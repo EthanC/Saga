@@ -1140,7 +1140,14 @@ def test_process_metadata_download_and_dispatch_errors(
     client.metadata_error = None
     client.download_error = DiskSpaceError("full")
     processor.process(detached_work(tmp_path, "download"))
-    assert state.updates[-1]["failure_phase"] == "disk"
+    assert state.updates[-1] == {
+        "video_id": "AbCdEfGhI12",
+        "status": "download",
+        "release": True,
+        "retry_after": 1,
+        "failure_phase": "disk",
+        "last_error": "DiskSpaceError: full",
+    }
 
 
 @pytest.mark.parametrize("status", ["upload", "reconcile_upload"])

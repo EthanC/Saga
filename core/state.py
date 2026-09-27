@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from loguru import logger
-from sqlalchemy import event, func, inspect, text
+from sqlalchemy import case, event, func, inspect, text
 from sqlmodel import (
     Field,
     Session,
@@ -548,6 +548,16 @@ class StateStore:
         """Claim one due archive row, optionally favoring notification candidates."""
         current = now or utcnow()
         terminal = ("complete", "unavailable", "operator_action")
+        queue_order = (
+            case((col(ArchiveProgress.failure_phase) == "disk", 1), else_=0),
+            *(
+                (case((col(Video.notification_candidate).is_(True), 0), else_=1),)
+                if prefer_recent
+                else ()
+            ),
+            col(ArchiveProgress.updated_at),
+            col(ArchiveProgress.video_id),
+        )
         with self._write_lock, Session(self.engine) as session:
             statement = (
                 select(ArchiveProgress, Video, Channel)
@@ -560,27 +570,8 @@ class StateStore:
                     | (col(ArchiveProgress.retry_at) <= current),
                 )
             )
-            if prefer_recent:
-                statement = statement.where(col(Video.notification_candidate).is_(True))
-            statement = statement.order_by(
-                col(ArchiveProgress.updated_at), col(ArchiveProgress.video_id)
-            )
+            statement = statement.order_by(*queue_order)
             row = session.exec(statement).first()
-            if row is None and prefer_recent:
-                row = session.exec(
-                    select(ArchiveProgress, Video, Channel)
-                    .join(Video, col(ArchiveProgress.video_id) == col(Video.id))
-                    .join(Channel, col(Video.channel_id) == col(Channel.id))
-                    .where(
-                        col(ArchiveProgress.status).not_in(terminal),
-                        col(ArchiveProgress.claimed_at).is_(None),
-                        col(ArchiveProgress.retry_at).is_(None)
-                        | (col(ArchiveProgress.retry_at) <= current),
-                    )
-                    .order_by(
-                        col(ArchiveProgress.updated_at), col(ArchiveProgress.video_id)
-                    )
-                ).first()
             if row is None:
                 return None
 

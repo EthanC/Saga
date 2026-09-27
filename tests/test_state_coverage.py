@@ -14,6 +14,7 @@ from core.state import (
     NotificationDelivery,
     ResolvedChannel,
     StateStore,
+    Video,
     webhook_key,
 )
 
@@ -243,4 +244,32 @@ def test_archive_claim_falls_back_and_reset_marks_submission_uncertain(
         assert progress.status == "operator_action"
         assert progress.failure_phase == "webpage_submission"
     assert store.claim_archive(prefer_recent=True) is None
+    store.close()
+
+
+def test_archive_claim_leaves_disk_blocked_video_at_back(tmp_path: Path) -> None:
+    store, baseline = prepare(tmp_path)
+    videos = [
+        discovered("ddddddddddd", baseline + timedelta(seconds=1)),
+        discovered("eeeeeeeeeee", baseline + timedelta(seconds=2)),
+    ]
+    store.record_discoveries(CHANNEL.id, videos, backfill=False)
+
+    blocked = store.claim_archive(prefer_recent=False)
+    assert blocked is not None
+    store.update_archive(blocked.video.id, release=True, failure_phase="disk")
+    viable_id = next(video.id for video in videos if video.id != blocked.video.id)
+    with Session(store.engine) as session:
+        viable_video = session.get(Video, viable_id)
+        assert viable_video is not None
+        viable_video.notification_candidate = False
+        session.add(viable_video)
+        session.commit()
+
+    viable = store.claim_archive(prefer_recent=True)
+    assert viable is not None and viable.video.id == viable_id
+    store.update_archive(viable.video.id, release=True)
+
+    next_work = store.claim_archive(prefer_recent=True)
+    assert next_work is not None and next_work.video.id == viable.video.id
     store.close()

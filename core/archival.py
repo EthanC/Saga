@@ -344,7 +344,20 @@ class ArchiveProcessor:
                 last_error=_error_text(error),
             )
         except DiskSpaceError as error:
-            self._retry(work, error, "disk")
+            logger.warning(
+                "Skipping video {} due to insufficient disk space; moved to the "
+                "back of the archive queue: {}",
+                work.video.id,
+                error,
+            )
+            self.state.update_archive(
+                work.video.id,
+                status=work.progress.status,
+                release=True,
+                retry_after=self.settings.archive_retry_delay,
+                failure_phase="disk",
+                last_error=_error_text(error),
+            )
         except LocalMediaChangedError as error:
             logger.error(
                 "Local media verification failed for video {}: {}", work.video.id, error
