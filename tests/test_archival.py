@@ -1277,6 +1277,70 @@ def test_ziggy_only_archival_does_not_require_internet_archive_credentials(
     assert state.updates[-1]["webpage_status"] == "queued"
 
 
+def test_ziggy_only_routes_resumed_stages_without_internet_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = replace(
+        settings(tmp_path, ziggy=True),
+        internet_archive_email=None,
+        internet_archive_password=None,
+    )
+    monkeypatch.setattr(
+        archival,
+        "submit_ziggy",
+        lambda _host, _identifier, url, _timeout: {"url": url, "receipt_id": "id"},
+    )
+    state = RecordingState()
+    processor = ArchiveProcessor(configured, state, YouTubeClient())
+
+    processor.process(detached_work(tmp_path, "webpage"))
+    assert state.updates[-1]["status"] == "cleanup"
+
+    processor.process(detached_work(tmp_path, "download"))
+    assert state.updates[-1]["status"] == "operator_action"
+    assert state.updates[-1]["failure_phase"] == "download"
+
+    processor.process(
+        detached_work(
+            tmp_path, "cleanup", media_verified_at=utcnow(), webpage_status="queued"
+        )
+    )
+    assert state.updates[-1]["status"] == "complete"
+
+
+def test_ziggy_only_process_handles_dispatch_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = replace(
+        settings(tmp_path, ziggy=True),
+        internet_archive_email=None,
+        internet_archive_password=None,
+    )
+    monkeypatch.setattr(
+        archival,
+        "submit_ziggy",
+        lambda _host, _identifier, url, _timeout: {"url": url, "receipt_id": "id"},
+    )
+    failed_state = RecordingState(fail_status="complete")
+
+    ArchiveProcessor(configured, failed_state, YouTubeClient()).process(
+        detached_work(tmp_path, "metadata")
+    )
+
+    assert failed_state.updates[-1]["status"] == "operator_action"
+    assert failed_state.updates[-1]["failure_phase"] == "ziggy"
+
+    unavailable = replace(configured, ziggy_host=None)
+    state = RecordingState()
+    processor = ArchiveProcessor(unavailable, state, YouTubeClient())
+    processor.process(detached_work(tmp_path, "metadata"))
+
+    assert state.updates[-1]["status"] == "metadata"
+    assert "no configured provider" in state.updates[-1]["last_error"]
+    with pytest.raises(RuntimeError, match="credentials are not configured"):
+        processor._gateway()
+
+
 @pytest.mark.parametrize(
     ("error", "expected_status"),
     [
