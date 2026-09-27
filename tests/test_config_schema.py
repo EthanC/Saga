@@ -75,6 +75,16 @@ def test_example_config_matches_schema(schema_validator: Validator) -> None:
             " HtTpS://WwW.Discord.CoM/api/webhooks/123/token ",
             True,
         ),
+        (
+            "discord_webhook_urls",
+            "https://canary.discord.com/api/webhooks/123/token",
+            True,
+        ),
+        (
+            "discord_webhook_urls",
+            "https://ptb.discord.com/api/webhooks/123/token",
+            True,
+        ),
         ("discord_webhook_urls", " http://Discord.com/api/webhooks/123/token ", False),
         ("discord_webhook_urls", " https://Discord.com/API/webhooks/123/token ", False),
         (

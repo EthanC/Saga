@@ -93,7 +93,7 @@ def test_configure_logging_adds_warning_discord_sink(
 def test_load_logging_settings_ignores_unrelated_invalid_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    webhook_url = "https://discord.com/api/webhooks/1/log-token"
+    webhook_url = "https://canary.discord.com/api/webhooks/1/log-token"
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("LOG_DISCORD_WEBHOOK_URL", webhook_url)
     monkeypatch.setenv("LOG_DISCORD_LEVEL", "ERROR")
@@ -131,7 +131,10 @@ def test_start_configures_logging_before_full_settings_validation(
 
 def test_redact_discord_webhooks_handles_full_and_path_only_urls() -> None:
     token = "secret.token-value"
-    text = f"https://discord.com/api/webhooks/123/{token} and /api/webhooks/456/{token}"
+    text = (
+        f"https://canary.discord.com/api/webhooks/123/{token} and "
+        f"/api/webhooks/456/{token}"
+    )
 
     redacted = logging_config.redact_discord_webhooks(text)
 

@@ -92,7 +92,7 @@
           "uniqueItems": true,
           "items": {
             "type": "string",
-            "pattern": "^\\s*[hH][tT][tT][pP][sS]://(?:[wW][wW][wW]\\.)?[dD][iI][sS][cC][oO][rR][dD]\\.[cC][oO][mM]/api/webhooks/[0-9]+/[^/?#]*[^/?#\\s]\\s*$"
+            "pattern": "^\\s*[hH][tT][tT][pP][sS]://(?:(?:[wW][wW][wW]|[cC][aA][nN][aA][rR][yY]|[pP][tT][bB])\\.)?[dD][iI][sS][cC][oO][rR][dD]\\.[cC][oO][mM]/api/webhooks/[0-9]+/[^/?#]*[^/?#\\s]\\s*$"
           }
         },
         "videos": {

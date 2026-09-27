@@ -18,6 +18,9 @@ INSTANCE_NAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?")
 CHANNEL_ID_PATTERN = re.compile(r"UC[A-Za-z0-9_-]{22}")
 HANDLE_PATTERN = re.compile(r"@[A-Za-z0-9._-]{3,30}")
 WEBHOOK_PATH_PATTERN = re.compile(r"/api/webhooks/\d+/[^/]+")
+DISCORD_WEBHOOK_HOSTS = frozenset(
+    {"discord.com", "www.discord.com", "canary.discord.com", "ptb.discord.com"}
+)
 ContentType = Literal["video", "short", "livestream"]
 ALL_CONTENT_TYPES: tuple[ContentType, ...] = ("video", "short", "livestream")
 LOG_LEVELS = frozenset(
@@ -418,7 +421,7 @@ def _valid_webhook_url(value: str) -> bool:
 
     return (
         parsed.scheme == "https"
-        and parsed.hostname in {"discord.com", "www.discord.com"}
+        and parsed.hostname in DISCORD_WEBHOOK_HOSTS
         and parsed.username is None
         and parsed.password is None
         and parsed.port is None

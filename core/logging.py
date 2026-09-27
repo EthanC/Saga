@@ -12,7 +12,7 @@ from loguru_discord import DiscordSink
 from core.config import LoggingSettings, Settings
 
 DISCORD_WEBHOOK_PATTERN = re.compile(
-    r"(?:https://(?:www\.)?discord\.com)?"
+    r"(?:https://(?:(?:www|canary|ptb)\.)?discord\.com)?"
     r"/api/webhooks/\d+/[A-Za-z0-9._-]+",
     re.IGNORECASE,
 )
