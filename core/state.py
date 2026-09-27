@@ -531,7 +531,7 @@ class StateStore:
             session.commit()
         interrupted = len(deliveries) + len(archive_rows) + len(reports)
         if interrupted:
-            logger.warning(
+            logger.info(
                 "Recovered {} interrupted workflow claim(s): {} delivery, {} archive, "
                 "{} report",
                 interrupted,
