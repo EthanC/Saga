@@ -1,0 +1,25 @@
+[instances]
+
+[[instances.youtube]]
+name = "example"
+cooldown = 60
+retries = 3
+retry_delay = 5
+
+[[instances.youtube.channels]]
+reference = "@ExampleHandle"
+videos = true
+shorts = true
+livestreams = true
+discord_webhook_urls = [
+  "https://discord.com/api/webhooks/000000000000000000/example-token",
+]
+
+[[instances.youtube.channels]]
+reference = "https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"
+videos = true
+shorts = true
+livestreams = true
+discord_webhook_urls = [
+  "https://discord.com/api/webhooks/111111111111111111/another-token",
+]

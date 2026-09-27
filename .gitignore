@@ -148,9 +148,16 @@ activemq-data/
 *.sage.py
 
 # Environments
-.env
+.env*
+!.env.example
 .envrc
 .venv
+config.toml
+data/
+*cookies*.txt
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 env/
 venv/
 ENV/
