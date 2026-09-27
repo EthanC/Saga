@@ -217,20 +217,13 @@ class SagaService:
                     monitored.channel,
                     content_types=monitored.content_types,
                 )
-                needs_detail = self.state.publication_detail_ids(
-                    video.id for video in recent
-                )
-                if needs_detail:
-                    recent = await asyncio.to_thread(
-                        self._resolve_publications,
-                        monitored.channel,
-                        recent,
-                        needs_detail,
-                        monitored.retries,
-                        monitored.retry_delay,
-                    )
-                added = self.state.record_discoveries(
-                    monitored.channel.id, recent, backfill=False
+                added = await asyncio.to_thread(
+                    self._record_videos,
+                    monitored.channel,
+                    recent,
+                    False,
+                    monitored.retries,
+                    monitored.retry_delay,
                 )
                 if added:
                     logger.info(
@@ -261,14 +254,13 @@ class SagaService:
 
                 def record_batch(batch: tuple[DiscoveredVideo, ...]) -> None:
                     nonlocal discovered
-                    resolved = self._resolve_publications(
-                        channel, batch, None, monitored.retries, monitored.retry_delay
+                    self._record_videos(
+                        channel, batch, True, monitored.retries, monitored.retry_delay
                     )
-                    self.state.record_discoveries(channel.id, resolved, backfill=True)
-                    discovered += len(resolved)
+                    discovered += len(batch)
                     logger.debug(
                         "Reconciled a batch of {} video(s) for {}",
-                        len(resolved),
+                        len(batch),
                         channel.title,
                     )
 
@@ -300,6 +292,26 @@ class SagaService:
             except Exception:
                 logger.exception("History reconciliation failed for {}", channel.title)
             await self._wait(21_600)
+
+    def _record_videos(
+        self,
+        channel: ResolvedChannel,
+        videos: tuple[DiscoveredVideo, ...],
+        backfill: bool,
+        retries: int,
+        retry_delay: float,
+    ) -> int:
+        """Queue discoveries before resolving metadata needed only for notifications."""
+        needs_detail = self.state.publication_detail_ids(video.id for video in videos)
+        if not needs_detail:
+            return self.state.record_discoveries(channel.id, videos, backfill=backfill)
+
+        added = self.state.record_discoveries(channel.id, videos, backfill=True)
+        resolved = self._resolve_publications(
+            channel, videos, needs_detail, retries, retry_delay
+        )
+        self.state.record_discoveries(channel.id, resolved, backfill=backfill)
+        return added
 
     def _resolve_publications(
         self,

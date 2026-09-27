@@ -420,7 +420,7 @@ def test_poll_loop_records_successes_and_survives_failure(
 
     class State:
         details = [{VIDEO.id}, set()]
-        additions = [1, 0]
+        additions = [1, 0, 0]
 
         def publication_detail_ids(self, ids: Any) -> set[str]:
             tuple(ids)
@@ -488,6 +488,9 @@ def test_reconciliation_records_batches_and_survives_failure(
         recorded: list[tuple[Any, ...]] = []
         completed = 0
 
+        def publication_detail_ids(self, ids: Any) -> set[str]:
+            return set(ids)
+
         def record_discoveries(
             self, channel_id: str, batch: Any, *, backfill: bool
         ) -> None:
@@ -516,8 +519,55 @@ def test_reconciliation_records_batches_and_survives_failure(
     )
 
     assert state.completed == 1
-    assert state.recorded[0][1][0].title == "Exact"
-    assert state.recorded[0][2] is True
+    assert state.recorded[0][1][0].title == "Video"
+    assert state.recorded[1][1][0].title == "Exact"
+    assert all(item[2] is True for item in state.recorded)
+
+
+def test_reconciliation_queues_archive_before_resolving_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "state.sqlite")
+    store.register_channel("@channel", CHANNEL)
+    route = YouTubeChannelConfig(
+        "@channel", ("https://discord.com/api/webhooks/1/token",)
+    )
+    store.synchronize_subscriptions(
+        [(YouTubeConfig("primary", (route,)), ((CHANNEL.id, route),))]
+    )
+    baseline = store.establish_baseline(CHANNEL.id, ())
+    video = replace(
+        VIDEO, published_at=None, live_status="is_live", published_precise=False
+    )
+    claimed: list[str] = []
+
+    class Youtube:
+        def scan_history(self, channel: Any, callback: Any, **kwargs: Any) -> None:
+            callback((video,))
+
+        def video_metadata(self, video_id: str) -> VideoMetadata:
+            work = store.claim_archive(prefer_recent=False)
+            assert work is not None
+            claimed.append(work.video.id)
+            with Session(store.engine) as session:
+                assert session.exec(select(NotificationDelivery)).first() is None
+            return replace(metadata(baseline + timedelta(seconds=1), True), id=video_id)
+
+    service = service_with(tmp_path, store, Youtube())
+
+    async def wait(_: float) -> None:
+        service.stop.set()
+
+    monkeypatch.setattr(service, "_wait", wait)
+    try:
+        asyncio.run(
+            service._reconciliation_loop(
+                MonitoredChannel(CHANNEL, 1, frozenset({"video"}))
+            )
+        )
+        assert claimed == [video.id]
+    finally:
+        store.close()
 
 
 def test_reconciliation_cancellation_waits_for_thread(tmp_path: Path) -> None:
