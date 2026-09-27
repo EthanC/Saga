@@ -145,7 +145,7 @@ def load_settings(project_root: Path) -> Settings:
     env = Env()
     env.read_env(project_root / ".env", recurse=False)
 
-    config_path = _path(env.str("SAGA_CONFIG_PATH", "config.toml"), project_root)
+    config_path = _path(env.str("SAGA_CONFIG_PATH", "config/config.toml"), project_root)
     data_path = _path(env.str("SAGA_DATA_PATH", "data"), project_root)
     health_value = env.str("SAGA_HEALTHCHECK_FILE", None)
     cookies_value = env.str("YOUTUBE_COOKIES_PATH", None)
@@ -219,7 +219,8 @@ def load_settings(project_root: Path) -> Settings:
         if not cookies_path.is_file():
             raise ValueError(f"YOUTUBE_COOKIES_PATH is not a file: {cookies_path}")
     else:
-        cookies_path = None
+        default_cookies_path = config_path.parent / "cookies.txt"
+        cookies_path = default_cookies_path if default_cookies_path.is_file() else None
 
     notification_timeout = env.float("DISCORD_TIMEOUT", 30.0)
     if not math.isfinite(notification_timeout) or notification_timeout <= 0:

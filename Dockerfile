@@ -16,8 +16,8 @@ FROM python:3.14-alpine
 RUN apk add --no-cache ffmpeg libstdc++ su-exec \
     && addgroup -g 1000 saga \
     && adduser -D -H -u 1000 -G saga saga \
-    && mkdir -p /app /data \
-    && chown -R saga:saga /app /data
+    && mkdir -p /app /config /data \
+    && chown -R saga:saga /app /config /data
 
 COPY --from=deno /bin/deno /opt/deno/bin/deno
 COPY --from=deno /usr/local/lib/ld-linux* /usr/local/lib/
@@ -39,12 +39,12 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PUID=1000 \
     PGID=1000 \
-    SAGA_CONFIG_PATH=/config.toml \
+    SAGA_CONFIG_PATH=/config/config.toml \
     SAGA_DATA_PATH=/data \
     SAGA_HEALTHCHECK_FILE=/data/healthy
 
 WORKDIR /app
-VOLUME ["/data"]
+VOLUME ["/config", "/data"]
 HEALTHCHECK --interval=1m --timeout=5s --start-period=2m --retries=3 \
     CMD ["python", "-m", "core.healthcheck"]
 ENTRYPOINT ["docker-entrypoint.sh"]

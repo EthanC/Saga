@@ -167,7 +167,7 @@ def test_load_settings_accepts_all_optional_values(
 
     result = config.load_settings(tmp_path)
 
-    assert result.config_path == tmp_path / "config.toml"
+    assert result.config_path == tmp_path / "config" / "config.toml"
     assert result.data_path == tmp_path / "store"
     assert result.healthcheck_file == tmp_path / "health"
     assert result.youtube_cookies_path == cookies
@@ -188,6 +188,22 @@ def test_load_settings_accepts_all_optional_values(
     assert result.report_discord_webhook_url == values["REPORT_DISCORD_WEBHOOK_URL"]
     assert result.report_interval == 3600
     assert result.report_finalization_grace == 30
+
+
+def test_load_settings_discovers_default_cookies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_settings: None
+) -> None:
+    config_directory = tmp_path / "config"
+    config_directory.mkdir()
+    cookies = config_directory / "cookies.txt"
+    cookies.write_text("cookies", encoding="utf-8")
+    monkeypatch.setenv("INTERNET_ARCHIVE_EMAIL", "user@example.com")
+    monkeypatch.setenv("INTERNET_ARCHIVE_PASSWORD", "password")
+
+    result = config.load_settings(tmp_path)
+
+    assert result.config_path == config_directory / "config.toml"
+    assert result.youtube_cookies_path == cookies
 
 
 def test_example_environment_preserves_container_paths(

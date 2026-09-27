@@ -23,7 +23,7 @@ Saga preserves YouTube channels in the Internet Archive and sends new uploads to
 
 ## Docker Compose
 
-Create `config.toml` from `config.example.toml` and `.env` from `.env.example`. Add your channels, webhooks, and Internet Archive credentials, then save this as `compose.yaml`:
+Create `config/config.toml` from `config.example.toml` and `.env` from `.env.example`. Add your channels, webhooks, and Internet Archive credentials, then save this as `compose.yaml`:
 
 ```yaml
 services:
@@ -34,7 +34,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./config.toml:/config.toml:ro
+      - ./config:/config:ro
       - ./data:/data
     restart: unless-stopped
     stop_grace_period: 30s
@@ -48,7 +48,7 @@ docker compose up -d
 
 The image includes Python 3.14, ffmpeg, ffprobe, Deno, and yt-dlp's JavaScript support.
 
-Leave the optional path overrides in `.env` commented out to keep the image's `/config.toml`, `/data`, and `/data/healthy` defaults. The health check expires after three times the longest configured polling cooldown, with a minimum window of five minutes. Saga clears the previous heartbeat before initialization and removes it on shutdown.
+Leave the optional path overrides in `.env` commented out to keep the image's `/config/config.toml`, `/config/cookies.txt`, `/data`, and `/data/healthy` defaults. The cookie file is optional. The health check expires after three times the longest configured polling cooldown, with a minimum window of five minutes. Saga clears the previous heartbeat before initialization and removes it on shutdown.
 
 ## Python
 
@@ -58,7 +58,7 @@ Install Python 3.14 or newer, [`uv`](https://docs.astral.sh/uv/), ffmpeg, ffprob
 uv sync
 ```
 
-Create and edit `config.toml` and `.env` from their examples, then run Saga:
+Create and edit `config/config.toml` and `.env` from their examples, then run Saga:
 
 ```console
 uv run python saga.py
@@ -78,7 +78,7 @@ Saga reads environment variables from the process and an optional `.env` file. P
 | `PUID` | Container process user ID | Integer | No | `1000` |
 | `PGID` | Container process group ID | Integer | No | `1000` |
 | `TZ` | System timezone used by the backup schedule | IANA timezone | No | `Etc/UTC` in `.env.example` |
-| `SAGA_CONFIG_PATH` | TOML configuration path | Path | No | `"config.toml"` |
+| `SAGA_CONFIG_PATH` | TOML configuration path | Path | No | `"config/config.toml"` |
 | `SAGA_DATA_PATH` | Database and download directory | Path | No | `"data"` |
 | `SAGA_HEALTHCHECK_FILE` | File refreshed after successful channel scans | Path | No | `"data/healthy"` |
 | `SAGA_BACKUP_ENABLED` | Enable the backup scheduler | Boolean | No | `true` |
@@ -90,7 +90,7 @@ Saga reads environment variables from the process and an optional `.env` file. P
 | `REPORT_DISCORD_WEBHOOK_URL` | Discord webhook for combined archival reports | URL | No | None |
 | `SAGA_REPORT_INTERVAL` | Fixed UTC report interval in seconds | Number | No | `86400` |
 | `SAGA_REPORT_FINALIZATION_GRACE` | Delay after a closed report window, in seconds | Number | No | `300` |
-| `YOUTUBE_COOKIES_PATH` | Netscape cookie export loaded without modifying the source file | Path | No | None |
+| `YOUTUBE_COOKIES_PATH` | Netscape cookie export loaded without modifying the source file | Path | No | `"config/cookies.txt"` when present |
 | `INTERNET_ARCHIVE_EMAIL` | Internet Archive account email | String | Yes | None |
 | `INTERNET_ARCHIVE_PASSWORD` | Internet Archive account password | String | Yes | None |
 | `SAGA_ARCHIVE_WORKERS` | Concurrent archive workers, from 1 through 4 | Integer | No | `1` |
@@ -210,25 +210,8 @@ Ziggy's listener has no authentication and should be reachable only over a trust
 
 Cookies are optional for public videos. They are needed for content that requires a signed-in account, such as age-restricted, private, or members-only videos.
 
-Follow yt-dlp's [Exporting YouTube cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) guide and save the exported file as `cookies.txt`. Keep the file private; it grants access to the signed-in account.
+Follow yt-dlp's [Exporting YouTube cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) guide and save the exported file as `config/cookies.txt`. Keep the file private; it grants access to the signed-in account.
 
-For a local Python installation, set the path in `.env`:
-
-```dotenv
-YOUTUBE_COOKIES_PATH=cookies.txt
-```
-
-For Docker Compose, add a read-only cookie volume:
-
-```yaml
-volumes:
-  - ./cookies.txt:/run/secrets/cookies.txt:ro
-```
-
-Then use its container path in `.env`:
-
-```dotenv
-YOUTUBE_COOKIES_PATH=/run/secrets/cookies.txt
-```
+Local Python installations and the Docker Compose example load this file automatically when it exists. Set `YOUTUBE_COOKIES_PATH` only to use another location.
 
 Restart Saga after replacing expired cookies.
