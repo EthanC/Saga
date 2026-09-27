@@ -24,6 +24,7 @@ dependencies = [
 [dependency-groups]
 dev = [
   "coverage>=7.10.7",
+  "jsonschema>=4.26.0",
   "pytest>=8.4.2",
   "pytest-cov>=7.0.0",
   "ruff>=0.16.7",

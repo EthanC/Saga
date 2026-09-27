@@ -1,3 +1,5 @@
+#:schema https://raw.githubusercontent.com/EthanC/Saga/main/config.schema.json
+
 [instances]
 
 [[instances.youtube]]
