@@ -280,7 +280,9 @@ class ArchiveProcessor:
         self.settings = settings
         self.state = state
         self.youtube = youtube
-        self.gateway = gateway or ArchiveGateway(settings, upload_limiter)
+        self.gateway = gateway
+        if self.gateway is None and settings.media_archival_enabled:
+            self.gateway = ArchiveGateway(settings, upload_limiter)
         self.download_root = settings.data_path / "downloads"
         self._download_lock = Lock()
 
@@ -291,6 +293,20 @@ class ArchiveProcessor:
             work.progress.status,
             work.video.id,
         )
+        if self.gateway is None:
+            try:
+                self._process_ziggy_only(work)
+            except AcceptedSubmissionPersistenceError as error:
+                logger.critical(
+                    "Accepted {} submission for video {} could not be persisted: {}",
+                    error.phase,
+                    work.video.id,
+                    error,
+                )
+                self._uncertain_submission(work, error, error.phase)
+            except Exception as error:
+                self._retry(work, error, work.progress.status)
+            return
         handlers = {
             "metadata": self._metadata,
             "download": self._download,
@@ -411,6 +427,7 @@ class ArchiveProcessor:
         )
 
     def _upload(self, work: ArchiveWork) -> None:
+        gateway = self._gateway()
         frozen = _frozen(work)
         path, size, md5_hash, sha1_hash = _media_facts(work)
         self.state.update_archive(
@@ -422,7 +439,7 @@ class ArchiveProcessor:
         )
         work.progress.status = "uploading"
         try:
-            self.gateway.upload(frozen, path)
+            gateway.upload(frozen, path)
         except InternetArchiveUploadError as error:
             # Archivist sets failed_file before transfer and records transferred
             # files before polling. Timeouts and ID conflicts do not prove absence.
@@ -484,15 +501,16 @@ class ArchiveProcessor:
                 last_error=_error_text(error),
             )
             return
-        inspection = self.gateway.inspect(
+        inspection = gateway.inspect(
             frozen, size=size, md5_hash=md5_hash, sha1_hash=sha1_hash
         )
         self._finish_inspection(work, inspection)
 
     def _reconcile(self, work: ArchiveWork) -> None:
+        gateway = self._gateway()
         frozen = _frozen(work)
         path, size, md5_hash, sha1_hash = _media_facts(work)
-        inspection = self.gateway.inspect(
+        inspection = gateway.inspect(
             frozen, size=size, md5_hash=md5_hash, sha1_hash=sha1_hash
         )
         logger.debug(
@@ -502,7 +520,7 @@ class ArchiveProcessor:
         )
         if inspection.state == "missing":
             try:
-                result = self.gateway.recover(frozen, path)
+                result = gateway.recover(frozen, path)
             except InternetArchiveRecoveryDeferredError as error:
                 logger.warning(
                     "Archive.org recovery was deferred for video {}: {}",
@@ -612,38 +630,13 @@ class ArchiveProcessor:
     def _webpage(self, work: ArchiveWork) -> None:
         frozen = _frozen(work)
         if self.settings.ziggy_host is not None:
-            logger.info("Submitting webpage for video {} through Ziggy", work.video.id)
-            self.state.update_archive(work.video.id, status="ziggy_submitting")
-            try:
-                receipt = submit_ziggy(
-                    self.settings.ziggy_host,
-                    self.settings.ziggy_identifier or "saga",
-                    frozen.source_url,
-                    self.settings.archive_request_timeout,
-                )
-            except SubmissionRejectedError as error:
-                self._retry_submission(work, error, "ziggy")
-                return
-            except Exception as error:
-                self._uncertain_submission(work, error, "ziggy")
-                return
-            try:
-                self.state.update_archive(
-                    work.video.id,
-                    status="cleanup",
-                    release=True,
-                    webpage_status="queued",
-                    ziggy_receipt=json.dumps(receipt, sort_keys=True),
-                    failure_phase=None,
-                    last_error=None,
-                )
-            except Exception as error:
-                raise AcceptedSubmissionPersistenceError("ziggy", error) from error
+            self._submit_ziggy(work, frozen.source_url, "cleanup", "webpage")
             return
+        gateway = self._gateway()
         logger.info("Submitting webpage for video {} directly", work.video.id)
         self.state.update_archive(work.video.id, status="wayback_submitting")
         try:
-            job_id = self.gateway.submit_page(frozen.source_url)
+            job_id = gateway.submit_page(frozen.source_url)
         except NetworkError as error:
             self._uncertain_submission(work, error, "wayback")
             return
@@ -666,7 +659,7 @@ class ArchiveProcessor:
             raise AcceptedSubmissionPersistenceError("wayback", error) from error
 
     def _retry_submission(
-        self, work: ArchiveWork, error: Exception, phase: str
+        self, work: ArchiveWork, error: Exception, phase: str, status: str = "webpage"
     ) -> None:
         logger.warning(
             "{} webpage submission failed for video {}; retry scheduled: {}",
@@ -676,7 +669,7 @@ class ArchiveProcessor:
         )
         self.state.update_archive(
             work.video.id,
-            status="webpage",
+            status=status,
             release=True,
             retry_after=self.settings.archive_retry_delay,
             failure_phase=phase,
@@ -701,10 +694,11 @@ class ArchiveProcessor:
         )
 
     def _wayback_wait(self, work: ArchiveWork) -> None:
+        gateway = self._gateway()
         job_id = work.progress.wayback_job_id
         if not job_id:
             raise RuntimeError("direct Wayback stage has no persisted job ID")
-        result = self.gateway.page_status(job_id)
+        result = gateway.page_status(job_id)
         if isinstance(result, InternetArchivePendingStatus):
             logger.debug("Wayback job {} is still pending", job_id)
             self.state.update_archive(
@@ -768,6 +762,68 @@ class ArchiveProcessor:
             last_error=None,
         )
         logger.info("Completed archive workflow for video {}", work.video.id)
+
+    def _process_ziggy_only(self, work: ArchiveWork) -> None:
+        if self.settings.ziggy_host is None:
+            raise RuntimeError("archive processor has no configured provider")
+        if work.progress.status == "metadata":
+            self._submit_ziggy(work, work.video.webpage_url, "complete", "metadata")
+            return
+        if work.progress.status == "webpage":
+            self._webpage(work)
+            return
+        if work.progress.status == "cleanup":
+            self._cleanup(work)
+            return
+        logger.error(
+            "Video {} requires Internet Archive credentials to resume stage {}",
+            work.video.id,
+            work.progress.status,
+        )
+        self.state.update_archive(
+            work.video.id,
+            status="operator_action",
+            release=True,
+            failure_phase=work.progress.status,
+            last_error="Internet Archive credentials are required to resume this stage",
+        )
+
+    def _submit_ziggy(
+        self, work: ArchiveWork, url: str, success_status: str, retry_status: str
+    ) -> None:
+        assert self.settings.ziggy_host is not None
+        logger.info("Submitting webpage for video {} through Ziggy", work.video.id)
+        self.state.update_archive(work.video.id, status="ziggy_submitting")
+        try:
+            receipt = submit_ziggy(
+                self.settings.ziggy_host,
+                self.settings.ziggy_identifier or "saga",
+                url,
+                self.settings.archive_request_timeout,
+            )
+        except SubmissionRejectedError as error:
+            self._retry_submission(work, error, "ziggy", retry_status)
+            return
+        except Exception as error:
+            self._uncertain_submission(work, error, "ziggy")
+            return
+        try:
+            self.state.update_archive(
+                work.video.id,
+                status=success_status,
+                release=True,
+                webpage_status="queued",
+                ziggy_receipt=json.dumps(receipt, sort_keys=True),
+                failure_phase=None,
+                last_error=None,
+            )
+        except Exception as error:
+            raise AcceptedSubmissionPersistenceError("ziggy", error) from error
+
+    def _gateway(self) -> ArchiveBackend:
+        if self.gateway is None:
+            raise RuntimeError("Internet Archive credentials are not configured")
+        return self.gateway
 
     def _retry(self, work: ArchiveWork, error: Exception, phase: str) -> None:
         status = (

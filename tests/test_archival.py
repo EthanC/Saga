@@ -1250,6 +1250,33 @@ def test_ziggy_submission_success_and_persistence_failure(
     assert calls[-1][1] == "saga"
 
 
+def test_ziggy_only_archival_does_not_require_internet_archive_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = replace(
+        settings(tmp_path, ziggy=True),
+        internet_archive_email=None,
+        internet_archive_password=None,
+    )
+    calls: list[str] = []
+
+    def submit(
+        _host: str, _identifier: str, url: str, _timeout: float
+    ) -> dict[str, str]:
+        calls.append(url)
+        return {"url": url, "receipt_id": "receipt"}
+
+    monkeypatch.setattr(archival, "submit_ziggy", submit)
+    state = RecordingState()
+    processor = ArchiveProcessor(configured, state, YouTubeClient())
+
+    processor.process(detached_work(tmp_path, "metadata"))
+
+    assert calls == ["https://youtu.be/AbCdEfGhI12"]
+    assert state.updates[-1]["status"] == "complete"
+    assert state.updates[-1]["webpage_status"] == "queued"
+
+
 @pytest.mark.parametrize(
     ("error", "expected_status"),
     [

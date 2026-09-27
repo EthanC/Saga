@@ -55,9 +55,11 @@ class SagaService:
         self.configurations = configurations
         self.state = state
         self.youtube = youtube
-        self.archival = archival or ArchiveProcessor(
-            settings, state, youtube, upload_limiter=upload_limiter
-        )
+        self.archival = archival
+        if self.archival is None and settings.archival_enabled:
+            self.archival = ArchiveProcessor(
+                settings, state, youtube, upload_limiter=upload_limiter
+            )
         self.stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -67,11 +69,7 @@ class SagaService:
         monitored = await self._initialize()
         self.state.reset_interrupted_claims()
         self._write_healthcheck()
-        logger.info(
-            "Starting workers for {} channel(s) with {} archive worker(s)",
-            len(monitored),
-            self.settings.archive_workers,
-        )
+        logger.info("Starting workers for {} channel(s)", len(monitored))
 
         try:
             async with asyncio.TaskGroup() as workers:
@@ -92,10 +90,14 @@ class SagaService:
                         ),
                         name="backup-scheduler",
                     )
-                for index in range(self.settings.archive_workers):
-                    workers.create_task(
-                        self._archive_loop(index), name=f"archive:{index}"
+                if self.archival is not None:
+                    logger.info(
+                        "Starting {} archive worker(s)", self.settings.archive_workers
                     )
+                    for index in range(self.settings.archive_workers):
+                        workers.create_task(
+                            self._archive_loop(index), name=f"archive:{index}"
+                        )
                 await self.stop.wait()
         finally:
             logger.debug("Worker group is stopping")
@@ -420,6 +422,7 @@ class SagaService:
                 logger.info("Delivered video {} to Discord", delivery.video_id)
 
     async def _archive_loop(self, worker_index: int) -> None:
+        assert self.archival is not None
         claim_count = worker_index
         while not self.stop.is_set():
             work = self.state.claim_archive(prefer_recent=claim_count % 4 != 3)

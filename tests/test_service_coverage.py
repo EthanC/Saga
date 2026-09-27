@@ -117,6 +117,20 @@ def test_run_starts_named_channel_workers(
     store.close()
 
 
+def test_run_skips_archive_workers_when_archival_is_disabled(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.sqlite", archival_enabled=False)
+    disabled = replace(
+        settings(tmp_path), internet_archive_email=None, internet_archive_password=None
+    )
+    service = SagaService(disabled, (), store, YouTubeClient())
+    service.stop.set()
+
+    asyncio.run(service.run())
+
+    assert service.archival is None
+    store.close()
+
+
 def test_youtube_request_helpers_retry_configured_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

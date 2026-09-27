@@ -35,7 +35,9 @@ async def start() -> None:
             f"Another Saga process is using {settings.data_path}"
         ) from None
 
-    state = StateStore(settings.data_path / "saga.sqlite")
+    state = StateStore(
+        settings.data_path / "saga.sqlite", archival_enabled=settings.archival_enabled
+    )
     download_limiter = ByteLimiter(settings.download_bytes_per_second)
     upload_limiter = ByteLimiter(settings.upload_bytes_per_second)
     service = SagaService(

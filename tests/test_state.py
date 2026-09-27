@@ -109,6 +109,26 @@ def test_baseline_is_silent_and_new_video_is_queued(tmp_path: Path) -> None:
     state.close()
 
 
+def test_disabled_archival_does_not_queue_videos(tmp_path: Path) -> None:
+    state = StateStore(tmp_path / "state.sqlite", archival_enabled=False)
+    channel = ResolvedChannel(
+        id="UCaaaaaaaaaaaaaaaaaaaaaa",
+        title="Channel",
+        handle="@channel",
+        url="https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    state.register_channel("@channel", channel)
+    state.synchronize_subscriptions(subscriptions(configured(WEBHOOK_1), channel.id))
+
+    state.establish_baseline(
+        channel.id, [discovery("aaaaaaaaaaa", datetime(2020, 1, 1, tzinfo=UTC))]
+    )
+
+    with Session(state.engine) as session:
+        assert session.exec(select(ArchiveProgress)).all() == []
+    state.close()
+
+
 def test_channel_content_toggles_filter_delivery_and_archival(tmp_path: Path) -> None:
     state = StateStore(tmp_path / "state.sqlite")
     channel = ResolvedChannel(

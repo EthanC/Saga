@@ -227,8 +227,9 @@ class ArchiveWork:
 class StateStore:
     """Own Saga's SQLite engine and transactional state transitions."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, archival_enabled: bool = True) -> None:
         self.path = path
+        self.archival_enabled = archival_enabled
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(
             f"sqlite:///{path}", connect_args={"check_same_thread": False}
@@ -993,7 +994,8 @@ class StateStore:
         ]
 
         if (
-            discovery.replay_ready
+            self.archival_enabled
+            and discovery.replay_ready
             and enabled_subscriptions
             and session.get(ArchiveProgress, discovery.id) is None
         ):

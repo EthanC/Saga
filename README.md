@@ -91,8 +91,8 @@ Saga reads environment variables from the process and an optional `.env` file. P
 | `SAGA_REPORT_INTERVAL` | Fixed UTC report interval in seconds | Number | No | `86400` |
 | `SAGA_REPORT_FINALIZATION_GRACE` | Delay after a closed report window, in seconds | Number | No | `300` |
 | `YOUTUBE_COOKIES_PATH` | Netscape cookie export loaded without modifying the source file | Path | No | `"config/cookies.txt"` when present |
-| `INTERNET_ARCHIVE_EMAIL` | Internet Archive account email | String | Yes | None |
-| `INTERNET_ARCHIVE_PASSWORD` | Internet Archive account password | String | Yes | None |
+| `INTERNET_ARCHIVE_EMAIL` | Internet Archive account email; enables media preservation when set with the password | String | Conditional | None |
+| `INTERNET_ARCHIVE_PASSWORD` | Internet Archive account password; enables media preservation when set with the email | String | Conditional | None |
 | `SAGA_ARCHIVE_WORKERS` | Concurrent archive workers, from 1 through 4 | Integer | No | `1` |
 | `SAGA_ARCHIVE_RETRY_DELAY` | Delay before retrying temporary archive failures, in seconds | Number | No | `300` |
 | `SAGA_ARCHIVE_REQUEST_TIMEOUT` | Archive request timeout in seconds | Number | No | `60` |
@@ -104,7 +104,7 @@ Saga reads environment variables from the process and an optional `.env` file. P
 | `ZIGGY_HOST` | Ziggy HTTP origin; set with the identifier | URL | Conditional | None |
 | `ZIGGY_IDENTIFIER` | Ziggy submission attribution, up to 128 characters | String | Conditional | None |
 
-The Internet Archive credentials must be set together. The two Ziggy variables are optional but must also be set together.
+Archival is disabled when neither provider is configured. Internet Archive credentials enable full media preservation and must be set together. The two Ziggy variables enable webpage preservation and must also be set together. Ziggy can be used without Internet Archive credentials; when both providers are configured, Saga uploads media to the Internet Archive and sends webpage captures through Ziggy.
 
 Set `LOG_DISCORD_WEBHOOK_URL` to forward warning-and-above events through `loguru-discord`. This logging webhook is separate from the per-channel notification webhooks in `config.toml`; lower its threshold with `LOG_DISCORD_LEVEL` only when diagnosing a problem.
 
@@ -172,7 +172,7 @@ Report delivery has the same webhook limitation as upload notifications: a lost 
 
 ## Preservation
 
-Saga downloads yt-dlp's exact `bestvideo+bestaudio` selection and merges it into MKV without re-encoding. Missing media fragments fail the download and trigger a retry rather than producing an incomplete archive. ffprobe must find both audio and video before Saga uploads the file.
+With Internet Archive credentials configured, Saga downloads yt-dlp's exact `bestvideo+bestaudio` selection and merges it into MKV without re-encoding. Missing media fragments fail the download and trigger a retry rather than producing an incomplete archive. ffprobe must find both audio and video before Saga uploads the file.
 
 Before downloading, Saga requires free space for twice the estimated media size plus `SAGA_MINIMUM_FREE_BYTES`, accounting for the input streams and merged output existing together. If the size is unknown, only the configured reserve can be checked.
 
@@ -187,15 +187,15 @@ The limiter permits bounded bursts of at most one second or 64 KiB, whichever is
 
 Bandwidth settings limit payload throughput rather than every packet on the network interface. Keep the values below measured usable capacity to leave room for protocol and control traffic. A low upload allowance can make shutdown take longer than the Docker example's 30-second stop grace period because Saga drains active archive work before exiting.
 
-Each video is stored as an Internet Archive item in `opensource_movies`. Saga records the source URL, checksums, and a unique operation ID, then verifies the remote file before deleting its local copy. Temporary failures retry later; conflicts retain the local files for operator review.
+When Internet Archive credentials are configured, each video is stored as an Internet Archive item in `opensource_movies`. Saga records the source URL, checksums, and a unique operation ID, then verifies the remote file before deleting its local copy. Temporary failures retry later; conflicts retain the local files for operator review.
 
 Scheduled livestreams trigger a Discord notification when discovered. Their download waits until yt-dlp reports that a replay is available.
 
 ## Webpage Capture
 
-By default, Saga submits each canonical YouTube watch URL to the Internet Archive. It stores the Wayback job ID and resumes polling after a restart.
+With Internet Archive credentials and no Ziggy configuration, Saga submits each canonical YouTube watch URL directly to the Internet Archive. It stores the Wayback job ID and resumes polling after a restart.
 
-Set both Ziggy variables to send webpage captures to its HTTP queue instead:
+Set both Ziggy variables to send webpage captures to its HTTP queue. Internet Archive credentials are not required for this mode:
 
 ```dotenv
 ZIGGY_HOST=http://ziggy:9449

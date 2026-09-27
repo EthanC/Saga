@@ -103,24 +103,30 @@ def test_reject_invalid_config(tmp_path: Path, body: str, message: str) -> None:
         load_youtube_configs(path)
 
 
-def test_settings_require_archive_credentials(
+def test_settings_allow_archival_to_be_disabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("INTERNET_ARCHIVE_EMAIL", raising=False)
     monkeypatch.delenv("INTERNET_ARCHIVE_PASSWORD", raising=False)
+    monkeypatch.delenv("ZIGGY_HOST", raising=False)
+    monkeypatch.delenv("ZIGGY_IDENTIFIER", raising=False)
 
-    with pytest.raises(ValueError, match="are required"):
-        load_settings(tmp_path)
+    result = load_settings(tmp_path)
+
+    assert result.archival_enabled is False
+    assert result.media_archival_enabled is False
 
 
 def test_settings_normalize_ziggy_origin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("INTERNET_ARCHIVE_EMAIL", "user@example.com")
-    monkeypatch.setenv("INTERNET_ARCHIVE_PASSWORD", "password")
+    monkeypatch.delenv("INTERNET_ARCHIVE_EMAIL", raising=False)
+    monkeypatch.delenv("INTERNET_ARCHIVE_PASSWORD", raising=False)
     monkeypatch.setenv("ZIGGY_HOST", "ziggy:9449")
     monkeypatch.setenv("ZIGGY_IDENTIFIER", "saga")
 
     result = load_settings(tmp_path)
 
     assert result.ziggy_host == "http://ziggy:9449"
+    assert result.archival_enabled is True
+    assert result.media_archival_enabled is False

@@ -101,6 +101,16 @@ class Settings:
     report_interval: float = 86_400.0
     report_finalization_grace: float = 300.0
 
+    @property
+    def archival_enabled(self) -> bool:
+        """Return whether either preservation provider is configured."""
+        return self.internet_archive_email is not None or self.ziggy_host is not None
+
+    @property
+    def media_archival_enabled(self) -> bool:
+        """Return whether Internet Archive media preservation is configured."""
+        return self.internet_archive_email is not None
+
 
 def load_youtube_configs(path: Path) -> tuple[YouTubeConfig, ...]:
     """Load all YouTube instances from a TOML configuration file."""
@@ -193,10 +203,6 @@ def load_settings(project_root: Path) -> Settings:
     if (archive_email is None) != (archive_password is None):
         raise ValueError(
             "INTERNET_ARCHIVE_EMAIL and INTERNET_ARCHIVE_PASSWORD must be set together"
-        )
-    if archive_email is None:
-        raise ValueError(
-            "INTERNET_ARCHIVE_EMAIL and INTERNET_ARCHIVE_PASSWORD are required"
         )
     if (ziggy_host is None) != (ziggy_identifier is None):
         raise ValueError("ZIGGY_HOST and ZIGGY_IDENTIFIER must be set together")
