@@ -21,6 +21,7 @@ SETTING_NAMES = (
     "SAGA_BACKUP_RETENTION_COUNT",
     "SAGA_BACKUP_TIMEZONE",
     "YOUTUBE_COOKIES_PATH",
+    "YOUTUBE_POT_PROVIDER_URL",
     "INTERNET_ARCHIVE_EMAIL",
     "INTERNET_ARCHIVE_PASSWORD",
     "ZIGGY_HOST",
@@ -141,6 +142,7 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_DATA_PATH": "store",
         "SAGA_HEALTHCHECK_FILE": "health",
         "YOUTUBE_COOKIES_PATH": "cookies.txt",
+        "YOUTUBE_POT_PROVIDER_URL": "http://pot-provider:4416/",
         "SAGA_BACKUP_ENABLED": "false",
         "SAGA_BACKUP_SCHEDULE": "30 2 * * 1",
         "SAGA_BACKUP_DIRECTORY": "snapshots",
@@ -171,6 +173,7 @@ def test_load_settings_accepts_all_optional_values(
     assert result.data_path == tmp_path / "store"
     assert result.healthcheck_file == tmp_path / "health"
     assert result.youtube_cookies_path == cookies
+    assert result.youtube_pot_provider_url == "http://pot-provider:4416"
     assert result.backup.enabled is False
     assert result.backup.schedule == "30 2 * * 1"
     assert result.backup.directory == tmp_path / "store" / "snapshots"
@@ -246,6 +249,9 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"ZIGGY_HOST": "localhost"}, "ZIGGY_HOST and ZIGGY_IDENTIFIER"),
         ({"ZIGGY_HOST": "localhost", "ZIGGY_IDENTIFIER": "x" * 129}, "1 to 128"),
         ({"YOUTUBE_COOKIES_PATH": "missing"}, "is not a file"),
+        ({"YOUTUBE_POT_PROVIDER_URL": "ftp://localhost"}, "valid HTTP origin"),
+        ({"YOUTUBE_POT_PROVIDER_URL": "http://local host:4416"}, "valid HTTP origin"),
+        ({"YOUTUBE_POT_PROVIDER_URL": "http://localhost:"}, "valid HTTP origin"),
         ({"DISCORD_TIMEOUT": "0"}, "positive finite number"),
         ({"DISCORD_TIMEOUT": "nan"}, "invalid"),
         ({"SAGA_ARCHIVE_WORKERS": "0"}, "between 1 and 4"),
@@ -328,6 +334,7 @@ def test_bandwidth_defaults_and_process_environment_precedence(
     result = config.load_settings(tmp_path)
 
     assert result.internet_archive_email == "process@example.com"
+    assert result.youtube_pot_provider_url == "http://127.0.0.1:4416"
     assert result.download_bytes_per_second == 30
     assert result.upload_bytes_per_second == 20
 

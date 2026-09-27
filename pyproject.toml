@@ -8,6 +8,7 @@ license = "AGPL-3.0-only"
 authors = [{ name = "EthanC", email = "16727756+EthanC@users.noreply.github.com" }]
 dependencies = [
   "archivist-py>=1.3.0",
+  "bgutil-ytdlp-pot-provider==2.0.0",
   "cronsim>=2.7",
   "discord-clyde>=1.1.0",
   "environs>=15.2.0",

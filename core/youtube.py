@@ -75,12 +75,16 @@ class YouTubeClient:
         self,
         cookies_path: Path | None = None,
         download_limiter: ByteLimiter | None = None,
+        *,
+        pot_provider_url: str = "http://127.0.0.1:4416",
     ) -> None:
         self.cookies_path = cookies_path
         self.download_limiter = download_limiter or ByteLimiter(0)
+        self.pot_provider_url = pot_provider_url
         logger.debug(
-            "Initialized YouTube client (cookies {})",
+            "Initialized YouTube client (cookies {}, PO token provider {})",
             "enabled" if cookies_path is not None else "disabled",
+            pot_provider_url,
         )
 
     def resolve_channel(self, reference: str) -> ResolvedChannel:
@@ -273,13 +277,10 @@ class YouTubeClient:
         limit: int | None,
     ) -> Iterable[DiscoveredVideo]:
         options = self._options()
-        options.update(
-            {
-                "extract_flat": True,
-                "lazy_playlist": True,
-                "extractor_args": {"youtube": {"raise_incomplete_data": ["true"]}},
-            }
-        )
+        options.update({"extract_flat": True, "lazy_playlist": True})
+        options.setdefault("extractor_args", {})["youtube"] = {
+            "raise_incomplete_data": ["true"]
+        }
         if limit is not None:
             options["playlist_items"] = f"1:{limit}"
 
@@ -315,6 +316,9 @@ class YouTubeClient:
             options["cookiefile"] = StringIO(
                 self.cookies_path.read_text(encoding="utf-8")
             )
+        options["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": [self.pot_provider_url]}
+        }
         return options
 
 

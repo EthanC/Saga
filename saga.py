@@ -44,7 +44,11 @@ async def start() -> None:
         settings,
         configurations,
         state,
-        YouTubeClient(settings.youtube_cookies_path, download_limiter),
+        YouTubeClient(
+            settings.youtube_cookies_path,
+            download_limiter,
+            pot_provider_url=settings.youtube_pot_provider_url,
+        ),
         upload_limiter=upload_limiter,
     )
     loop = asyncio.get_running_loop()

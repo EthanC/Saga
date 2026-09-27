@@ -117,16 +117,24 @@ def test_settings_allow_archival_to_be_disabled(
     assert result.media_archival_enabled is False
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("ziggy:9449", "http://ziggy:9449"),
+        ("http://ziggy.internal.:9449/", "http://ziggy.internal.:9449"),
+        ("http://ziggy_server:9449/", "http://ziggy_server:9449"),
+    ],
+)
 def test_settings_normalize_ziggy_origin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
 ) -> None:
     monkeypatch.delenv("INTERNET_ARCHIVE_EMAIL", raising=False)
     monkeypatch.delenv("INTERNET_ARCHIVE_PASSWORD", raising=False)
-    monkeypatch.setenv("ZIGGY_HOST", "ziggy:9449")
+    monkeypatch.setenv("ZIGGY_HOST", value)
     monkeypatch.setenv("ZIGGY_IDENTIFIER", "saga")
 
     result = load_settings(tmp_path)
 
-    assert result.ziggy_host == "http://ziggy:9449"
+    assert result.ziggy_host == expected
     assert result.archival_enabled is True
     assert result.media_archival_enabled is False

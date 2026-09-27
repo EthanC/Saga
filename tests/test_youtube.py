@@ -50,10 +50,11 @@ def test_video_normalization_defers_active_livestream() -> None:
 
 def test_recent_videos_only_scans_enabled_content_types(monkeypatch: Any) -> None:
     urls: list[str] = []
+    seen_options: list[dict[str, Any]] = []
 
     class FakeYoutubeDL:
         def __init__(self, options: dict[str, Any]) -> None:
-            pass
+            seen_options.append(options)
 
         def __enter__(self) -> FakeYoutubeDL:
             return self
@@ -74,7 +75,7 @@ def test_recent_videos_only_scans_enabled_content_types(monkeypatch: Any) -> Non
         url="https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa",
     )
 
-    videos = YouTubeClient().recent_videos(
+    videos = YouTubeClient(pot_provider_url="http://pot-provider:4416").recent_videos(
         channel, content_types={"short", "livestream"}
     )
 
@@ -83,6 +84,14 @@ def test_recent_videos_only_scans_enabled_content_types(monkeypatch: Any) -> Non
         ("sssssssssss", "short"),
         ("lllllllllll", "livestream"),
     }
+    assert all(
+        options["extractor_args"]
+        == {
+            "youtube": {"raise_incomplete_data": ["true"]},
+            "youtubepot-bgutilhttp": {"base_url": ["http://pot-provider:4416"]},
+        }
+        for options in seen_options
+    )
 
 
 def test_download_uses_strict_separate_formats(

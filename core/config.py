@@ -5,6 +5,7 @@ import re
 import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, tzinfo
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -18,6 +19,10 @@ INSTANCE_NAME_PATTERN = re.compile(r"[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?")
 CHANNEL_ID_PATTERN = re.compile(r"UC[A-Za-z0-9_-]{22}")
 HANDLE_PATTERN = re.compile(r"@[A-Za-z0-9._-]{3,30}")
 WEBHOOK_PATH_PATTERN = re.compile(r"/api/webhooks/\d+/[^/]+")
+HTTP_HOST_PATTERN = re.compile(
+    r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+    r"(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*"
+)
 DISCORD_WEBHOOK_HOSTS = frozenset(
     {"discord.com", "www.discord.com", "canary.discord.com", "ptb.discord.com"}
 )
@@ -97,6 +102,7 @@ class Settings:
     ziggy_host: str | None
     ziggy_identifier: str | None
     log_level: str
+    youtube_pot_provider_url: str = "http://127.0.0.1:4416"
     backup: BackupSettings = field(default_factory=BackupSettings)
     log_discord_webhook_url: str | None = None
     log_discord_level: str = "WARNING"
@@ -178,6 +184,7 @@ def load_settings(project_root: Path) -> Settings:
     data_path = _path(env.str("SAGA_DATA_PATH", "data"), project_root)
     health_value = env.str("SAGA_HEALTHCHECK_FILE", None)
     cookies_value = env.str("YOUTUBE_COOKIES_PATH", None)
+    pot_provider_value = env.str("YOUTUBE_POT_PROVIDER_URL", "http://127.0.0.1:4416")
     archive_email = env.str("INTERNET_ARCHIVE_EMAIL", None)
     archive_password = env.str("INTERNET_ARCHIVE_PASSWORD", None)
     ziggy_host = env.str("ZIGGY_HOST", None)
@@ -237,6 +244,7 @@ def load_settings(project_root: Path) -> Settings:
     else:
         default_cookies_path = config_path.parent / "cookies.txt"
         cookies_path = default_cookies_path if default_cookies_path.is_file() else None
+    pot_provider_url = _http_origin(pot_provider_value, "YOUTUBE_POT_PROVIDER_URL")
 
     notification_timeout = env.float("DISCORD_TIMEOUT", 30.0)
     if not math.isfinite(notification_timeout) or notification_timeout <= 0:
@@ -277,6 +285,7 @@ def load_settings(project_root: Path) -> Settings:
             else data_path / "healthy"
         ),
         youtube_cookies_path=cookies_path,
+        youtube_pot_provider_url=pot_provider_url,
         internet_archive_email=archive_email,
         internet_archive_password=archive_password,
         ziggy_host=ziggy_host,
@@ -516,6 +525,10 @@ def _log_level(env: Env, name: str, default: str) -> str:
 
 
 def _ziggy_url(value: str) -> str:
+    return _http_origin(value, "ZIGGY_HOST")
+
+
+def _http_origin(value: str, name: str) -> str:
     candidate = value.strip()
     if "://" not in candidate:
         candidate = f"http://{candidate}"
@@ -523,20 +536,31 @@ def _ziggy_url(value: str) -> str:
         parsed = urlsplit(candidate)
         port = parsed.port
     except ValueError as error:
-        raise ValueError("ZIGGY_HOST must be a valid HTTP origin") from error
+        raise ValueError(f"{name} must be a valid HTTP origin") from error
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.hostname
+        or not _valid_http_host(parsed.hostname)
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.netloc.endswith(":")
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
         or port is not None
         and not 1 <= port <= 65535
     ):
-        raise ValueError("ZIGGY_HOST must be a valid HTTP origin")
+        raise ValueError(f"{name} must be a valid HTTP origin")
     return candidate.rstrip("/")
+
+
+def _valid_http_host(value: str) -> bool:
+    try:
+        ip_address(value)
+    except ValueError:
+        value = value.removesuffix(".")
+        return len(value) <= 253 and HTTP_HOST_PATTERN.fullmatch(value) is not None
+    return True
 
 
 def _keys(values: set[str]) -> str:

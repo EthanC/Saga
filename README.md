@@ -107,3 +107,26 @@ ZIGGY_IDENTIFIER=saga
 ## YouTube Authentication
 
 Cookies are needed only for account-restricted videos. Follow yt-dlp's [cookie export guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) and save the file as `config/cookies.txt`. Saga loads it automatically; use `YOUTUBE_COOKIES_PATH` for another location. Keep the file private and restart Saga after replacing it.
+
+When cookies are configured, add [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) and the corresponding Saga dependency to `compose.yaml`:
+
+```yaml
+services:
+  saga:
+    depends_on:
+      saga-pot:
+        condition: service_healthy
+
+  saga-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    init: true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+```
+
+The provider generates video-bound PO tokens on the private Compose network. It is not needed when Saga runs without authentication cookies. Do not publish its unauthenticated port. For a native installation, run provider server version `2.0.0` and set `YOUTUBE_POT_PROVIDER_URL=http://127.0.0.1:4416`. The server and Python plugin versions must match.
