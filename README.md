@@ -17,7 +17,7 @@ Saga preserves YouTube channels in the Internet Archive and sends new uploads to
 - Send new upload links to one or more Discord webhooks.
 - Preserve media and watch pages in the Internet Archive.
 - Resume interrupted downloads and archive work after a restart.
-- Report discovery and preservation totals on fixed UTC intervals.
+- Report discovery and preservation totals on a UTC cron schedule.
 - Create verified SQLite backups on a cron schedule.
 - Run with Docker Compose or Python and [`uv`](https://docs.astral.sh/uv/).
 
@@ -88,7 +88,7 @@ Saga reads environment variables from the process and an optional `.env` file. P
 | `SAGA_BACKUP_TIMEZONE` | Backup schedule timezone override | IANA timezone | No | System local timezone |
 | `DISCORD_TIMEOUT` | Discord request deadline in seconds | Number | No | `30` |
 | `REPORT_DISCORD_WEBHOOK_URL` | Discord webhook for combined archival reports | URL | No | None |
-| `SAGA_REPORT_INTERVAL` | Fixed UTC report interval in seconds | Number | No | `86400` |
+| `SAGA_REPORT_SCHEDULE` | Five-field report cron expression, evaluated in UTC | String | No | `"0 0 * * *"` |
 | `SAGA_REPORT_FINALIZATION_GRACE` | Delay after a closed report window, in seconds | Number | No | `300` |
 | `YOUTUBE_COOKIES_PATH` | Netscape cookie export loaded without modifying the source file | Path | No | `"config/cookies.txt"` when present |
 | `INTERNET_ARCHIVE_EMAIL` | Internet Archive account email; enables media preservation when set with the password | String | Conditional | None |
@@ -153,7 +153,7 @@ Saga notifies each configured webhook independently. Uploads found after downtim
 
 ## Archival Reports
 
-Set `REPORT_DISCORD_WEBHOOK_URL` to send one combined report for every configured YouTube instance. Reports use fixed UTC windows. The default interval is 24 hours, and Saga waits five minutes after each window closes before freezing its metrics.
+Set `REPORT_DISCORD_WEBHOOK_URL` to send one combined report for every configured YouTube instance. Report windows run between occurrences of `SAGA_REPORT_SCHEDULE`, evaluated in UTC. The default schedule is midnight daily, and Saga waits five minutes after each window closes before freezing its metrics.
 
 The first reporting startup stores the latest closed boundary without sending a historical report. After downtime, Saga generates missed windows from oldest to newest and resumes any pending delivery. Each snapshot is committed before its Discord request, so retries retain the original values while discovery and archival continue.
 

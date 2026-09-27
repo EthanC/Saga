@@ -49,13 +49,24 @@ def subscriptions(
     return [(config, ((channel_id, config.channels[0]),))]
 
 
-def test_existing_database_gets_default_on_content_columns(tmp_path: Path) -> None:
+def test_existing_database_gets_new_schema_columns(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite"
     with closing(sqlite3.connect(path)) as connection:
         connection.execute("CREATE TABLE subscription (id INTEGER PRIMARY KEY)")
         connection.execute("INSERT INTO subscription (id) VALUES (1)")
         connection.execute("CREATE TABLE video (id VARCHAR PRIMARY KEY)")
         connection.execute("INSERT INTO video (id) VALUES ('abcdefghijk')")
+        connection.execute(
+            "CREATE TABLE reportcheckpoint ("
+            "id INTEGER PRIMARY KEY, last_window_end DATETIME NOT NULL, "
+            "interval_seconds FLOAT NOT NULL, initialized_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO reportcheckpoint VALUES "
+            "(1, '2026-01-01 00:00:00', 86400, '2026-01-01 00:00:00', "
+            "'2026-01-01 00:00:00')"
+        )
         connection.commit()
 
     state = StateStore(path)
@@ -69,6 +80,14 @@ def test_existing_database_gets_default_on_content_columns(tmp_path: Path) -> No
         ).scalar_one()
     assert policy == (1, 1, 1)
     assert content_type == "video"
+    checkpoint, initialized = state.initialize_report_checkpoint(
+        datetime(2026, 1, 2, tzinfo=UTC), "0 0 * * *"
+    )
+    assert initialized is True
+    assert checkpoint.schedule == "0 0 * * *"
+    assert checkpoint.last_window_end.replace(tzinfo=UTC) == datetime(
+        2026, 1, 2, tzinfo=UTC
+    )
     state.close()
 
 

@@ -102,10 +102,10 @@ def test_report_snapshot_uses_half_open_windows_and_freezes_metrics(
     start = datetime(2026, 1, 1, tzinfo=UTC)
     end = start + timedelta(days=1)
     add_source_data(state, start, end)
-    checkpoint, initialized = state.initialize_report_checkpoint(start, 86_400)
+    checkpoint, initialized = state.initialize_report_checkpoint(start, "0 0 * * *")
     assert initialized is True
     assert checkpoint.last_window_end.replace(tzinfo=UTC) == start
-    _, initialized = state.initialize_report_checkpoint(start, 86_400)
+    _, initialized = state.initialize_report_checkpoint(start, "0 0 * * *")
     assert initialized is False
 
     first = state.create_report_snapshot(start, end, end + timedelta(minutes=5))
@@ -151,7 +151,7 @@ def test_report_claim_retry_completion_and_restart_recovery(tmp_path: Path) -> N
     state = StateStore(tmp_path / "state.sqlite")
     start = datetime(2026, 1, 1, tzinfo=UTC)
     end = start + timedelta(days=1)
-    state.initialize_report_checkpoint(start, 86_400)
+    state.initialize_report_checkpoint(start, "0 0 * * *")
     created = state.create_report_snapshot(start, end, end)
 
     claimed = state.claim_report(end)
@@ -186,17 +186,17 @@ def test_report_claim_retry_completion_and_restart_recovery(tmp_path: Path) -> N
     state.close()
 
 
-def test_report_checkpoint_realigns_after_interval_change(tmp_path: Path) -> None:
+def test_report_checkpoint_realigns_after_schedule_change(tmp_path: Path) -> None:
     state = StateStore(tmp_path / "state.sqlite")
     first_end = datetime(2026, 1, 1, tzinfo=UTC)
-    state.initialize_report_checkpoint(first_end, 86_400)
+    state.initialize_report_checkpoint(first_end, "0 0 * * *")
 
     checkpoint, initialized = state.initialize_report_checkpoint(
-        first_end + timedelta(hours=1), 3_600
+        first_end + timedelta(hours=1), "0 * * * *"
     )
 
     assert initialized is True
-    assert checkpoint.interval_seconds == 3_600
+    assert checkpoint.schedule == "0 * * * *"
     assert checkpoint.last_window_end.replace(tzinfo=UTC) == first_end + timedelta(
         hours=1
     )

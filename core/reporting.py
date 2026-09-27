@@ -1,4 +1,4 @@
-"""Generate durable fixed-window reports and deliver them through Discord."""
+"""Generate durable scheduled reports and deliver them through Discord."""
 
 from __future__ import annotations
 
@@ -10,44 +10,43 @@ from typing import Any
 from clyde import AllowedMentions, Markdown, Timestamp, Webhook
 from clyde.components import Container, Seperator, SeperatorSpacing, TextDisplay
 from clyde.webhook import MessageFlags
+from cronsim import CronSim
 
 from core.state import Report
 
 
 @dataclass(frozen=True, slots=True)
 class ReportWindow:
-    """Represent one closed, fixed UTC reporting interval."""
+    """Represent one closed UTC reporting interval."""
 
     start: datetime
     end: datetime
 
 
-def closed_window_end(
-    now: datetime, interval_seconds: float, finalization_grace: float
+def latest_report_boundary(
+    now: datetime, schedule: str, finalization_grace: float
 ) -> datetime:
-    """Return the latest fixed boundary whose grace period has elapsed."""
+    """Return the latest cron boundary whose grace period has elapsed."""
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("current time must be timezone-aware")
-    if interval_seconds <= 0 or finalization_grace <= 0:
-        raise ValueError("report durations must be positive")
-    timestamp = (now - timedelta(seconds=finalization_grace)).timestamp()
-    return datetime.fromtimestamp(
-        timestamp // interval_seconds * interval_seconds, tz=UTC
-    )
+    if finalization_grace <= 0:
+        raise ValueError("report finalization grace must be positive")
+    cutoff = (now - timedelta(seconds=finalization_grace)).astimezone(UTC)
+    # Five-field cron occurrences are minute-aligned. Advancing to the next
+    # minute lets reverse iteration include a boundary exactly at the cutoff.
+    cursor = cutoff.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return next(CronSim(schedule, cursor, reverse=True))
 
 
 def next_report_window(
-    last_end: datetime,
-    now: datetime,
-    interval_seconds: float,
-    finalization_grace: float,
+    last_end: datetime, now: datetime, schedule: str, finalization_grace: float
 ) -> ReportWindow | None:
-    """Return the next closed interval without skipping persisted windows."""
-    interval = timedelta(seconds=interval_seconds)
-    end = _as_utc(last_end) + interval
-    if end > closed_window_end(now, interval_seconds, finalization_grace):
+    """Return the next closed cron window without skipping persisted windows."""
+    start = _as_utc(last_end)
+    end = next(CronSim(schedule, start))
+    if end > latest_report_boundary(now, schedule, finalization_grace):
         return None
-    return ReportWindow(end - interval, end)
+    return ReportWindow(start, end)
 
 
 def report_has_activity(report: Report) -> bool:

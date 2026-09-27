@@ -144,11 +144,11 @@ class ArchiveProgress(SQLModel, table=True):
 
 
 class ReportCheckpoint(SQLModel, table=True):
-    """Store the end of the last generated fixed reporting window."""
+    """Store the end of the last generated scheduled reporting window."""
 
     id: int = Field(default=1, primary_key=True)
     last_window_end: datetime
-    interval_seconds: float
+    schedule: str
     initialized_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -237,7 +237,7 @@ class StateStore:
         self._write_lock = Lock()
         event.listen(self.engine, "connect", _configure_sqlite)
         SQLModel.metadata.create_all(self.engine)
-        self._migrate_content_type_columns()
+        self._migrate_schema()
         logger.debug("Initialized SQLite state at {}", self.path)
 
     def close(self) -> None:
@@ -732,7 +732,7 @@ class StateStore:
             return retrying
 
     def initialize_report_checkpoint(
-        self, initial_end: datetime, interval_seconds: float
+        self, initial_end: datetime, schedule: str
     ) -> tuple[ReportCheckpoint, bool]:
         """Create or realign the singleton report checkpoint."""
         current = utcnow()
@@ -742,13 +742,13 @@ class StateStore:
             if checkpoint is None:
                 checkpoint = ReportCheckpoint(
                     last_window_end=initial_end,
-                    interval_seconds=interval_seconds,
+                    schedule=schedule,
                     initialized_at=current,
                     updated_at=current,
                 )
-            elif checkpoint.interval_seconds != interval_seconds:
+            elif checkpoint.schedule != schedule:
                 checkpoint.last_window_end = initial_end
-                checkpoint.interval_seconds = interval_seconds
+                checkpoint.schedule = schedule
                 checkpoint.updated_at = current
                 initialized = True
             session.add(checkpoint)
@@ -1031,13 +1031,16 @@ class StateStore:
                 )
                 logger.debug("Queued Discord delivery for video {}", discovery.id)
 
-    def _migrate_content_type_columns(self) -> None:
-        """Add default-on content policy columns to databases from older releases."""
+    def _migrate_schema(self) -> None:
+        """Add columns introduced after the initial SQLite schema."""
         schema = inspect(self.engine)
         subscription_columns = {
             column["name"] for column in schema.get_columns("subscription")
         }
         video_columns = {column["name"] for column in schema.get_columns("video")}
+        report_checkpoint_columns = {
+            column["name"] for column in schema.get_columns("reportcheckpoint")
+        }
         statements = [
             f"ALTER TABLE subscription ADD COLUMN {name} BOOLEAN NOT NULL DEFAULT 1"
             for name in ("videos", "shorts", "livestreams")
@@ -1047,6 +1050,11 @@ class StateStore:
             statements.append(
                 "ALTER TABLE video ADD COLUMN content_type VARCHAR NOT NULL "
                 "DEFAULT 'video'"
+            )
+        if "schedule" not in report_checkpoint_columns:
+            statements.append(
+                "ALTER TABLE reportcheckpoint ADD COLUMN schedule VARCHAR NOT NULL "
+                "DEFAULT ''"
             )
         if not statements:
             return

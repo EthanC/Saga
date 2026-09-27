@@ -19,7 +19,7 @@ from core.config import ContentType, Settings, YouTubeChannelConfig, YouTubeConf
 from core.logging import redact_discord_webhooks
 from core.notifications import send_video
 from core.reporting import (
-    closed_window_end,
+    latest_report_boundary,
     next_report_window,
     report_has_activity,
     send_report,
@@ -448,19 +448,19 @@ class SagaService:
 
     async def _report_loop(self) -> None:
         logger.debug(
-            "Reporting worker started with a {} second interval",
-            self.settings.report_interval,
+            "Reporting worker started with cron schedule {} UTC",
+            self.settings.report_schedule,
         )
         while not self.stop.is_set():
             try:
                 now = datetime.now(UTC)
-                initial_end = closed_window_end(
+                initial_end = latest_report_boundary(
                     now,
-                    self.settings.report_interval,
+                    self.settings.report_schedule,
                     self.settings.report_finalization_grace,
                 )
                 checkpoint, initialized = self.state.initialize_report_checkpoint(
-                    initial_end, self.settings.report_interval
+                    initial_end, self.settings.report_schedule
                 )
                 if initialized:
                     logger.info(
@@ -471,7 +471,7 @@ class SagaService:
                     window = next_report_window(
                         checkpoint.last_window_end,
                         now,
-                        self.settings.report_interval,
+                        self.settings.report_schedule,
                         self.settings.report_finalization_grace,
                     )
                     if window is not None:

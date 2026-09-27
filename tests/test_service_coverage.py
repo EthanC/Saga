@@ -169,7 +169,7 @@ def test_report_loop_initializes_without_historical_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), True
 
         def claim_report(self, now: datetime) -> None:
@@ -191,7 +191,7 @@ def test_report_loop_generates_and_suppresses_empty_report(
     item = frozen_report()
 
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), False
 
         def create_report_snapshot(self, *args: Any) -> Report:
@@ -222,7 +222,7 @@ def test_report_loop_waits_when_no_window_or_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), False
 
         def claim_report(self, now: datetime) -> None:
@@ -243,7 +243,7 @@ def test_report_loop_logs_without_webhook(tmp_path: Path) -> None:
     completed: list[str] = []
 
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), True
 
         def claim_report(self, now: datetime) -> Report:
@@ -266,7 +266,7 @@ def test_report_loop_delivers_or_retries(
     events: list[tuple[Any, ...]] = []
 
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), True
 
         def claim_report(self, now: datetime) -> Report:
@@ -330,7 +330,7 @@ def test_report_loop_propagates_delivery_cancellation(
     item = frozen_report(active=True)
 
     class State:
-        def initialize_report_checkpoint(self, end: datetime, interval: float) -> Any:
+        def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), True
 
         def claim_report(self, now: datetime) -> Report:

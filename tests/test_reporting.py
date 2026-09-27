@@ -25,32 +25,45 @@ def report(**values: Any) -> Report:
     return result
 
 
-def test_fixed_windows_observe_finalization_grace() -> None:
-    interval = 86_400
+def test_cron_windows_observe_finalization_grace() -> None:
+    schedule = "0 0 * * *"
     last_end = datetime(2026, 1, 1, tzinfo=UTC)
 
     assert (
         reporting.next_report_window(
-            last_end, datetime(2026, 1, 2, 0, 4, 59, tzinfo=UTC), interval, 300
+            last_end, datetime(2026, 1, 2, 0, 4, 59, tzinfo=UTC), schedule, 300
         )
         is None
     )
     window = reporting.next_report_window(
-        last_end, datetime(2026, 1, 2, 0, 5, tzinfo=UTC), interval, 300
+        last_end, datetime(2026, 1, 2, 0, 5, tzinfo=UTC), schedule, 300
     )
     assert window == reporting.ReportWindow(
         datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
     )
 
 
+def test_cron_windows_can_have_variable_lengths() -> None:
+    window = reporting.next_report_window(
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 2, 1, 0, 1, tzinfo=UTC),
+        "0 0 1 * *",
+        60,
+    )
+
+    assert window == reporting.ReportWindow(
+        datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC)
+    )
+
+
 def test_window_helpers_validate_inputs() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
-        reporting.closed_window_end(datetime(2026, 1, 1), 60, 5)
+        reporting.latest_report_boundary(datetime(2026, 1, 1), "* * * * *", 5)
     with pytest.raises(ValueError, match="positive"):
-        reporting.closed_window_end(datetime.now(UTC), 0, 5)
-    assert reporting.closed_window_end(
-        datetime(1970, 1, 1, 0, 0, 1, 750000, tzinfo=UTC), 0.5, 0.25
-    ) == datetime(1970, 1, 1, 0, 0, 1, 500000, tzinfo=UTC)
+        reporting.latest_report_boundary(datetime.now(UTC), "* * * * *", 0)
+    assert reporting.latest_report_boundary(
+        datetime(2026, 1, 1, 0, 1, 30, tzinfo=UTC), "* * * * *", 30
+    ) == datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
 
 
 def test_report_activity_ignores_active_channels_alone() -> None:

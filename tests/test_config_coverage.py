@@ -38,7 +38,7 @@ SETTING_NAMES = (
     "SAGA_DOWNLOAD_BYTES_PER_SECOND",
     "SAGA_UPLOAD_BYTES_PER_SECOND",
     "REPORT_DISCORD_WEBHOOK_URL",
-    "SAGA_REPORT_INTERVAL",
+    "SAGA_REPORT_SCHEDULE",
     "SAGA_REPORT_FINALIZATION_GRACE",
 )
 
@@ -159,7 +159,7 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_DOWNLOAD_BYTES_PER_SECOND": "6250000",
         "SAGA_UPLOAD_BYTES_PER_SECOND": "1250000",
         "REPORT_DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/2/report",
-        "SAGA_REPORT_INTERVAL": "3600",
+        "SAGA_REPORT_SCHEDULE": "0 * * * *",
         "SAGA_REPORT_FINALIZATION_GRACE": "30",
     }
     for name, value in values.items():
@@ -186,7 +186,7 @@ def test_load_settings_accepts_all_optional_values(
     assert result.download_bytes_per_second == 6_250_000
     assert result.upload_bytes_per_second == 1_250_000
     assert result.report_discord_webhook_url == values["REPORT_DISCORD_WEBHOOK_URL"]
-    assert result.report_interval == 3600
+    assert result.report_schedule == "0 * * * *"
     assert result.report_finalization_grace == 30
 
 
@@ -266,7 +266,8 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": "fast"}, "SAGA_UPLOAD_BYTES_PER_SECOND"),
         ({"SAGA_ARCHIVE_RETRY_DELAY": "0"}, "positive finite number"),
         ({"REPORT_DISCORD_WEBHOOK_URL": "https://example.com/hook"}, "valid Discord"),
-        ({"SAGA_REPORT_INTERVAL": "0"}, "positive finite number"),
+        ({"SAGA_REPORT_SCHEDULE": "0 * * *"}, "must have five fields"),
+        ({"SAGA_REPORT_SCHEDULE": "0 99 * * *"}, "is invalid"),
         ({"SAGA_REPORT_FINALIZATION_GRACE": "inf"}, "invalid"),
         (
             {"ZIGGY_HOST": "http://localhost:notaport", "ZIGGY_IDENTIFIER": "x"},

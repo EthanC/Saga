@@ -4,7 +4,7 @@ import math
 import re
 import tomllib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -107,7 +107,7 @@ class Settings:
     download_bytes_per_second: int = 0
     upload_bytes_per_second: int = 0
     report_discord_webhook_url: str | None = None
-    report_interval: float = 86_400.0
+    report_schedule: str = "0 0 * * *"
     report_finalization_grace: float = 300.0
 
     @property
@@ -188,8 +188,6 @@ def load_settings(project_root: Path) -> Settings:
     except ValueError as error:
         raise ValueError(f"Invalid backup environment setting: {error}") from error
     backup_schedule = env.str("SAGA_BACKUP_SCHEDULE", "0 7 * * *")
-    if len(backup_schedule.split()) != _CRON_FIELD_COUNT:
-        raise ValueError("SAGA_BACKUP_SCHEDULE must have five fields")
     backup_timezone_name = env.str("SAGA_BACKUP_TIMEZONE", None) or None
     try:
         backup_timezone = (
@@ -201,12 +199,9 @@ def load_settings(project_root: Path) -> Settings:
         raise ValueError(
             "SAGA_BACKUP_TIMEZONE must be a valid IANA timezone"
         ) from error
-    try:
-        next(CronSim(backup_schedule, datetime.now(UTC).astimezone(backup_timezone)))
-    except CronSimError as error:
-        raise ValueError(f"SAGA_BACKUP_SCHEDULE is invalid: {error}") from error
-    except StopIteration as error:
-        raise ValueError("SAGA_BACKUP_SCHEDULE has no future occurrence") from error
+    _validate_cron_schedule(
+        backup_schedule, "SAGA_BACKUP_SCHEDULE", datetime.now(UTC), backup_timezone
+    )
     backup_directory_value = env.str("SAGA_BACKUP_DIRECTORY", "backups")
     if (
         not backup_directory_value
@@ -262,7 +257,10 @@ def load_settings(project_root: Path) -> Settings:
     upload_bytes_per_second = _nonnegative_env_int(
         env, "SAGA_UPLOAD_BYTES_PER_SECOND", 0
     )
-    report_interval = _positive_env_float(env, "SAGA_REPORT_INTERVAL", 86_400.0)
+    report_schedule = env.str("SAGA_REPORT_SCHEDULE", "0 0 * * *")
+    _validate_cron_schedule(
+        report_schedule, "SAGA_REPORT_SCHEDULE", datetime.now(UTC), UTC
+    )
     report_finalization_grace = _positive_env_float(
         env, "SAGA_REPORT_FINALIZATION_GRACE", 300.0
     )
@@ -300,7 +298,7 @@ def load_settings(project_root: Path) -> Settings:
         download_bytes_per_second=download_bytes_per_second,
         upload_bytes_per_second=upload_bytes_per_second,
         report_discord_webhook_url=report_discord_webhook_url,
-        report_interval=report_interval,
+        report_schedule=report_schedule,
         report_finalization_grace=report_finalization_grace,
     )
 
@@ -474,6 +472,19 @@ def _positive_env_float(env: Env, name: str, default: float) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive finite number")
     return value
+
+
+def _validate_cron_schedule(
+    schedule: str, name: str, now: datetime, timezone: tzinfo
+) -> None:
+    if len(schedule.split()) != _CRON_FIELD_COUNT:
+        raise ValueError(f"{name} must have five fields")
+    try:
+        next(CronSim(schedule, now.astimezone(timezone)))
+    except CronSimError as error:
+        raise ValueError(f"{name} is invalid: {error}") from error
+    except StopIteration as error:
+        raise ValueError(f"{name} has no future occurrence") from error
 
 
 def _nonnegative_env_int(env: Env, name: str, default: int) -> int:
