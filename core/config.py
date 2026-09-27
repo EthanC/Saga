@@ -73,6 +73,15 @@ class BackupSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class LoggingSettings:
+    """Contain settings needed before full startup validation."""
+
+    log_level: str = "INFO"
+    log_discord_webhook_url: str | None = None
+    log_discord_level: str = "WARNING"
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Contain process-wide paths, credentials, and runtime limits."""
 
@@ -150,6 +159,13 @@ def load_youtube_configs(path: Path) -> tuple[YouTubeConfig, ...]:
     return configs
 
 
+def load_logging_settings(project_root: Path) -> LoggingSettings:
+    """Load logging settings before validating the rest of the environment."""
+    env = Env()
+    env.read_env(project_root / ".env", recurse=False)
+    return _logging_settings(env)
+
+
 def load_settings(project_root: Path) -> Settings:
     """Load process-wide settings after reading an optional project .env file."""
     env = Env()
@@ -163,8 +179,8 @@ def load_settings(project_root: Path) -> Settings:
     archive_password = env.str("INTERNET_ARCHIVE_PASSWORD", None)
     ziggy_host = env.str("ZIGGY_HOST", None)
     ziggy_identifier = env.str("ZIGGY_IDENTIFIER", None)
-    log_discord_webhook_url = env.str("LOG_DISCORD_WEBHOOK_URL", None)
     report_discord_webhook_url = env.str("REPORT_DISCORD_WEBHOOK_URL", None)
+    logging_settings = _logging_settings(env)
 
     try:
         backup_enabled = env.bool("SAGA_BACKUP_ENABLED", True)
@@ -210,10 +226,6 @@ def load_settings(project_root: Path) -> Settings:
         ziggy_host = _ziggy_url(ziggy_host)
         if not 1 <= len(ziggy_identifier or "") <= 128:
             raise ValueError("ZIGGY_IDENTIFIER must contain 1 to 128 characters")
-    if log_discord_webhook_url is not None and not _valid_webhook_url(
-        log_discord_webhook_url
-    ):
-        raise ValueError("LOG_DISCORD_WEBHOOK_URL must be a valid Discord webhook URL")
     if report_discord_webhook_url is not None and not _valid_webhook_url(
         report_discord_webhook_url
     ):
@@ -268,7 +280,7 @@ def load_settings(project_root: Path) -> Settings:
         internet_archive_password=archive_password,
         ziggy_host=ziggy_host,
         ziggy_identifier=ziggy_identifier,
-        log_level=_log_level(env, "LOG_LEVEL", "INFO"),
+        log_level=logging_settings.log_level,
         backup=BackupSettings(
             enabled=backup_enabled,
             schedule=backup_schedule,
@@ -276,8 +288,8 @@ def load_settings(project_root: Path) -> Settings:
             retention_count=backup_retention_count,
             timezone=backup_timezone,
         ),
-        log_discord_webhook_url=log_discord_webhook_url,
-        log_discord_level=_log_level(env, "LOG_DISCORD_LEVEL", "WARNING"),
+        log_discord_webhook_url=logging_settings.log_discord_webhook_url,
+        log_discord_level=logging_settings.log_discord_level,
         notification_timeout=notification_timeout,
         archive_workers=archive_workers,
         archive_retry_delay=archive_retry_delay,
@@ -469,6 +481,17 @@ def _nonnegative_env_int(env: Env, name: str, default: int) -> int:
     if not value or re.fullmatch(r"[0-9]+", value) is None:
         raise ValueError(f"{name} must be a non-negative integer")
     return int(value)
+
+
+def _logging_settings(env: Env) -> LoggingSettings:
+    webhook_url = env.str("LOG_DISCORD_WEBHOOK_URL", None)
+    if webhook_url is not None and not _valid_webhook_url(webhook_url):
+        raise ValueError("LOG_DISCORD_WEBHOOK_URL must be a valid Discord webhook URL")
+    return LoggingSettings(
+        log_level=_log_level(env, "LOG_LEVEL", "INFO"),
+        log_discord_webhook_url=webhook_url,
+        log_discord_level=_log_level(env, "LOG_DISCORD_LEVEL", "WARNING"),
+    )
 
 
 def _log_level(env: Env, name: str, default: str) -> str:

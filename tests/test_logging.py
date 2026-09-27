@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from io import StringIO
 from pathlib import Path
@@ -5,8 +6,9 @@ from typing import Any
 
 import pytest
 
+import saga
 from core import logging as logging_config
-from core.config import Settings
+from core.config import LoggingSettings, Settings, load_logging_settings
 
 
 def settings(webhook_url: str | None = None) -> Settings:
@@ -86,6 +88,45 @@ def test_configure_logging_adds_warning_discord_sink(
     assert sink_calls == [(url, False)]
     assert len(fake.sinks) == 2
     assert fake.sinks[1][1]["level"] == "WARNING"
+
+
+def test_load_logging_settings_ignores_unrelated_invalid_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    webhook_url = "https://discord.com/api/webhooks/1/log-token"
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("LOG_DISCORD_WEBHOOK_URL", webhook_url)
+    monkeypatch.setenv("LOG_DISCORD_LEVEL", "ERROR")
+    monkeypatch.setenv("SAGA_BACKUP_ENABLED", "invalid")
+
+    result = load_logging_settings(tmp_path)
+
+    assert result == LoggingSettings("DEBUG", webhook_url, "ERROR")
+
+
+def test_start_configures_logging_before_full_settings_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logging_settings = LoggingSettings()
+    calls: list[str] = []
+
+    monkeypatch.setattr(saga, "load_logging_settings", lambda _: logging_settings)
+
+    def configure(settings: Settings | LoggingSettings) -> None:
+        assert settings is logging_settings
+        calls.append("configure")
+
+    def fail_settings(_: Path) -> None:
+        calls.append("settings")
+        raise ValueError("invalid environment")
+
+    monkeypatch.setattr(saga, "configure_logging", configure)
+    monkeypatch.setattr(saga, "load_settings", fail_settings)
+
+    with pytest.raises(ValueError, match="invalid environment"):
+        asyncio.run(saga.start())
+
+    assert calls == ["configure", "settings"]
 
 
 def test_redact_discord_webhooks_handles_full_and_path_only_urls() -> None:

@@ -9,7 +9,7 @@ from sys import stderr, stdout
 from loguru import logger
 from loguru_discord import DiscordSink
 
-from core.config import Settings
+from core.config import LoggingSettings, Settings
 
 DISCORD_WEBHOOK_PATTERN = re.compile(
     r"(?:https://(?:www\.)?discord\.com)?"
@@ -41,7 +41,7 @@ class _SafeDiscordSink(logging.Handler):
             )
 
 
-def configure_logging(settings: Settings) -> None:
+def configure_logging(settings: Settings | LoggingSettings) -> None:
     """Configure console, Discord, and standard-library logging."""
     logger.level(settings.log_level)
     logger.level(settings.log_discord_level)

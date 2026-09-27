@@ -8,7 +8,7 @@ from filelock import FileLock, Timeout
 from loguru import logger
 
 from core.bandwidth import ByteLimiter
-from core.config import load_settings, load_youtube_configs
+from core.config import load_logging_settings, load_settings, load_youtube_configs
 from core.logging import configure_logging
 from core.service import SagaService
 from core.state import StateStore
@@ -19,8 +19,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 async def start() -> None:
     """Validate configuration and run Saga until a termination signal."""
+    configure_logging(load_logging_settings(PROJECT_ROOT))
     settings = load_settings(PROJECT_ROOT)
-    configure_logging(settings)
 
     logger.debug("Loading YouTube configuration from {}", settings.config_path)
     configurations = load_youtube_configs(settings.config_path)
@@ -80,4 +80,5 @@ if __name__ == "__main__":
         pass
     except Exception:
         logger.exception("Saga stopped due to a fatal error")
+        logger.complete()
         raise SystemExit(1) from None
