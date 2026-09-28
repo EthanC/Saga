@@ -317,14 +317,23 @@ def test_metadata_and_identifier_preserve_video_id_case() -> None:
         channel_url="https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa",
         webpage_url="https://www.youtube.com/watch?v=AbCdEfGhI12",
         estimated_bytes=None,
+        tags=("video essay", "Caf\u00e9"),
     )
 
     frozen = freeze_metadata(details)
 
     assert frozen.identifier == "cafe-a-test-AbCdEfGhI12"
     assert frozen.title == "Caf\u00e9: A / Test? | @Handle | YouTube"
-    assert frozen.subjects == ("youtube", "video", "@Handle", "AbCdEfGhI12")
+    assert frozen.subjects == (
+        "youtube",
+        "video",
+        "@Handle",
+        "AbCdEfGhI12",
+        "video essay",
+        "Caf\u00e9",
+    )
     assert "Published: 2026-02-03" in frozen.description
+    assert "Tags: video essay, Caf\u00e9" in frozen.description
     assert frozen.description.endswith(
         "Powered by Saga (https://github.com/EthanC/Saga)"
     )

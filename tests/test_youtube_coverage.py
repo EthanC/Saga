@@ -163,13 +163,16 @@ def complete_metadata(**changes: Any) -> dict[str, Any]:
 def test_video_metadata_returns_complete_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake_downloader(monkeypatch, complete_metadata())
+    fake_downloader(
+        monkeypatch, complete_metadata(tags=[" Tag One ", "Tag Two", "Tag One", ""])
+    )
 
     result = youtube.YouTubeClient().video_metadata("abcdefghijk")
 
     assert result.title == "Video"
     assert result.estimated_bytes == 12
     assert result.published_precise is True
+    assert result.tags == ("Tag One", "Tag Two")
 
 
 @pytest.mark.parametrize(
@@ -213,6 +216,7 @@ def test_full_metadata_uses_fallbacks_and_requested_format_sizes() -> None:
     assert result.channel_handle == CHANNEL.id
     assert result.channel_url == CHANNEL.url
     assert result.description == ""
+    assert result.tags == ()
     assert result.estimated_bytes == 9
     assert result.published_at == datetime(2024, 1, 2, tzinfo=UTC)
     assert result.published_precise is False

@@ -56,6 +56,7 @@ class VideoMetadata:
     estimated_bytes: int | None
     published_at: datetime | None = None
     published_precise: bool = False
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,6 +526,16 @@ def _full_metadata(info: dict[str, Any], expected_id: str) -> VideoMetadata:
     description = info.get("description")
     if not isinstance(description, str):
         description = ""
+    raw_tags = info.get("tags")
+    tags = (
+        tuple(
+            dict.fromkeys(
+                tag.strip() for tag in raw_tags if isinstance(tag, str) and tag.strip()
+            )
+        )
+        if isinstance(raw_tags, list)
+        else ()
+    )
 
     estimated = info.get("filesize_approx") or info.get("filesize")
     if not isinstance(estimated, int) or isinstance(estimated, bool) or estimated <= 0:
@@ -561,6 +572,7 @@ def _full_metadata(info: dict[str, Any], expected_id: str) -> VideoMetadata:
         estimated_bytes=estimated,
         published_at=published_at,
         published_precise=published_precise,
+        tags=tags,
     )
 
 

@@ -870,13 +870,15 @@ def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
         published = details.published_at.astimezone(UTC).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
         )
+    tags = f"Tags: {', '.join(details.tags)}\n" if details.tags else ""
     description = (
         f"{details.description.rstrip()}\n\n"
         f"Published: {published}\n"
         f"YouTube URL: {details.webpage_url}\n"
         f"Channel username: {username}\n"
         f"Channel display name: {details.channel_name}\n"
-        f"Channel URL: {details.channel_url}\n\n"
+        f"Channel URL: {details.channel_url}\n"
+        f"{tags}\n"
         "Powered by Saga (https://github.com/EthanC/Saga)"
     ).lstrip()
     return FrozenArchiveMetadata(
@@ -886,7 +888,9 @@ def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
         media_name=f"{identifier}.mkv",
         title=f"{details.title} | {username} | YouTube",
         description=description,
-        subjects=("youtube", "video", username, details.id),
+        subjects=tuple(
+            dict.fromkeys(("youtube", "video", username, details.id, *details.tags))
+        ),
         creator=details.channel_name,
         upload_date=_iso_date(details.upload_date),
         channel_username=username,
