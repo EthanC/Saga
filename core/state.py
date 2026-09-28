@@ -545,10 +545,19 @@ class StateStore:
     def claim_archive(
         self, *, prefer_recent: bool, now: datetime | None = None
     ) -> ArchiveWork | None:
-        """Claim one due archive row, optionally favoring notification candidates."""
+        """Claim one due archive row, prioritizing downstream archive stages."""
         current = now or utcnow()
         terminal = ("complete", "unavailable", "operator_action")
         queue_order = (
+            case(
+                (col(ArchiveProgress.status) == "cleanup", 0),
+                (col(ArchiveProgress.status).in_(("uploading", "reconcile_upload")), 1),
+                (col(ArchiveProgress.status).in_(("webpage", "wayback_wait")), 2),
+                (col(ArchiveProgress.status) == "upload", 3),
+                (col(ArchiveProgress.status) == "download", 4),
+                (col(ArchiveProgress.status) == "metadata", 5),
+                else_=6,
+            ),
             case((col(ArchiveProgress.failure_phase) == "disk", 1), else_=0),
             *(
                 (case((col(Video.notification_candidate).is_(True), 0), else_=1),)

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -38,6 +39,7 @@ from niquests import Response
 from sqlmodel import Session
 
 from core import archival
+from core import state as state_module
 from core.archival import (
     ArchiveGateway,
     ArchiveProcessor,
@@ -52,6 +54,7 @@ from core.archival import (
 )
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings, YouTubeChannelConfig, YouTubeConfig
+from core.service import SagaService
 from core.state import (
     ArchiveProgress,
     ArchiveWork,
@@ -181,6 +184,125 @@ class FakeGateway:
 
     def page_status(self, job_id: str) -> Any:
         raise AssertionError("not used")
+
+
+def test_single_worker_finishes_staged_media_before_metadata_backlog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(state_module, "utcnow", lambda: now)
+    monkeypatch.setattr(archival, "utcnow", lambda: now)
+    state = StateStore(tmp_path / "saga.sqlite")
+    video_id, media, _ = seed_upload(state, tmp_path)
+    state.update_archive(video_id, status="download")
+    backlog = tuple(
+        DiscoveredVideo(
+            id=f"{index:011d}",
+            title=f"Backlog {index}",
+            published_at=datetime(2019, 1, index + 1, tzinfo=UTC),
+            live_status="not_live",
+            replay_ready=True,
+        )
+        for index in range(3)
+    )
+    state.record_discoveries("UCaaaaaaaaaaaaaaaaaaaaaa", backlog, backfill=True)
+    with Session(state.engine) as session:
+        staged = session.get(ArchiveProgress, video_id)
+        assert staged is not None
+        staged.updated_at = now
+        session.add(staged)
+        for item in backlog:
+            progress = session.get(ArchiveProgress, item.id)
+            assert progress is not None
+            progress.updated_at = datetime(2020, 1, 1, tzinfo=UTC)
+            session.add(progress)
+            video = session.get(Video, item.id)
+            assert video is not None
+            video.notification_candidate = True
+            session.add(video)
+        session.commit()
+
+    class Youtube:
+        def download_video(self, *_: Any, **__: Any) -> Path:
+            return media
+
+    class CompletingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inspection = Inspection("verified")
+
+        def upload(self, metadata: FrozenArchiveMetadata, media_path: Path) -> None:
+            with Session(state.engine) as session:
+                progress = session.get(ArchiveProgress, video_id)
+                assert progress is not None
+                assert progress.status == "uploading"
+                assert progress.claimed_at is not None
+            super().upload(metadata, media_path)
+
+        def page_status(self, job_id: str) -> InternetArchiveSuccessStatus:
+            return InternetArchiveSuccessStatus(
+                job_id, "https://web.archive.org/example", utcnow()
+            )
+
+    monkeypatch.setattr(
+        archival,
+        "verify_media",
+        lambda path: MediaFile(
+            path,
+            4,
+            "098f6bcd4621d373cade4e832627b4f6",
+            "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
+        ),
+    )
+    gateway = CompletingGateway()
+    configured = settings(tmp_path)
+    youtube = cast(Any, Youtube())
+    processor = ArchiveProcessor(configured, state, youtube, gateway)
+    service = SagaService(configured, (), state, youtube, archival=processor)
+    stages = (
+        "download",
+        "upload",
+        "reconcile_upload",
+        "webpage",
+        "wayback_wait",
+        "cleanup",
+    )
+    claimed: list[tuple[str, str]] = []
+    claim_archive = state.claim_archive
+
+    def claim_next(*, prefer_recent: bool) -> ArchiveWork | None:
+        nonlocal now
+        if len(claimed) == len(stages):
+            service.request_stop()
+            return None
+        # Let persisted retry and polling deadlines pass between worker iterations.
+        now += timedelta(seconds=2)
+        work = claim_archive(prefer_recent=prefer_recent)
+        assert work is not None
+        claimed.append((work.video.id, work.progress.status))
+        return work
+
+    monkeypatch.setattr(state, "claim_archive", claim_next)
+    asyncio.run(service._archive_loop(0))
+
+    assert claimed == [(video_id, stage) for stage in stages]
+    with Session(state.engine) as session:
+        progress = session.get(ArchiveProgress, video_id)
+        assert progress is not None
+        assert progress.status == "complete"
+        assert progress.media_verified_at is not None
+        assert progress.cleaned_at is not None
+        for item in backlog:
+            queued = session.get(ArchiveProgress, item.id)
+            assert queued is not None
+            assert queued.status == "metadata"
+            assert queued.attempts == 0
+    assert gateway.upload_calls == 1
+    assert not media.exists()
+    next_work = claim_archive(prefer_recent=False)
+    assert next_work is not None
+    assert next_work.progress.status == "metadata"
+    state.close()
 
 
 def test_metadata_and_identifier_preserve_video_id_case() -> None:
