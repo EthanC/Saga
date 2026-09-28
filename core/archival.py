@@ -612,7 +612,7 @@ class ArchiveProcessor:
                 last_error=inspection.detail,
             )
         else:
-            logger.warning(
+            logger.info(
                 "Archive.org item for video {} is not yet verified: {}",
                 work.video.id,
                 inspection.detail,
