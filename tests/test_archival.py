@@ -325,6 +325,9 @@ def test_metadata_and_identifier_preserve_video_id_case() -> None:
     assert frozen.title == "Caf\u00e9: A / Test? | @Handle | YouTube"
     assert frozen.subjects == ("youtube", "video", "@Handle", "AbCdEfGhI12")
     assert "Published: 2026-02-03" in frozen.description
+    assert frozen.description.endswith(
+        "Powered by Saga (https://github.com/EthanC/Saga)"
+    )
     assert archive_identifier("x" * 200, details.id).endswith("-AbCdEfGhI12")
     assert len(archive_identifier("x" * 200, details.id)) == 100
 

@@ -876,7 +876,8 @@ def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
         f"YouTube URL: {details.webpage_url}\n"
         f"Channel username: {username}\n"
         f"Channel display name: {details.channel_name}\n"
-        f"Channel URL: {details.channel_url}"
+        f"Channel URL: {details.channel_url}\n\n"
+        "Powered by Saga (https://github.com/EthanC/Saga)"
     ).lstrip()
     return FrozenArchiveMetadata(
         identifier=identifier,
