@@ -324,9 +324,30 @@ def test_metadata_and_identifier_preserve_video_id_case() -> None:
     assert frozen.identifier == "cafe-a-test-AbCdEfGhI12"
     assert frozen.title == "Caf\u00e9: A / Test? | @Handle | YouTube"
     assert frozen.subjects == ("youtube", "video", "@Handle", "AbCdEfGhI12")
-    assert "Original upload date: 2026-02-03" in frozen.description
+    assert "Published: 2026-02-03" in frozen.description
     assert archive_identifier("x" * 200, details.id).endswith("-AbCdEfGhI12")
     assert len(archive_identifier("x" * 200, details.id)) == 100
+
+
+def test_metadata_description_includes_precise_publication_time() -> None:
+    details = VideoMetadata(
+        id="AbCdEfGhI12",
+        title="Title",
+        description="Description",
+        upload_date="20260203",
+        channel_id="UCaaaaaaaaaaaaaaaaaaaaaa",
+        channel_name="Display Name",
+        channel_handle="@Handle",
+        channel_url="https://www.youtube.com/channel/UCaaaaaaaaaaaaaaaaaaaaaa",
+        webpage_url="https://www.youtube.com/watch?v=AbCdEfGhI12",
+        estimated_bytes=None,
+        published_at=datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC),
+        published_precise=True,
+    )
+
+    frozen = freeze_metadata(details)
+
+    assert "Published: 2026-02-03 04:05:06 UTC" in frozen.description
 
 
 def test_item_inspection_requires_provenance_and_all_checksums() -> None:

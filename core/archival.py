@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import unicodedata
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import UTC, date
 from hashlib import md5, sha1
 from pathlib import Path
 from threading import Lock
@@ -865,9 +865,14 @@ def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
     operation_id = str(uuid4())
     identifier = archive_identifier(details.title, details.id)
     username = details.channel_handle
+    published = _iso_date(details.upload_date)
+    if details.published_precise and details.published_at is not None:
+        published = details.published_at.astimezone(UTC).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
     description = (
         f"{details.description.rstrip()}\n\n"
-        f"Original upload date: {_iso_date(details.upload_date)}\n"
+        f"Published: {published}\n"
         f"YouTube URL: {details.webpage_url}\n"
         f"Channel username: {username}\n"
         f"Channel display name: {details.channel_name}\n"
