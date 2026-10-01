@@ -122,7 +122,7 @@ def test_build_report_webhook_uses_exact_component_shape() -> None:
     assert "Videos 1 | 10 Lifetime" in statistics
     assert "Shorts 2 | 20 Lifetime" in statistics
     assert "Livestreams 3 | 30 Lifetime" in statistics
-    assert "Media preserved: **1.0 KiB** | **1.0 MiB** Lifetime" in statistics
+    assert "Bytes uploaded: **1.0 KiB** | **1.0 MiB** Lifetime" in statistics
     assert separator.divider is True
     assert "Report for" in footer.content
     assert not isinstance(webhook.content, str)

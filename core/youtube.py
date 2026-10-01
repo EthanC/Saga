@@ -204,16 +204,27 @@ class YouTubeClient:
         *,
         minimum_free_bytes: int,
         estimated_bytes: int | None,
+        disk_guard: Callable[[int, int], None] | None = None,
     ) -> Path:
         """Resume a strict bestvideo+bestaudio download and return its MKV path."""
         directory.mkdir(parents=True, exist_ok=True)
         output = directory / "media.mkv"
-        if output.is_file():
-            logger.info(
-                "Resuming archive workflow with existing media for {}", video_id
-            )
-            return output
-
+        marker = directory / "download.json"
+        if output.is_file() and marker.is_file():
+            try:
+                completed = json.loads(marker.read_text(encoding="utf-8"))
+            except ValueError, OSError:
+                completed = {}
+            if completed == {"video_id": video_id, "size": output.stat().st_size} and (
+                output.stat().st_size > 0
+            ):
+                return output
+        # A final filename without a completion receipt is not a completed download.
+        output.unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
+        merging = directory / "merging.mkv"
+        if merging.exists():
+            merging.unlink()
         # ffmpeg keeps both input streams while writing the merged output.
         required = minimum_free_bytes + 2 * max(estimated_bytes or 0, 0)
         free = shutil.disk_usage(directory).free
@@ -229,6 +240,27 @@ class YouTubeClient:
         logger.info("Downloading video {} to archive staging", video_id)
 
         options = self._options()
+        streams: dict[str, tuple[int, int]] = {}
+
+        def guard(event: dict[str, Any]) -> None:
+            downloaded = max(int(event.get("downloaded_bytes") or 0), 0)
+            total = max(
+                int(
+                    event.get("total_bytes")
+                    or event.get("total_bytes_estimate")
+                    or downloaded
+                ),
+                downloaded,
+            )
+            streams[str(event.get("filename", "media"))] = total, downloaded
+            expected = max(
+                sum(value[0] for value in streams.values()), estimated_bytes or 0
+            )
+            if disk_guard:
+                disk_guard(expected, sum(value[1] for value in streams.values()))
+            elif shutil.disk_usage(directory).free < minimum_free_bytes + expected:
+                raise DiskSpaceError("insufficient space for temporary merge output")
+
         options.update(
             {
                 "skip_download": False,
@@ -238,7 +270,8 @@ class YouTubeClient:
                 "continuedl": True,
                 "skip_unavailable_fragments": False,
                 "overwrites": False,
-                "outtmpl": {"default": str(directory / "media.%(ext)s")},
+                "progress_hooks": [guard],
+                "outtmpl": {"default": str(directory / "merging.%(ext)s")},
             }
         )
         downloader_type: type[Any] = YoutubeDL
@@ -263,10 +296,17 @@ class YouTubeClient:
             raise _classify_download_error(error) from error
         if result != 0:
             raise RuntimeError(f"yt-dlp exited with status {result} for {video_id}")
-        if not output.is_file():
+        if not merging.is_file() or merging.stat().st_size == 0:
             raise RuntimeError(
                 f"yt-dlp did not produce the expected MKV for {video_id}"
             )
+        merging.replace(output)
+        temporary_marker = marker.with_suffix(".tmp")
+        temporary_marker.write_text(
+            json.dumps({"video_id": video_id, "size": output.stat().st_size}),
+            encoding="utf-8",
+        )
+        temporary_marker.replace(marker)
         logger.info("Downloaded video {}", video_id)
         return output
 

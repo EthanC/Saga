@@ -44,7 +44,7 @@ docker compose up -d
 
 ## Python
 
-Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, ffprobe, and Deno, then install the dependencies:
+Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then install the dependencies:
 
 ```console
 uv sync
@@ -87,11 +87,37 @@ References accept handles, channel IDs, and YouTube channel URLs. Videos, Shorts
 
 ## Archival Reports
 
-Set `REPORT_DISCORD_WEBHOOK_URL` for Discord reports covering discoveries, archived media, and unfinished work. Reports run at midnight UTC by default and are written to the log when no webhook is set.
+Set `REPORT_DISCORD_WEBHOOK_URL` for Discord reports covering discoveries, videos uploaded, bytes uploaded, lifetime uploads, and outstanding transfers. Reports run at midnight UTC by default and are written to the log when no webhook is set. Validation and webpage results are reported separately.
+
+Report semantics version 2 counts a video when its upload acknowledgement commits. Recovered and migrated uploads contribute to lifetime totals but are excluded from the reporting window's newly transferred videos and bytes. Existing version 1 snapshots retain their stored counts and labels.
 
 ## Preservation
 
-Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encoding, validates it, and uploads it to `opensource_movies`. Remote files are verified before local deletion. Failed work is retried, and scheduled livestreams wait for a replay.
+Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encoding and uploads it to `opensource_movies`. Download completion is recorded after a successful downloader/merge result, a nonempty output, and an atomic rename. A leftover MKV without its completion receipt is downloaded again.
+
+Internet Archive's acknowledgement of the expected original file completes the transfer. Saga saves the item ID, operation ID, filename, size, receipt, ETag, and completion time before scheduling staging deletion. Derivative processing, public visibility, validation, and webpage capture do not delay cleanup or upload reporting.
+
+The default pipeline has one upload worker, one download worker, and a buffer of two upload-ready files. Downloads reserve space for both their streams and ffmpeg's merge output. Saga pauses new downloads when the buffer or disk budget is full and keeps uploads running. `SAGA_UNKNOWN_DOWNLOAD_BYTES` supplies an estimate when YouTube omits one; progress hooks adjust reservations as stream sizes become known. Failed transfers release their worker and retry with exponential backoff and jitter.
+
+Validation is disabled by default. Enable `SAGA_VALIDATION_ENABLED` for one remote-only validation worker using saved receipts, sizes, and existing checksums. Background validation, recovery checks, and captures each have separate claims, request timeouts, a deadline, and a retry budget. No automatic upload or status-check path hashes staging files or runs ffprobe.
+
+If a connection is lost before acknowledgement, Saga retains staging and checks the persisted operation's remote original in the recovery queue. Confirmed originals become recovered completions; confirmed missing files return to upload priority. Ambiguous outcomes expire after the background budget while other transfers continue. Saga pins Archivist 1.3.0 and supplies its transport-only recovery extension in `core/transport.py`; recovery rechecks account ownership and Saga provenance before a missing-file PUT.
+
+`data/transfers.json` records the last successful upload, active transfer byte progress, oldest due ready file, staging usage, disk reservations, download-pause reason, and cumulative worker time. The healthcheck requires both a polling heartbeat and a recent transfer-health record. Upload work with no progress or waiting reason for `SAGA_TRANSFER_STALL_TIMEOUT` seconds produces an error and an unhealthy result.
+
+### Migrating an Existing Queue
+
+1. Stop the old Saga instance and retain a consistent SQLite backup. The new version also creates `saga.sqlite.pre-upload-first.sqlite3` before changing a legacy schema.
+2. Rehearse with a consistent backup using the tested version:
+
+   ```console
+   uv run python -m core.migration data/saga.sqlite --directory data/migration-rehearsal
+   ```
+
+   The command migrates an online SQLite snapshot twice, checks database integrity and foreign keys, and prints its path. It leaves the source database unchanged.
+3. Deploy the tested image pinned to its `sha-<full-commit>` tag or digest. Start one Saga instance against the original data directory. Startup applies the idempotent schema and queue migration under Saga's process lock.
+4. Verified historical successes become upload completions with their original verification timestamp. Their pending staging cleanup and capture jobs are scheduled independently. Interrupted uploads, including the stuck originals described in `PLAN.md`, enter remote recovery using their saved file facts. Staging is deleted only after those originals are confirmed. Upload-ready rows with missing media, including `0UCmCkIDANU`, return to downloading.
+5. Check `transfers.json`, the logs, and the next version 2 report as transfers resume. Keep the pre-migration backup and the pinned previous image until the queue and reclaimed staging have been checked.
 
 ## Webpage Capture
 

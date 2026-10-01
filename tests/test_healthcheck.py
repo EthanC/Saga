@@ -41,7 +41,12 @@ def test_healthcheck_respects_heartbeat_age_and_polling_schedule(
     monkeypatch.setattr(
         healthcheck,
         "load_settings",
-        lambda _: SimpleNamespace(healthcheck_file=path, config_path=tmp_path),
+        lambda _: SimpleNamespace(
+            healthcheck_file=path,
+            config_path=tmp_path,
+            data_path=tmp_path,
+            archival_enabled=False,
+        ),
     )
     monkeypatch.setattr(
         healthcheck,
@@ -102,6 +107,7 @@ def test_container_probe_exit_status(tmp_path: Path, age: int) -> None:
     )
     heartbeat = tmp_path / "custom-heartbeat"
     heartbeat.touch()
+    (tmp_path / "transfers.json").write_text('{"healthy": true}', encoding="utf-8")
     timestamp = time.time() - age
     os.utime(heartbeat, (timestamp, timestamp))
     environment = {

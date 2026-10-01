@@ -238,20 +238,11 @@ def test_archive_claim_prioritizes_downstream_stages(
         if (work := store.claim_archive(prefer_recent=prefer_recent)) is not None
     ]
 
-    assert claimed == [
-        "ccccccccccc",
-        "rrrrrrrrrrr",
-        "iiiiiiiiiii",
-        "wwwwwwwwwww",
-        "ppppppppppp",
-        "uuuuuuuuuuu",
-        "ddddddddddd",
-        "mmmmmmmmmmm",
-    ]
+    assert claimed == ["uuuuuuuuuuu", "ddddddddddd", "mmmmmmmmmmm"]
     store.close()
 
 
-@pytest.mark.parametrize("status", ["cleanup", "reconcile_upload", "wayback_wait"])
+@pytest.mark.parametrize("status", ["upload", "download"])
 def test_archive_claim_skips_high_priority_future_retry(
     tmp_path: Path, status: str
 ) -> None:
@@ -325,11 +316,7 @@ def test_archive_notification_preference_is_limited_to_stage_class(
 @pytest.mark.parametrize("prefer_recent", [False, True])
 @pytest.mark.parametrize(
     ("older_stage", "newer_stage"),
-    [
-        ("upload", "upload"),
-        ("uploading", "reconcile_upload"),
-        ("wayback_wait", "webpage"),
-    ],
+    [("upload", "upload"), ("download", "download"), ("metadata", "metadata")],
 )
 def test_archive_claim_keeps_oldest_first_within_stage_class(
     tmp_path: Path, prefer_recent: bool, older_stage: str, newer_stage: str

@@ -108,6 +108,14 @@ class Settings:
     log_discord_level: str = "WARNING"
     notification_timeout: float = 30.0
     archive_workers: int = 1
+    upload_workers: int = 1
+    download_workers: int = 1
+    upload_ready_buffer: int = 2
+    unknown_download_bytes: int = 10_000_000_000
+    validation_enabled: bool = False
+    background_max_attempts: int = 12
+    background_deadline: float = 86_400.0
+    transfer_stall_timeout: float = 900.0
     archive_retry_delay: float = 300.0
     archive_request_timeout: float = 60.0
     archive_poll_timeout: float = 900.0
@@ -253,6 +261,19 @@ def load_settings(project_root: Path) -> Settings:
     archive_workers = env.int("SAGA_ARCHIVE_WORKERS", 1)
     if not 1 <= archive_workers <= 4:
         raise ValueError("SAGA_ARCHIVE_WORKERS must be between 1 and 4")
+    upload_workers = _worker_count(env, "SAGA_UPLOAD_WORKERS", 1)
+    download_workers = _worker_count(env, "SAGA_DOWNLOAD_WORKERS", 1)
+    upload_ready_buffer = _nonnegative_env_int(env, "SAGA_UPLOAD_READY_BUFFER", 2)
+    unknown_download_bytes = _nonnegative_env_int(
+        env, "SAGA_UNKNOWN_DOWNLOAD_BYTES", 10_000_000_000
+    )
+    background_max_attempts = _nonnegative_env_int(
+        env, "SAGA_BACKGROUND_MAX_ATTEMPTS", 12
+    )
+    if min(upload_ready_buffer, unknown_download_bytes, background_max_attempts) < 1:
+        raise ValueError(
+            "buffer, download reservation, and retry budget must be positive"
+        )
     archive_retry_delay = _positive_env_float(env, "SAGA_ARCHIVE_RETRY_DELAY", 300.0)
     archive_request_timeout = _positive_env_float(
         env, "SAGA_ARCHIVE_REQUEST_TIMEOUT", 60.0
@@ -302,6 +323,18 @@ def load_settings(project_root: Path) -> Settings:
         log_discord_level=logging_settings.log_discord_level,
         notification_timeout=notification_timeout,
         archive_workers=archive_workers,
+        upload_workers=upload_workers,
+        download_workers=download_workers,
+        upload_ready_buffer=upload_ready_buffer,
+        unknown_download_bytes=unknown_download_bytes,
+        validation_enabled=env.bool("SAGA_VALIDATION_ENABLED", False),
+        background_max_attempts=background_max_attempts,
+        background_deadline=_positive_env_float(
+            env, "SAGA_BACKGROUND_DEADLINE", 86_400
+        ),
+        transfer_stall_timeout=_positive_env_float(
+            env, "SAGA_TRANSFER_STALL_TIMEOUT", 900
+        ),
         archive_retry_delay=archive_retry_delay,
         archive_request_timeout=archive_request_timeout,
         archive_poll_timeout=archive_poll_timeout,
@@ -504,6 +537,13 @@ def _nonnegative_env_int(env: Env, name: str, default: int) -> int:
     if not value or re.fullmatch(r"[0-9]+", value) is None:
         raise ValueError(f"{name} must be a non-negative integer")
     return int(value)
+
+
+def _worker_count(env: Env, name: str, default: int) -> int:
+    value = _nonnegative_env_int(env, name, default)
+    if not 1 <= value <= 4:
+        raise ValueError(f"{name} must be between 1 and 4")
+    return value
 
 
 def _logging_settings(env: Env) -> LoggingSettings:

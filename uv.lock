@@ -935,7 +935,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "archivist-py", specifier = ">=1.3.0" },
+    { name = "archivist-py", specifier = "==1.3.0" },
     { name = "bgutil-ytdlp-pot-provider", specifier = "==2.0.0" },
     { name = "cronsim", specifier = ">=2.7" },
     { name = "discord-clyde", specifier = ">=1.1.0" },

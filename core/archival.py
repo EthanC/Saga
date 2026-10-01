@@ -1,18 +1,18 @@
-"""Restart-safe video, Archive.org, webpage, and local cleanup workflow."""
+"""Upload-first transfers with independent capture, recovery, and cleanup jobs."""
 
 from __future__ import annotations
 
 import json
 import shutil
-import subprocess
+import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, date
-from hashlib import md5, sha1
+from http.client import HTTPException
 from pathlib import Path
-from threading import Lock
-from typing import Any, Protocol
-from urllib.error import HTTPError, URLError
+from typing import Any, Protocol, cast
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
@@ -20,36 +20,32 @@ from archivist import (
     AuthenticationError,
     InternetArchiveAccount,
     InternetArchiveCaptureStatus,
-    InternetArchiveClient,
     InternetArchiveFailedStatus,
     InternetArchiveItem,
     InternetArchiveItemAvailability,
-    InternetArchiveItemTaskState,
     InternetArchivePendingStatus,
-    InternetArchiveRecoveryDeferredError,
-    InternetArchiveRecoveryError,
-    InternetArchiveRecoveryResult,
     InternetArchiveSuccessStatus,
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
     InternetArchiveUploadOptions,
+    InternetArchiveUploadResult,
     InvalidOptionError,
     NetworkError,
-    PollingTimeoutError,
     RateLimitError,
+    ServiceError,
 )
 from loguru import logger
 from niquests import Session
 
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings
-from core.state import ArchiveWork, StateStore, utcnow
+from core.state import ArchiveWork, StateStore, retry_delay, utcnow
+from core.transport import RecoveryConflictError, TransportArchiveClient
 from core.youtube import (
     DiskSpaceError,
     VideoMetadata,
     VideoUnavailableError,
     YouTubeClient,
-    verify_media,
 )
 
 MAX_IDENTIFIER_LENGTH = 100
@@ -57,7 +53,7 @@ MAX_IDENTIFIER_LENGTH = 100
 
 @dataclass(frozen=True, slots=True)
 class FrozenArchiveMetadata:
-    """Contain every value that must remain stable across archive retries."""
+    """Contain values that must remain stable across transfer retries."""
 
     identifier: str
     operation_id: str
@@ -72,13 +68,11 @@ class FrozenArchiveMetadata:
     estimated_bytes: int | None
 
     def to_json(self) -> str:
-        """Serialize the immutable upload contract for SQLite."""
         return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
 
     @classmethod
     def from_json(cls, value: str) -> FrozenArchiveMetadata:
-        """Load and validate a persisted upload contract."""
-        document: Any = json.loads(value)
+        document = json.loads(value)
         if not isinstance(document, dict):
             raise ValueError("frozen archive metadata is not an object")
         document["subjects"] = tuple(document["subjects"])
@@ -87,36 +81,48 @@ class FrozenArchiveMetadata:
 
 @dataclass(frozen=True, slots=True)
 class Inspection:
-    """Describe a read-only comparison against one Archive.org item."""
+    """Describe remote evidence for the expected original file."""
 
     state: str
     detail: str | None = None
+    receipt: str | None = None
 
 
 class SubmissionRejectedError(RuntimeError):
-    """Indicate a response that confirms a webpage submission was rejected."""
+    """A webpage request was rejected before acceptance."""
 
 
 class SubmissionUncertainError(RuntimeError):
-    """Indicate that a webpage submission may have been accepted remotely."""
+    """A webpage request might have been accepted."""
 
 
 class LocalMediaChangedError(RuntimeError):
-    """Indicate that a verified local source no longer matches persisted hashes."""
+    """Staging no longer has the persisted download size."""
 
 
 class AcceptedSubmissionPersistenceError(RuntimeError):
-    """Indicate acceptance succeeded but its receipt could not be committed."""
+    """A remote receipt could not be saved."""
 
-    def __init__(self, phase: str, cause: Exception) -> None:
-        super().__init__(
-            f"{phase} accepted a submission but persistence failed: {cause}"
-        )
-        self.phase = phase
+
+class _ProgressStream:
+    def __init__(self, stream: Any, callback: Callable[[int], None]) -> None:
+        self.stream = stream
+        self.callback = callback
+        self.last_update = time.monotonic()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+    def read(self, amount: int = -1) -> bytes:
+        chunk = self.stream.read(amount)
+        if time.monotonic() - self.last_update >= 5:
+            self.callback(self.stream.tell())
+            self.last_update = time.monotonic()
+        return chunk
 
 
 class ArchiveGateway:
-    """Wrap Archivist 1.3.0 calls without adding mutation retries."""
+    """Keep transfers one-shot and status reads bounded by request timeouts."""
 
     def __init__(
         self, settings: Settings, upload_limiter: ByteLimiter | None = None
@@ -127,8 +133,6 @@ class ArchiveGateway:
             settings.internet_archive_email, settings.internet_archive_password
         )
         self.request_timeout = settings.archive_request_timeout
-        self.poll_timeout = settings.archive_poll_timeout
-        self.poll_interval = settings.archive_poll_interval
         self.upload_limiter = upload_limiter or ByteLimiter(0)
 
     def _session(self) -> Session:
@@ -142,9 +146,18 @@ class ArchiveGateway:
                 previous.close()
         return session
 
-    def upload(self, metadata: FrozenArchiveMetadata, media_path: Path) -> None:
-        """Attempt one create-only upload; the caller persists uncertainty."""
-        logger.info("Uploading {} to Archive.org", metadata.identifier)
+    def _client(self, session: Session) -> TransportArchiveClient:
+        return TransportArchiveClient(
+            session=session, account=self.account, timeout=self.request_timeout
+        )
+
+    def upload(
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult:
         options = InternetArchiveUploadOptions(
             identifier=metadata.identifier,
             title=metadata.title,
@@ -159,115 +172,95 @@ class ArchiveGateway:
                 "saga_operation_id": metadata.operation_id,
             },
         )
-        upload_file = InternetArchiveUploadFile(media_path, name=metadata.media_name)
         with (
+            media_path.open("rb") as stream,
             self._session() as session,
-            InternetArchiveClient(
-                session=session, account=self.account, timeout=self.request_timeout
-            ) as client,
+            self._client(session) as client,
         ):
-            client.upload(
-                [upload_file],
-                options,
-                wait=True,
-                timeout=self.poll_timeout,
-                poll_interval=self.poll_interval,
+            file = InternetArchiveUploadFile(
+                cast(Any, _ProgressStream(stream, progress)), name=metadata.media_name
             )
-        logger.info("Archive.org upload returned for {}", metadata.identifier)
+            return client.upload([file], options, wait=False)
 
     def inspect(
         self,
         metadata: FrozenArchiveMetadata,
         *,
         size: int,
-        md5_hash: str,
-        sha1_hash: str,
+        md5_hash: str | None = None,
+        sha1_hash: str | None = None,
+        validation: bool = False,
     ) -> Inspection:
-        """Read and compare provenance plus all expected original-file facts."""
-        logger.debug("Inspecting Archive.org item {}", metadata.identifier)
-        with (
-            self._session() as session,
-            InternetArchiveClient(
-                session=session, account=self.account, timeout=self.request_timeout
-            ) as client,
-        ):
+        with self._session() as session, self._client(session) as client:
             item = client.get_item(metadata.identifier)
-        return inspect_item(item, metadata, size, md5_hash, sha1_hash)
+        return inspect_item(
+            item, metadata, size, md5_hash, sha1_hash, validation=validation
+        )
 
     def recover(
-        self, metadata: FrozenArchiveMetadata, media_path: Path
-    ) -> InternetArchiveRecoveryResult:
-        """Add only a missing file using exact persisted provenance guards."""
-        logger.warning(
-            "Recovering missing media in Archive.org item {}", metadata.identifier
-        )
-        upload_file = InternetArchiveUploadFile(media_path, name=metadata.media_name)
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult:
         with (
+            media_path.open("rb") as stream,
             self._session() as session,
-            InternetArchiveClient(
-                session=session, account=self.account, timeout=self.request_timeout
-            ) as client,
+            self._client(session) as client,
         ):
-            return client.add_files(
+            return client.add_file_transport(
                 metadata.identifier,
-                [upload_file],
+                InternetArchiveUploadFile(
+                    cast(Any, _ProgressStream(stream, progress)),
+                    name=metadata.media_name,
+                ),
                 expected_metadata={
                     "source": metadata.source_url,
                     "saga_operation_id": metadata.operation_id,
                 },
-                wait=True,
-                timeout=self.poll_timeout,
-                poll_interval=self.poll_interval,
+                expected_size=media_path.stat().st_size,
             )
 
     def submit_page(self, url: str) -> str:
-        """Submit a direct Wayback job and return its durable identifier."""
-        logger.info("Submitting webpage to the Wayback Machine: {}", url)
-        with (
-            self._session() as session,
-            InternetArchiveClient(
-                session=session, account=self.account, timeout=self.request_timeout
-            ) as client,
-        ):
+        with self._session() as session, self._client(session) as client:
             return client.submit(url).job_id
 
     def page_status(self, job_id: str) -> InternetArchiveCaptureStatus:
-        """Read a previously submitted Wayback job without resubmitting it."""
-        logger.debug("Checking Wayback job {}", job_id)
-        with (
-            self._session() as session,
-            InternetArchiveClient(
-                session=session, account=self.account, timeout=self.request_timeout
-            ) as client,
-        ):
+        with self._session() as session, self._client(session) as client:
             return client.status(job_id)
 
 
 class ArchiveBackend(Protocol):
-    """Describe the external archive operations used by the state machine."""
-
-    def upload(self, metadata: FrozenArchiveMetadata, media_path: Path) -> None: ...
-
+    def upload(
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult: ...
     def inspect(
         self,
         metadata: FrozenArchiveMetadata,
         *,
         size: int,
-        md5_hash: str,
-        sha1_hash: str,
+        md5_hash: str | None = None,
+        sha1_hash: str | None = None,
+        validation: bool = False,
     ) -> Inspection: ...
-
     def recover(
-        self, metadata: FrozenArchiveMetadata, media_path: Path
-    ) -> InternetArchiveRecoveryResult: ...
-
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult: ...
     def submit_page(self, url: str) -> str: ...
-
     def page_status(self, job_id: str) -> InternetArchiveCaptureStatus: ...
 
 
 class ArchiveProcessor:
-    """Advance one claimed archive row by one externally visible operation."""
+    """Perform one network or filesystem operation per independent claim."""
 
     def __init__(
         self,
@@ -281,587 +274,433 @@ class ArchiveProcessor:
         self.state = state
         self.youtube = youtube
         self.gateway = gateway
-        if self.gateway is None and settings.media_archival_enabled:
+        if gateway is None and settings.media_archival_enabled:
             self.gateway = ArchiveGateway(settings, upload_limiter)
         self.download_root = settings.data_path / "downloads"
-        self._download_lock = Lock()
 
     def process(self, work: ArchiveWork) -> None:
-        """Advance the stage captured in a detached archive claim."""
-        logger.debug(
-            "Processing archive stage {} for video {}",
-            work.progress.status,
-            work.video.id,
-        )
-        if self.gateway is None:
-            try:
-                self._process_ziggy_only(work)
-            except AcceptedSubmissionPersistenceError as error:
-                logger.critical(
-                    "Accepted {} submission for video {} could not be persisted: {}",
-                    error.phase,
-                    work.video.id,
-                    error,
-                )
-                self._uncertain_submission(work, error, error.phase)
-            except Exception as error:
-                self._retry(work, error, work.progress.status)
-            return
-        handlers = {
-            "metadata": self._metadata,
-            "download": self._download,
-            "upload": self._upload,
-            "uploading": self._reconcile,
-            "reconcile_upload": self._reconcile,
-            "webpage": self._webpage,
-            "wayback_wait": self._wayback_wait,
-            "cleanup": self._cleanup,
-        }
-        handler = handlers.get(work.progress.status)
-        if handler is None:
-            logger.error(
-                "Video {} has unknown archive stage {!r}; operator action is required",
-                work.video.id,
-                work.progress.status,
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="operator_action",
-                release=True,
-                failure_phase="state",
-                last_error=f"unknown archive stage {work.progress.status!r}",
-            )
-            return
+        stage = work.job.kind if work.job else work.progress.status
         try:
-            handler(work)
+            handlers = {
+                "metadata": self._metadata,
+                "download": self._download,
+                "upload": self._upload,
+                "recovery": self._reconcile,
+                "validation": self._validate,
+                "webpage": self._webpage,
+                "cleanup": self._cleanup,
+            }
+            if stage not in handlers:
+                raise RecoveryConflictError(f"unknown archive stage {stage!r}")
+            handlers[stage](work)
         except VideoUnavailableError as error:
-            logger.warning("Video {} is unavailable: {}", work.video.id, error)
             self.state.update_archive(
                 work.video.id,
                 status="unavailable",
                 release=True,
-                failure_phase=work.progress.status,
+                failure_phase=stage,
                 last_error=_error_text(error),
             )
-        except DiskSpaceError as error:
-            logger.warning(
-                "Skipping video {} due to insufficient disk space; moved to the "
-                "back of the archive queue: {}",
-                work.video.id,
-                error,
-            )
-            self.state.update_archive(
-                work.video.id,
-                status=work.progress.status,
-                release=True,
-                retry_after=self.settings.archive_retry_delay,
-                failure_phase="disk",
-                last_error=_error_text(error),
-            )
-        except LocalMediaChangedError as error:
-            logger.error(
-                "Local media verification failed for video {}: {}", work.video.id, error
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="operator_action",
-                release=True,
-                failure_phase="local_verification",
-                last_error=_error_text(error),
-            )
-        except AcceptedSubmissionPersistenceError as error:
-            logger.critical(
-                "Accepted {} submission for video {} could not be persisted: {}",
-                error.phase,
-                work.video.id,
-                error,
-            )
-            self._uncertain_submission(work, error, error.phase)
+        except (
+            LocalMediaChangedError,
+            RecoveryConflictError,
+            AuthenticationError,
+            InvalidOptionError,
+        ) as error:
+            if work.job:
+                self.state.update_job(work, status="failed", error=_error_text(error))
+            else:
+                self.state.update_archive(
+                    work.video.id,
+                    status="operator_action",
+                    release=True,
+                    failure_phase=stage,
+                    last_error=_error_text(error),
+                )
         except Exception as error:
-            self._retry(work, error, work.progress.status)
+            logger.warning("{} failed for video {}: {}", stage, work.video.id, error)
+            delay = retry_delay(
+                self.settings.archive_retry_delay,
+                work.job.attempts if work.job else work.progress.retry_attempts + 1,
+            )
+            if work.job:
+                self.state.update_job(
+                    work, status="waiting", retry_after=delay, error=_error_text(error)
+                )
+            elif stage == "upload" and work.progress.status == "uploading":
+                self.state.defer_transfer(
+                    work,
+                    status="reconcile_upload",
+                    error=_error_text(error),
+                    delay=delay,
+                    deadline=self.settings.background_deadline,
+                )
+            else:
+                self.state.update_archive(
+                    work.video.id,
+                    release=True,
+                    retry_after=delay,
+                    retry_attempts=work.progress.retry_attempts + 1,
+                    failure_phase="disk"
+                    if isinstance(error, DiskSpaceError)
+                    else stage,
+                    last_error=_error_text(error),
+                )
 
     def _metadata(self, work: ArchiveWork) -> None:
-        details = self.youtube.video_metadata(work.video.id)
-        frozen = freeze_metadata(details)
-        directory = self.download_root / frozen.operation_id
+        if self.gateway is None:
+            self._ziggy_only(work)
+            return
+        frozen = freeze_metadata(self.youtube.video_metadata(work.video.id))
         self.state.update_archive(
             work.video.id,
             status="download",
             release=True,
-            working_directory=str(directory),
+            working_directory=str(self.download_root / frozen.operation_id),
             media_name=frozen.media_name,
             frozen_metadata=frozen.to_json(),
             ia_identifier=frozen.identifier,
             operation_id=frozen.operation_id,
-            failure_phase=None,
+            retry_attempts=0,
             last_error=None,
-        )
-        logger.info(
-            "Prepared archive metadata for video {} as {}",
-            work.video.id,
-            frozen.identifier,
+            failure_phase=None,
         )
 
     def _download(self, work: ArchiveWork) -> None:
         frozen = _frozen(work)
         directory = _working_directory(work)
-        with self._download_lock:
-            path = self.youtube.download_video(
+        path = self.youtube.download_video(
+            work.video.id,
+            directory,
+            minimum_free_bytes=self.settings.minimum_free_bytes,
+            estimated_bytes=work.progress.download_estimated_bytes
+            or frozen.estimated_bytes
+            or self.settings.unknown_download_bytes,
+            disk_guard=lambda expected, downloaded: self.state.guard_download_space(
                 work.video.id,
-                directory,
-                minimum_free_bytes=self.settings.minimum_free_bytes,
-                estimated_bytes=frozen.estimated_bytes,
-            )
-        try:
-            media = verify_media(path)
-        except Exception as error:
-            if (
-                isinstance(
-                    error,
-                    (subprocess.CalledProcessError, json.JSONDecodeError, RuntimeError),
-                )
-                and path == directory / "media.mkv"
-            ):
-                path.unlink(missing_ok=True)
-            raise
+                expected,
+                downloaded,
+                shutil.disk_usage(directory).free,
+                self.settings.minimum_free_bytes,
+            ),
+        )
+        if not path.is_file() or path.stat().st_size == 0:
+            raise RuntimeError("downloader did not produce nonempty media")
         self.state.update_archive(
             work.video.id,
             status="upload",
             release=True,
-            media_path=str(media.path),
-            media_size=media.size,
-            media_md5=media.md5,
-            media_sha1=media.sha1,
+            media_path=str(path),
+            media_size=path.stat().st_size,
+            media_md5=None,
+            media_sha1=None,
+            download_completed_at=utcnow(),
+            ready_at=utcnow(),
+            retry_attempts=0,
             failure_phase=None,
             last_error=None,
         )
-        logger.info(
-            "Staged verified media for video {} ({} bytes)", work.video.id, media.size
-        )
 
     def _upload(self, work: ArchiveWork) -> None:
-        gateway = self._gateway()
         frozen = _frozen(work)
-        path, size, md5_hash, sha1_hash = _media_facts(work)
+        path = Path(work.progress.media_path) if work.progress.media_path else None
+        if path is None or not path.is_file():
+            self.state.update_archive(
+                work.video.id,
+                status="download",
+                release=True,
+                media_path=None,
+                download_completed_at=None,
+                ready_at=None,
+                last_error="staging media disappeared; downloading again",
+                failure_phase=None,
+            )
+            return
+        if work.progress.download_completed_at is None:
+            self.state.update_archive(
+                work.video.id,
+                status="download",
+                release=True,
+                media_path=None,
+                last_error="download completion is not recorded",
+            )
+            return
+        if path.stat().st_size != work.progress.media_size or path.stat().st_size == 0:
+            raise LocalMediaChangedError(
+                "staging size changed after download completion"
+            )
         self.state.update_archive(
             work.video.id,
             status="uploading",
             upload_started_at=utcnow(),
+            transfer_bytes=0,
+            transfer_progress_at=utcnow(),
             failure_phase=None,
             last_error=None,
         )
         work.progress.status = "uploading"
+
+        def progress(bytes_sent: int) -> None:
+            self.state.update_archive(
+                work.video.id, transfer_bytes=bytes_sent, transfer_progress_at=utcnow()
+            )
+
         try:
-            gateway.upload(frozen, path)
+            operation = (
+                self._gateway().recover
+                if work.progress.upload_mode == "recover"
+                else self._gateway().upload
+            )
+            result = operation(frozen, path, progress=progress)
         except InternetArchiveUploadError as error:
-            # Archivist sets failed_file before transfer and records transferred
-            # files before polling. Timeouts and ID conflicts do not prove absence.
-            rejected = (
-                error.failed_file is None
-                and bool(error.result.files)
-                and not any(file.transferred for file in error.result.files)
-                and not error.result.processing_complete
-                and not isinstance(error.cause, NetworkError)
-                and error.cause.status_code is not None
-                and 400 <= error.cause.status_code < 500
-                and error.cause.status_code not in {408, 409, 412}
+            if self._acknowledged(work, error.result):
+                self._acknowledge(work, error.result)
+                return
+            code = error.cause.status_code
+            known_failure = (
+                not isinstance(error.cause, NetworkError)
+                and code is not None
+                and 400 <= code < 500
+                and code not in {408, 409, 412}
             )
-            logger.warning(
-                "Archive.org upload for video {} {}: {}",
-                work.video.id,
-                (
-                    "was rejected; creation will retry"
-                    if rejected
-                    else "is uncertain and will be reconciled"
+            if known_failure and error.failed_file:
+                self.state.update_archive(work.video.id, upload_mode="recover")
+            self.state.defer_transfer(
+                work,
+                status="upload" if known_failure else "reconcile_upload",
+                error=_error_text(error),
+                delay=retry_delay(
+                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
                 ),
-                error.cause,
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="upload" if rejected else "reconcile_upload",
-                release=True,
-                retry_after=self.settings.archive_retry_delay,
-                failure_phase="initial_upload",
-                last_error=_error_text(error),
+                deadline=self.settings.background_deadline,
             )
             return
-        except (AuthenticationError, InvalidOptionError) as error:
-            logger.error(
-                "Archive.org rejected upload preflight for video {}: {}",
-                work.video.id,
-                error,
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="operator_action",
-                release=True,
-                failure_phase="initial_upload_preflight",
-                last_error=_error_text(error),
+        except ServiceError as error:
+            # Both upload APIs wrap service failures once a mutation starts.
+            # Retry transient preflight failures without waiting for a remote item.
+            if not (
+                isinstance(error, (NetworkError, RateLimitError))
+                or error.status_code is not None
+                and (error.status_code in {408, 425, 429} or error.status_code >= 500)
+            ):
+                raise
+            self.state.defer_transfer(
+                work,
+                status="upload",
+                error=_error_text(error),
+                delay=retry_delay(
+                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
+                ),
+                deadline=self.settings.background_deadline,
             )
             return
-        except Exception as error:
-            logger.warning(
-                "Archive.org upload preflight failed for video {}; retry scheduled: {}",
-                work.video.id,
-                error,
+        if not self._acknowledged(work, result):
+            raise RuntimeError(
+                "upload returned without acknowledgement of the expected original"
             )
+        self._acknowledge(work, result)
+
+    @staticmethod
+    def _acknowledged(work: ArchiveWork, result: InternetArchiveUploadResult) -> bool:
+        return (
+            result.identifier == work.progress.ia_identifier
+            and sum(
+                file.name == work.progress.media_name
+                and file.size == work.progress.media_size
+                and file.transferred
+                for file in result.files
+            )
+            == 1
+        )
+
+    def _acknowledge(
+        self, work: ArchiveWork, result: InternetArchiveUploadResult
+    ) -> None:
+        file = next(
+            file for file in result.files if file.name == work.progress.media_name
+        )
+        self.state.acknowledge_upload(
+            work,
+            receipt=json.dumps(asdict(result), sort_keys=True),
+            etag=file.etag,
+            validation=self.settings.validation_enabled,
+            deadline=self.settings.background_deadline,
+        )
+        logger.info(
+            "Upload acknowledged for video {} ({} bytes)", work.video.id, file.size
+        )
+
+    def _inspection(self, work: ArchiveWork, *, validation: bool = False) -> Inspection:
+        if work.progress.media_size is None:
+            raise RecoveryConflictError("no persisted size for remote reconciliation")
+        return self._gateway().inspect(
+            _frozen(work),
+            size=work.progress.media_size,
+            md5_hash=work.progress.media_md5,
+            sha1_hash=work.progress.media_sha1,
+            validation=validation,
+        )
+
+    def _reconcile(self, work: ArchiveWork) -> None:
+        inspection = self._inspection(work)
+        if inspection.state == "verified":
+            self.state.acknowledge_upload(
+                work,
+                receipt=inspection.receipt or json.dumps({"remote_evidence": True}),
+                etag=None,
+                recovered=True,
+                validation=self.settings.validation_enabled,
+                deadline=self.settings.background_deadline,
+            )
+            self.state.update_job(work, status="passed")
+        elif inspection.state == "missing":
             self.state.update_archive(
                 work.video.id,
                 status="upload",
                 release=True,
-                retry_after=self.settings.archive_retry_delay,
-                failure_phase="initial_upload_preflight",
-                last_error=_error_text(error),
+                upload_mode="recover",
+                ready_at=utcnow(),
+                failure_phase=None,
+                last_error=None,
             )
-            return
-        inspection = gateway.inspect(
-            frozen, size=size, md5_hash=md5_hash, sha1_hash=sha1_hash
-        )
-        self._finish_inspection(work, inspection)
-
-    def _reconcile(self, work: ArchiveWork) -> None:
-        gateway = self._gateway()
-        frozen = _frozen(work)
-        path, size, md5_hash, sha1_hash = _media_facts(work)
-        inspection = gateway.inspect(
-            frozen, size=size, md5_hash=md5_hash, sha1_hash=sha1_hash
-        )
-        logger.debug(
-            "Archive.org inspection for video {} returned {}",
-            work.video.id,
-            inspection.state,
-        )
-        if inspection.state == "missing":
-            try:
-                result = gateway.recover(frozen, path)
-            except InternetArchiveRecoveryDeferredError as error:
-                logger.warning(
-                    "Archive.org recovery was deferred for video {}: {}",
-                    work.video.id,
-                    error,
-                )
-                self.state.update_archive(
-                    work.video.id,
-                    status="reconcile_upload",
-                    release=True,
-                    retry_after=self.settings.archive_retry_delay,
-                    recovery_result=_recovery_json(error.result),
-                    failure_phase=error.phase.value,
-                    last_error=_error_text(error),
-                )
-                return
-            except InternetArchiveRecoveryError as error:
-                dispositions = {item.disposition.value for item in error.result.files}
-                uncertain = bool(
-                    dispositions & {"uncertain", "deferred"}
-                ) or _temporary_recovery_error(error)
-                log = logger.warning if uncertain else logger.error
-                log(
-                    "Archive.org recovery {} for video {}: {}",
-                    "will retry" if uncertain else "requires operator action",
-                    work.video.id,
-                    error,
-                )
-                self.state.update_archive(
-                    work.video.id,
-                    status="reconcile_upload" if uncertain else "operator_action",
-                    release=True,
-                    retry_after=(
-                        self.settings.archive_retry_delay if uncertain else None
-                    ),
-                    recovery_result=_recovery_json(error.result),
-                    failure_phase=error.phase.value,
-                    last_error=_error_text(error),
-                )
-                return
-            if not result.verification_complete or not _recovery_matches(
-                result, frozen, size=size, md5_hash=md5_hash, sha1_hash=sha1_hash
-            ):
-                logger.warning(
-                    "Archive.org recovery verification is incomplete for video {}",
-                    work.video.id,
-                )
-                self.state.update_archive(
-                    work.video.id,
-                    status="reconcile_upload",
-                    release=True,
-                    retry_after=self.settings.archive_retry_delay,
-                    recovery_result=_recovery_json(result),
-                    failure_phase="verification",
-                    last_error="Archivist recovery verification is incomplete",
-                )
-                return
-            self._mark_media_verified(work, _recovery_json(result))
-            return
-        self._finish_inspection(work, inspection)
-
-    def _finish_inspection(self, work: ArchiveWork, inspection: Inspection) -> None:
-        if inspection.state == "verified":
-            self._mark_media_verified(work, None)
+            self.state.update_job(work, status="passed")
         elif inspection.state == "conflict":
-            logger.error(
-                "Archive.org item conflicts with video {}: {}",
-                work.video.id,
-                inspection.detail,
-            )
+            self.state.update_job(work, status="failed", error=inspection.detail)
             self.state.update_archive(
                 work.video.id,
                 status="operator_action",
                 release=True,
-                failure_phase="verification",
+                failure_phase="recovery",
                 last_error=inspection.detail,
             )
         else:
-            logger.info(
-                "Archive.org item for video {} is not yet verified: {}",
-                work.video.id,
-                inspection.detail,
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="reconcile_upload",
-                release=True,
-                retry_after=self.settings.archive_retry_delay,
-                failure_phase="reconciliation",
-                last_error=inspection.detail,
-            )
+            self._defer_job(work, inspection.detail)
 
-    def _mark_media_verified(
-        self, work: ArchiveWork, recovery_result: str | None
-    ) -> None:
-        self.state.update_archive(
-            work.video.id,
-            status="webpage",
-            release=True,
-            media_verified_at=utcnow(),
-            recovery_result=recovery_result,
-            failure_phase=None,
-            last_error=None,
+    def _validate(self, work: ArchiveWork) -> None:
+        if not self.settings.validation_enabled:
+            self.state.update_job(
+                work, status="expired", error="optional validation disabled"
+            )
+            return
+        inspection = self._inspection(work, validation=True)
+        if inspection.state == "verified":
+            self.state.update_job(work, status="passed", media_verified_at=utcnow())
+        elif inspection.state in {"conflict", "missing"}:
+            self.state.update_job(work, status="failed", error=inspection.detail)
+        else:
+            self._defer_job(work, inspection.detail)
+
+    def _defer_job(self, work: ArchiveWork, detail: str | None) -> None:
+        assert work.job is not None
+        self.state.update_job(
+            work,
+            status="waiting",
+            error=detail,
+            retry_after=retry_delay(
+                self.settings.archive_retry_delay, work.job.attempts
+            ),
         )
-        logger.info("Verified archived media for video {}", work.video.id)
 
     def _webpage(self, work: ArchiveWork) -> None:
-        frozen = _frozen(work)
-        if self.settings.ziggy_host is not None:
-            self._submit_ziggy(work, frozen.source_url, "cleanup", "webpage")
+        assert work.job is not None
+        if work.progress.wayback_job_id:
+            result = self._gateway().page_status(work.progress.wayback_job_id)
+            if isinstance(result, InternetArchivePendingStatus):
+                self._defer_job(work, "Wayback job is pending")
+            elif isinstance(result, InternetArchiveSuccessStatus):
+                self.state.update_job(work, status="passed", webpage_status="captured")
+            elif isinstance(result, InternetArchiveFailedStatus):
+                self.state.update_job(
+                    work, status="failed", webpage_status="failed", error=result.message
+                )
+            else:
+                raise RuntimeError("unexpected Wayback status")
             return
-        gateway = self._gateway()
-        logger.info("Submitting webpage for video {} directly", work.video.id)
-        self.state.update_archive(work.video.id, status="wayback_submitting")
+        url = (
+            _frozen(work).source_url
+            if work.progress.frozen_metadata
+            else work.video.webpage_url
+        )
+        self.state.update_job(work, status="submitting")
         try:
-            job_id = gateway.submit_page(frozen.source_url)
-        except NetworkError as error:
-            self._uncertain_submission(work, error, "wayback")
-            return
-        except Exception as error:
-            self._retry_submission(work, error, "wayback")
-            return
-        try:
-            self.state.update_archive(
-                work.video.id,
-                status="wayback_wait",
-                release=True,
-                retry_after=self.settings.archive_poll_interval,
-                wayback_job_id=job_id,
-                webpage_status="submitted",
-                failure_phase=None,
-                last_error=None,
+            if self.settings.ziggy_host:
+                receipt = submit_ziggy(
+                    self.settings.ziggy_host,
+                    self.settings.ziggy_identifier or "saga",
+                    url,
+                    self.settings.archive_request_timeout,
+                )
+                try:
+                    self.state.update_job(
+                        work,
+                        status="passed",
+                        webpage_status="queued",
+                        ziggy_receipt=json.dumps(receipt, sort_keys=True),
+                    )
+                except Exception as error:
+                    raise AcceptedSubmissionPersistenceError(str(error)) from error
+            else:
+                job_id = self._gateway().submit_page(url)
+                try:
+                    self.state.update_job(
+                        work,
+                        status="waiting",
+                        webpage_status="submitted",
+                        wayback_job_id=job_id,
+                        retry_after=self.settings.archive_poll_interval,
+                    )
+                except Exception as error:
+                    raise AcceptedSubmissionPersistenceError(str(error)) from error
+        except (
+            NetworkError,
+            SubmissionUncertainError,
+            AcceptedSubmissionPersistenceError,
+        ) as error:
+            self.state.update_job(
+                work,
+                status="failed",
+                webpage_status="uncertain",
+                error=_error_text(error),
             )
-            logger.info("Persisted Wayback job {} for video {}", job_id, work.video.id)
-        except Exception as error:
-            raise AcceptedSubmissionPersistenceError("wayback", error) from error
 
-    def _retry_submission(
-        self, work: ArchiveWork, error: Exception, phase: str, status: str = "webpage"
-    ) -> None:
-        logger.warning(
-            "{} webpage submission failed for video {}; retry scheduled: {}",
-            phase,
-            work.video.id,
-            error,
+    def _ziggy_only(self, work: ArchiveWork) -> None:
+        # There is no media transfer in this mode; submit through a background job.
+        self.state.queue_webpage_only(
+            work.video.id, deadline=self.settings.background_deadline
         )
-        self.state.update_archive(
-            work.video.id,
-            status=status,
-            release=True,
-            retry_after=self.settings.archive_retry_delay,
-            failure_phase=phase,
-            last_error=_error_text(error),
-        )
-
-    def _uncertain_submission(
-        self, work: ArchiveWork, error: Exception, phase: str
-    ) -> None:
-        logger.error(
-            "{} webpage submission outcome is uncertain for video {}: {}",
-            phase,
-            work.video.id,
-            error,
-        )
-        self.state.update_archive(
-            work.video.id,
-            status="operator_action",
-            release=True,
-            failure_phase=phase,
-            last_error=f"submission outcome is uncertain; {_error_text(error)}",
-        )
-
-    def _wayback_wait(self, work: ArchiveWork) -> None:
-        gateway = self._gateway()
-        job_id = work.progress.wayback_job_id
-        if not job_id:
-            raise RuntimeError("direct Wayback stage has no persisted job ID")
-        result = gateway.page_status(job_id)
-        if isinstance(result, InternetArchivePendingStatus):
-            logger.debug("Wayback job {} is still pending", job_id)
-            self.state.update_archive(
-                work.video.id,
-                release=True,
-                retry_after=self.settings.archive_poll_interval,
-                last_error=None,
-            )
-        elif isinstance(result, InternetArchiveSuccessStatus):
-            logger.info("Wayback capture completed for video {}", work.video.id)
-            self.state.update_archive(
-                work.video.id,
-                status="cleanup",
-                release=True,
-                webpage_status="captured",
-                failure_phase=None,
-                last_error=None,
-            )
-        elif isinstance(result, InternetArchiveFailedStatus):
-            logger.error(
-                "Wayback capture failed for video {}: {}",
-                work.video.id,
-                result.message or "no detail returned",
-            )
-            self.state.update_archive(
-                work.video.id,
-                status="operator_action",
-                release=True,
-                webpage_status="failed",
-                failure_phase="wayback",
-                last_error=result.message or "Wayback capture failed",
-            )
-        else:
-            raise RuntimeError(f"unexpected Wayback status {type(result).__name__}")
 
     def _cleanup(self, work: ArchiveWork) -> None:
-        if work.progress.media_verified_at is None:
-            raise RuntimeError("cleanup requested before media verification")
-        if work.progress.webpage_status not in {"captured", "queued"}:
-            raise RuntimeError("cleanup requested before webpage acceptance")
+        if work.progress.media_uploaded_at is None:
+            raise RecoveryConflictError(
+                "cleanup requires persisted upload acknowledgement"
+            )
         directory = _working_directory(work).resolve()
         root = self.download_root.resolve()
-        operation_id = work.progress.operation_id or _frozen(work).operation_id
-        if directory.parent != root or directory.name != operation_id:
-            raise RuntimeError("refusing to clean a directory outside Saga downloads")
-        if work.progress.media_path is not None:
-            media_path = Path(work.progress.media_path).resolve()
-            if media_path.parent != directory:
-                raise RuntimeError("refusing to clean media outside its work directory")
+        if directory.parent != root or directory.name != work.progress.operation_id:
+            raise RecoveryConflictError("refusing cleanup outside this Saga operation")
+        if (
+            work.progress.media_path
+            and Path(work.progress.media_path).resolve().parent != directory
+        ):
+            raise RecoveryConflictError("media is outside its staging directory")
         if directory.exists():
-            logger.debug("Removing archive staging directory {}", directory)
             shutil.rmtree(directory)
-        self.state.update_archive(
-            work.video.id,
-            status="complete",
-            release=True,
+        self.state.update_job(
+            work,
+            status="passed",
             cleaned_at=utcnow(),
             media_path=None,
             working_directory=None,
-            failure_phase=None,
-            last_error=None,
         )
-        logger.info("Completed archive workflow for video {}", work.video.id)
-
-    def _process_ziggy_only(self, work: ArchiveWork) -> None:
-        if self.settings.ziggy_host is None:
-            raise RuntimeError("archive processor has no configured provider")
-        if work.progress.status == "metadata":
-            self._submit_ziggy(work, work.video.webpage_url, "complete", "metadata")
-            return
-        if work.progress.status == "webpage":
-            self._webpage(work)
-            return
-        if work.progress.status == "cleanup":
-            self._cleanup(work)
-            return
-        logger.error(
-            "Video {} requires Internet Archive credentials to resume stage {}",
-            work.video.id,
-            work.progress.status,
-        )
-        self.state.update_archive(
-            work.video.id,
-            status="operator_action",
-            release=True,
-            failure_phase=work.progress.status,
-            last_error="Internet Archive credentials are required to resume this stage",
-        )
-
-    def _submit_ziggy(
-        self, work: ArchiveWork, url: str, success_status: str, retry_status: str
-    ) -> None:
-        assert self.settings.ziggy_host is not None
-        logger.info("Submitting webpage for video {} through Ziggy", work.video.id)
-        self.state.update_archive(work.video.id, status="ziggy_submitting")
-        try:
-            receipt = submit_ziggy(
-                self.settings.ziggy_host,
-                self.settings.ziggy_identifier or "saga",
-                url,
-                self.settings.archive_request_timeout,
-            )
-        except SubmissionRejectedError as error:
-            self._retry_submission(work, error, "ziggy", retry_status)
-            return
-        except Exception as error:
-            self._uncertain_submission(work, error, "ziggy")
-            return
-        try:
-            self.state.update_archive(
-                work.video.id,
-                status=success_status,
-                release=True,
-                webpage_status="queued",
-                ziggy_receipt=json.dumps(receipt, sort_keys=True),
-                failure_phase=None,
-                last_error=None,
-            )
-        except Exception as error:
-            raise AcceptedSubmissionPersistenceError("ziggy", error) from error
 
     def _gateway(self) -> ArchiveBackend:
         if self.gateway is None:
             raise RuntimeError("Internet Archive credentials are not configured")
         return self.gateway
 
-    def _retry(self, work: ArchiveWork, error: Exception, phase: str) -> None:
-        status = (
-            "reconcile_upload"
-            if work.progress.status == "uploading"
-            else work.progress.status
-        )
-        logger.warning(
-            "Archive phase {} failed for video {}; retry scheduled: {}",
-            phase,
-            work.video.id,
-            error,
-        )
-        self.state.update_archive(
-            work.video.id,
-            status=status,
-            release=True,
-            retry_after=self.settings.archive_retry_delay,
-            failure_phase=phase,
-            last_error=_error_text(error),
-        )
-
 
 def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
-    """Build the exact immutable Archive.org identifier and item metadata."""
+    """Freeze provenance and the original filename before sending any bytes."""
     operation_id = str(uuid4())
     identifier = archive_identifier(details.title, details.id)
     username = details.channel_handle
@@ -872,34 +711,28 @@ def freeze_metadata(details: VideoMetadata) -> FrozenArchiveMetadata:
         )
     tags = f"Tags: {', '.join(details.tags)}\n" if details.tags else ""
     description = (
-        f"{details.description.rstrip()}\n\n"
-        f"Published: {published}\n"
-        f"YouTube URL: {details.webpage_url}\n"
-        f"Channel username: {username}\n"
+        f"{details.description.rstrip()}\n\nPublished: {published}\n"
+        f"YouTube URL: {details.webpage_url}\nChannel username: {username}\n"
         f"Channel display name: {details.channel_name}\n"
-        f"Channel URL: {details.channel_url}\n"
-        f"{tags}\n"
+        f"Channel URL: {details.channel_url}\n{tags}\n"
         "Powered by Saga (https://github.com/EthanC/Saga)"
     ).lstrip()
     return FrozenArchiveMetadata(
-        identifier=identifier,
-        operation_id=operation_id,
-        source_url=details.webpage_url,
-        media_name=f"{identifier}.mkv",
-        title=f"{details.title} | {username} | YouTube",
-        description=description,
-        subjects=tuple(
-            dict.fromkeys(("youtube", "video", username, details.id, *details.tags))
-        ),
-        creator=details.channel_name,
-        upload_date=_iso_date(details.upload_date),
-        channel_username=username,
-        estimated_bytes=details.estimated_bytes,
+        identifier,
+        operation_id,
+        details.webpage_url,
+        f"{identifier}.mkv",
+        f"{details.title} | {username} | YouTube",
+        description,
+        tuple(dict.fromkeys(("youtube", "video", username, details.id, *details.tags))),
+        details.channel_name,
+        _iso_date(details.upload_date),
+        username,
+        details.estimated_bytes,
     )
 
 
 def archive_identifier(title: str, video_id: str) -> str:
-    """Return an IA-safe ASCII title slug with the case-sensitive ID suffix."""
     ascii_title = (
         unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
     )
@@ -908,9 +741,7 @@ def archive_identifier(title: str, video_id: str) -> str:
     )
     slug = "-".join(part for part in slug.split("-") if part)
     suffix = f"-{video_id}"
-    prefix = slug[: MAX_IDENTIFIER_LENGTH - len(suffix)].rstrip("-")
-    if not prefix:
-        prefix = "video"
+    prefix = slug[: MAX_IDENTIFIER_LENGTH - len(suffix)].rstrip("-") or "video"
     return f"{prefix}{suffix}"
 
 
@@ -918,97 +749,118 @@ def inspect_item(
     item: InternetArchiveItem,
     metadata: FrozenArchiveMetadata,
     size: int,
-    md5_hash: str,
-    sha1_hash: str,
+    md5_hash: str | None = None,
+    sha1_hash: str | None = None,
+    *,
+    validation: bool = False,
 ) -> Inspection:
-    """Compare a snapshot without interpreting an empty response as absence."""
+    """Compare saved facts without reading staging or waiting for derivatives."""
+    if item.identifier != metadata.identifier:
+        return Inspection("conflict", "wrong item identifier")
     if not item.metadata:
-        return Inspection("pending", "Archive.org item metadata is unresolved")
-    if not _metadata_matches(
-        item.metadata, "source", metadata.source_url
-    ) or not _metadata_matches(
-        item.metadata, "saga_operation_id", metadata.operation_id
-    ):
-        return Inspection("conflict", "Archive.org provenance metadata does not match")
-    if item.has_redrow or item.is_dark or item.nodownload:
-        return Inspection("conflict", "Archive.org item is blocked or unavailable")
-    if item.server_unavailable:
-        return Inspection("pending", "Archive.org item server is unavailable")
-    if item.error_tasks:
-        return Inspection("conflict", "Archive.org item has failed processing tasks")
-    if item.pending_tasks or any(
-        task.state is InternetArchiveItemTaskState.UNKNOWN for task in item.tasks
-    ):
-        return Inspection("pending", "Archive.org item processing is unresolved")
-    if item.availability is not InternetArchiveItemAvailability.AVAILABLE:
-        return Inspection(
-            "pending", f"Archive.org item availability is {item.availability.value}"
+        return Inspection("pending", "item metadata is unresolved")
+    if any(
+        not _metadata_matches(item.metadata, name, expected)
+        for name, expected in (
+            ("source", metadata.source_url),
+            ("saga_operation_id", metadata.operation_id),
         )
-    if not item.listing_complete:
-        return Inspection("pending", "Archive.org file listing is incomplete")
+    ):
+        return Inspection("conflict", "Saga operation provenance does not match")
     matches = [file for file in item.original_files if file.name == metadata.media_name]
+    if len(matches) > 1:
+        return Inspection("conflict", "original filename is ambiguous")
     if not matches:
-        return Inspection("missing", "expected original file is missing")
+        if (
+            item.listing_complete
+            and not item.server_unavailable
+            and item.availability is InternetArchiveItemAvailability.AVAILABLE
+        ):
+            return Inspection(
+                "missing", "expected original is absent from a complete listing"
+            )
+        return Inspection("pending", "original listing is unresolved")
     remote = matches[0]
     if (
-        (remote.size is not None and remote.size != size)
-        or (remote.md5 is not None and remote.md5 != md5_hash)
-        or (remote.sha1 is not None and remote.sha1 != sha1_hash)
+        remote.size is not None
+        and remote.size != size
+        or any(
+            saved and actual and saved.lower() != actual.lower()
+            for saved, actual in ((md5_hash, remote.md5), (sha1_hash, remote.sha1))
+        )
     ):
-        return Inspection(
-            "conflict", "Archive.org original file size or checksums do not match"
+        return Inspection("conflict", "saved original size or checksums do not match")
+    if (
+        remote.size is None
+        or validation
+        and any(
+            saved and not actual
+            for saved, actual in ((md5_hash, remote.md5), (sha1_hash, remote.sha1))
         )
-    if remote.size is None or remote.md5 is None or remote.sha1 is None:
-        return Inspection(
-            "pending", "Archive.org original file size or checksums are incomplete"
-        )
-    return Inspection("verified")
+    ):
+        return Inspection("pending", "original facts are incomplete")
+    return Inspection(
+        "verified",
+        receipt=json.dumps(
+            {
+                "identifier": item.identifier,
+                "operation_id": metadata.operation_id,
+                "original": asdict(remote),
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 def submit_ziggy(
     host: str, identifier: str, url: str, timeout: float
 ) -> dict[str, str]:
-    """Queue one URL and require Ziggy's committed 202 receipt."""
-    logger.debug("Submitting webpage to Ziggy at {}", host)
-    endpoint = f"{host.rstrip('/')}/v1/queue"
     body = json.dumps({"identifier": identifier, "urls": [url]}).encode()
     request = Request(
-        endpoint, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        f"{host.rstrip('/')}/v1/queue",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     try:
         with urlopen(request, timeout=timeout) as response:
-            status = response.status
+            if response.status != 202:
+                raise SubmissionRejectedError(
+                    f"Ziggy returned HTTP {response.status}, expected 202"
+                )
             payload = response.read()
     except HTTPError as error:
         raise SubmissionRejectedError(f"Ziggy rejected the request: {error}") from error
-    except URLError as error:
-        raise SubmissionUncertainError(
-            f"Ziggy submission outcome is uncertain: {error}"
-        ) from error
-    if status != 202:
-        raise SubmissionRejectedError(f"Ziggy returned HTTP {status}, expected 202")
+    except (HTTPException, OSError) as error:
+        raise SubmissionUncertainError(f"Ziggy response was lost: {error}") from error
     try:
-        document: Any = json.loads(payload)
-        submissions = document["submissions"]
+        submissions = json.loads(payload)["submissions"]
         receipt = submissions[0]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError("Ziggy returned an invalid receipt") from error
-    if (
-        len(submissions) != 1
-        or not isinstance(receipt, dict)
-        or receipt.get("url") != url
-        or not isinstance(receipt.get("receipt_id"), str)
-        or not receipt["receipt_id"]
-    ):
-        raise RuntimeError("Ziggy returned an invalid receipt")
-    logger.info("Ziggy accepted webpage submission for {}", url)
+        if (
+            len(submissions) != 1
+            or receipt.get("url") != url
+            or not isinstance(receipt.get("receipt_id"), str)
+            or not receipt["receipt_id"]
+        ):
+            raise ValueError("invalid receipt")
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as error:
+        raise SubmissionUncertainError("Ziggy returned an invalid receipt") from error
     return {"receipt_id": receipt["receipt_id"], "url": receipt["url"]}
 
 
 def _frozen(work: ArchiveWork) -> FrozenArchiveMetadata:
     if not work.progress.frozen_metadata:
         raise RuntimeError("archive stage has no frozen metadata")
-    return FrozenArchiveMetadata.from_json(work.progress.frozen_metadata)
+    frozen = FrozenArchiveMetadata.from_json(work.progress.frozen_metadata)
+    if (frozen.identifier, frozen.operation_id, frozen.media_name) != (
+        work.progress.ia_identifier,
+        work.progress.operation_id,
+        work.progress.media_name,
+    ):
+        raise RecoveryConflictError(
+            "frozen upload contract does not match persisted operation"
+        )
+    return frozen
 
 
 def _working_directory(work: ArchiveWork) -> Path:
@@ -1017,99 +869,12 @@ def _working_directory(work: ArchiveWork) -> Path:
     return Path(work.progress.working_directory)
 
 
-def _media_facts(work: ArchiveWork) -> tuple[Path, int, str, str]:
-    progress = work.progress
-    media_path = progress.media_path
-    media_size = progress.media_size
-    media_md5 = progress.media_md5
-    media_sha1 = progress.media_sha1
-    if (
-        media_path is None
-        or media_size is None
-        or media_md5 is None
-        or media_sha1 is None
-    ):
-        raise RuntimeError("archive stage has incomplete local media facts")
-    path = Path(media_path)
-    if not path.is_file():
-        raise RuntimeError("verified local media file is missing")
-    current_size, current_md5, current_sha1 = _hash_file(path)
-    if (current_size, current_md5, current_sha1) != (media_size, media_md5, media_sha1):
-        raise LocalMediaChangedError("local media changed after verification")
-    return path, media_size, media_md5, media_sha1
-
-
-def _hash_file(path: Path) -> tuple[int, str, str]:
-    md5_hash = md5(usedforsecurity=False)
-    sha1_hash = sha1(usedforsecurity=False)
-    size = 0
-    with path.open("rb") as file:
-        while chunk := file.read(1024 * 1024):
-            size += len(chunk)
-            md5_hash.update(chunk)
-            sha1_hash.update(chunk)
-    return size, md5_hash.hexdigest(), sha1_hash.hexdigest()
-
-
-def _recovery_matches(
-    result: InternetArchiveRecoveryResult,
-    metadata: FrozenArchiveMetadata,
-    *,
-    size: int,
-    md5_hash: str,
-    sha1_hash: str,
-) -> bool:
-    matches = [file for file in result.files if file.name == metadata.media_name]
-    return (
-        len(matches) == 1
-        and matches[0].disposition.value in {"transferred", "already_matching"}
-        and (
-            matches[0].size,
-            matches[0].md5,
-            matches[0].sha1,
-            matches[0].checksum_state.value,
-        )
-        == (size, md5_hash, sha1_hash, "verified")
-    )
-
-
-def _temporary_recovery_error(error: InternetArchiveRecoveryError) -> bool:
-    cause = error.cause
-    return (
-        isinstance(cause, (NetworkError, PollingTimeoutError, RateLimitError))
-        or cause.status_code in {408, 425, 429}
-        or cause.status_code is not None
-        and cause.status_code >= 500
-    )
-
-
 def _metadata_matches(metadata: Any, name: str, expected: str) -> bool:
     value = metadata.get(name)
-    if isinstance(value, (tuple, list)):
-        return list(value) == [expected]
-    return value == expected
-
-
-def _recovery_json(result: InternetArchiveRecoveryResult) -> str:
-    return json.dumps(
-        {
-            "identifier": result.identifier,
-            "processing_complete": result.processing_complete,
-            "verification_complete": result.verification_complete,
-            "files": [
-                {
-                    "name": file.name,
-                    "size": file.size,
-                    "md5": file.md5,
-                    "sha1": file.sha1,
-                    "disposition": file.disposition.value,
-                    "checksum_state": file.checksum_state.value,
-                    "transferred": file.transferred,
-                }
-                for file in result.files
-            ],
-        },
-        sort_keys=True,
+    return (
+        list(value) == [expected]
+        if isinstance(value, (tuple, list))
+        else value == expected
     )
 
 

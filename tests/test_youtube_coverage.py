@@ -277,6 +277,9 @@ def test_download_video_handles_space_and_existing_file(
 
     output = tmp_path / "media.mkv"
     output.write_bytes(b"existing")
+    (tmp_path / "download.json").write_text(
+        json.dumps({"video_id": "abcdefghijk", "size": 8}), encoding="utf-8"
+    )
     assert (
         youtube.YouTubeClient().download_video(
             "abcdefghijk", tmp_path, minimum_free_bytes=5, estimated_bytes=3

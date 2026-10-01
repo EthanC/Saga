@@ -100,6 +100,7 @@ def test_run_starts_named_channel_workers(
     monkeypatch.setattr(service, "_delivery_loop", worker)
     monkeypatch.setattr(service, "_report_loop", worker)
     monkeypatch.setattr(service, "_archive_loop", worker)
+    monkeypatch.setattr(service, "_transfer_health_loop", worker)
     monkeypatch.setattr(service_module, "run_backup_scheduler", worker)
     service.stop.set()
 
@@ -111,7 +112,13 @@ def test_run_starts_named_channel_workers(
         "discord",
         "reporting",
         "backup-scheduler",
-        "archive:0",
+        "upload:0",
+        "download:0",
+        "metadata:0",
+        "cleanup:0",
+        "webpage:0",
+        "recovery:0",
+        "transfer-health",
     }
     assert not (tmp_path / "healthy").exists()
     store.close()
@@ -791,9 +798,12 @@ def test_archive_loop_rotates_preference_and_handles_failure(
     class State:
         preferences: list[bool] = []
 
-        def claim_archive(self, *, prefer_recent: bool) -> Any:
+        def claim_archive(self, *, prefer_recent: bool, **kwargs: Any) -> Any:
             self.preferences.append(prefer_recent)
             return None if len(self.preferences) == 1 else work
+
+        def record_worker_time(self, *args: Any) -> None:
+            pass
 
     state = State()
     service = service_with(tmp_path, state, SimpleNamespace())

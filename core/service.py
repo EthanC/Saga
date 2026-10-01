@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -61,13 +64,16 @@ class SagaService:
                 settings, state, youtube, upload_limiter=upload_limiter
             )
         self.stop = asyncio.Event()
+        self._work_changed = asyncio.Condition()
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
         logger.info("Initializing Saga service")
         self._remove_healthcheck()
         monitored = await self._initialize()
-        self.state.reset_interrupted_claims()
+        self.state.reset_interrupted_claims(
+            background_deadline=self.settings.background_deadline
+        )
         self._write_healthcheck()
         logger.info("Starting workers for {} channel(s)", len(monitored))
 
@@ -91,13 +97,22 @@ class SagaService:
                         name="backup-scheduler",
                     )
                 if self.archival is not None:
-                    logger.info(
-                        "Starting {} archive worker(s)", self.settings.archive_workers
+                    for lane, count in (
+                        ("upload", self.settings.upload_workers),
+                        ("download", self.settings.download_workers),
+                        ("metadata", 1),
+                        ("cleanup", 1),
+                        ("recovery", 1),
+                        ("webpage", 1),
+                        ("validation", int(self.settings.validation_enabled)),
+                    ):
+                        for index in range(count):
+                            workers.create_task(
+                                self._archive_loop(index, lane), name=f"{lane}:{index}"
+                            )
+                    workers.create_task(
+                        self._transfer_health_loop(), name="transfer-health"
                     )
-                    for index in range(self.settings.archive_workers):
-                        workers.create_task(
-                            self._archive_loop(index), name=f"archive:{index}"
-                        )
                 await self.stop.wait()
         finally:
             logger.debug("Worker group is stopping")
@@ -433,22 +448,49 @@ class SagaService:
                 self.state.complete_delivery(delivery.id, message_id)
                 logger.info("Delivered video {} to Discord", delivery.video_id)
 
-    async def _archive_loop(self, worker_index: int) -> None:
+    async def _archive_loop(self, worker_index: int, lane: str = "metadata") -> None:
+        # Discovery and history use asyncio's default pool. Each archive worker
+        # owns a thread so those requests cannot consume upload capacity.
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"saga-{lane}-{worker_index}"
+        ) as executor:
+            await self._archive_worker_loop(worker_index, lane, executor)
+
+    async def _archive_worker_loop(
+        self, worker_index: int, lane: str, executor: ThreadPoolExecutor
+    ) -> None:
         assert self.archival is not None
         claim_count = worker_index
         while not self.stop.is_set():
-            work = self.state.claim_archive(prefer_recent=claim_count % 4 != 3)
+            if lane in {"upload", "download", "metadata"}:
+                work = self.state.claim_archive(
+                    prefer_recent=claim_count % 4 != 3,
+                    lane=lane,
+                    buffer=self.settings.upload_ready_buffer,
+                    free_bytes=shutil.disk_usage(self.settings.data_path).free
+                    if lane == "download"
+                    else None,
+                    minimum_free_bytes=self.settings.minimum_free_bytes,
+                    unknown_download_bytes=self.settings.unknown_download_bytes,
+                )
+            else:
+                work = self.state.claim_background(
+                    lane, max_attempts=self.settings.background_max_attempts
+                )
             claim_count += 1
             if work is None:
-                await self._wait(1)
+                async with self._work_changed:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self._work_changed.wait(), timeout=1)
                 continue
             logger.debug(
                 "Archive worker {} claimed video {}", worker_index, work.video.id
             )
             operation = asyncio.create_task(
-                asyncio.to_thread(self.archival.process, work),
+                self._archive_operation(executor, work),
                 name=f"archive-operation:{work.video.id}",
             )
+            started = time.monotonic()
             try:
                 await asyncio.shield(operation)
             except asyncio.CancelledError:
@@ -457,6 +499,32 @@ class SagaService:
                 raise
             except Exception:
                 logger.exception("Archive worker failed for {}", work.video.id)
+            finally:
+                self.state.record_worker_time(lane, time.monotonic() - started)
+                async with self._work_changed:
+                    self._work_changed.notify_all()
+
+    async def _archive_operation(self, executor: ThreadPoolExecutor, work: Any) -> None:
+        assert self.archival is not None
+        await asyncio.get_running_loop().run_in_executor(
+            executor, self.archival.process, work
+        )
+
+    async def _transfer_health_loop(self) -> None:
+        """Publish transfer progress separately from the polling heartbeat."""
+        while not self.stop.is_set():
+            health = self.state.transfer_health(
+                stall_timeout=self.settings.transfer_stall_timeout
+            )
+            root = self.settings.data_path / "downloads"
+            health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
+            path = self.settings.data_path / "transfers.json"
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(health, sort_keys=True), encoding="utf-8")
+            temporary.replace(path)
+            if not health["healthy"]:
+                logger.error("Upload queue stalled: {}", health)
+            await self._wait(30)
 
     async def _report_loop(self) -> None:
         logger.debug(
@@ -513,7 +581,7 @@ class SagaService:
                 if webhook_url is None:
                     logger.info(
                         "YouTube archival report {} to {}: {} discovered, {} media "
-                        "archived, {} unfinished, {} awaiting replay, {} unavailable, "
+                        "uploaded, {} unfinished, {} awaiting replay, {} unavailable, "
                         "{} requiring operator action",
                         report.window_start,
                         report.window_end,
@@ -582,3 +650,15 @@ class SagaService:
 def _safe_error(error: Exception, secret: str) -> str:
     detail = f"{type(error).__name__}: {error}"
     return redact_discord_webhooks(detail.replace(secret, "<discord webhook>"))[:2000]
+
+
+def staging_usage(root: Any) -> int:
+    """Measure staging while allowing the cleanup worker to remove directories."""
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            continue
+    return total

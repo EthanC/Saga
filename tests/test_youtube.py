@@ -215,7 +215,7 @@ def test_missing_media_fragment_fails_download(
     monkeypatch.setattr(youtube.YoutubeDL, "urlopen", urlopen)
     monkeypatch.setattr(youtube.YoutubeDL, "download", download)
     monkeypatch.setattr(
-        youtube.shutil, "disk_usage", lambda _: shutil._ntuple_diskusage(10, 0, 10)
+        youtube.shutil, "disk_usage", lambda _: shutil._ntuple_diskusage(100, 0, 100)
     )
 
     with pytest.raises(RuntimeError, match="HTTP Error 404"):

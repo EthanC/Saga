@@ -62,6 +62,10 @@ def report_has_activity(report: Report) -> bool:
             report.awaiting_replay,
             report.unavailable,
             report.operator_action,
+            report.validation_pending,
+            report.validation_failed,
+            report.webpage_pending,
+            report.webpage_failed,
         )
     )
 
@@ -107,13 +111,21 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
                 "indent": 1,
             },
             (
-                "Media archived: "
-                f"{Markdown.bold(f'{report.media_archived:,}')}"
+                (
+                    "Videos uploaded: "
+                    if report.semantics_version >= 2
+                    else "Media archived: "
+                )
+                + f"{Markdown.bold(f'{report.media_archived:,}')}"
                 f" | {Markdown.bold(f'{report.lifetime_media_archived:,}')} Lifetime"
             ),
             (
-                "Media preserved: "
-                f"{Markdown.bold(format_bytes(report.media_bytes))}"
+                (
+                    "Bytes uploaded: "
+                    if report.semantics_version >= 2
+                    else "Media preserved: "
+                )
+                + f"{Markdown.bold(format_bytes(report.media_bytes))}"
                 " | "
                 f"{Markdown.bold(format_bytes(report.lifetime_media_bytes))} Lifetime"
             ),
@@ -125,6 +137,20 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
             f"Awaiting replay: {Markdown.bold(f'{report.awaiting_replay:,}')}",
             f"Unavailable: {Markdown.bold(f'{report.unavailable:,}')}",
             f"Operator action: {Markdown.bold(f'{report.operator_action:,}')}",
+            f"Ready uploads: {report.ready_uploads:,}"
+            f" | Pending downloads: {report.pending_downloads:,}",
+            f"Active transfers: {report.active_transfers:,}"
+            f" | Failed: {report.failed_transfers:,}"
+            f" | Uncertain: {report.uncertain_transfers:,}",
+            f"Validation: {report.validation_pending:,} pending, "
+            f"{report.validation_passed:,} passed, "
+            f"{report.validation_failed:,} failed, "
+            f"{report.validation_expired:,} expired",
+            f"Webpages: {report.webpage_pending:,} pending, "
+            f"{report.webpage_completed:,} completed, "
+            f"{report.webpage_failed:,} failed/expired",
+            f"Recovered/historical uploads: {report.recovered_uploads:,} "
+            "(excluded from newly transferred bytes)",
         ]
     )
     footer = Markdown.subtext(

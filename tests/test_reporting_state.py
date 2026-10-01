@@ -87,6 +87,9 @@ def add_source_data(state: StateStore, start: datetime, end: datetime) -> None:
                 status="complete",
                 media_size=1024,
                 media_verified_at=start,
+                media_uploaded_at=start,
+                uploaded_bytes=1024,
+                upload_origin="transferred",
             )
         )
         session.add(ArchiveProgress(video_id="bbbbbbbbbbb", status="operator_action"))

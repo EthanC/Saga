@@ -12,6 +12,14 @@ VALID_CHANNEL = {
 }
 VALID_INSTANCE = {"name": "primary", "channels": [VALID_CHANNEL]}
 SETTING_NAMES = (
+    "SAGA_UPLOAD_WORKERS",
+    "SAGA_DOWNLOAD_WORKERS",
+    "SAGA_UPLOAD_READY_BUFFER",
+    "SAGA_UNKNOWN_DOWNLOAD_BYTES",
+    "SAGA_VALIDATION_ENABLED",
+    "SAGA_BACKGROUND_MAX_ATTEMPTS",
+    "SAGA_BACKGROUND_DEADLINE",
+    "SAGA_TRANSFER_STALL_TIMEOUT",
     "SAGA_CONFIG_PATH",
     "SAGA_DATA_PATH",
     "SAGA_HEALTHCHECK_FILE",
@@ -48,6 +56,28 @@ SETTING_NAMES = (
 def clean_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in SETTING_NAMES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("SAGA_UPLOAD_WORKERS", "0"),
+        ("SAGA_DOWNLOAD_WORKERS", "5"),
+        ("SAGA_UPLOAD_READY_BUFFER", "0"),
+        ("SAGA_UNKNOWN_DOWNLOAD_BYTES", "0"),
+        ("SAGA_BACKGROUND_MAX_ATTEMPTS", "0"),
+    ],
+)
+def test_upload_first_configuration_rejects_zero_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_settings: None,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError):
+        config.load_settings(tmp_path)
 
 
 @pytest.mark.parametrize(

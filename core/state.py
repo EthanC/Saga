@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import random
+import sqlite3
 from collections.abc import Iterable, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import case, event, func, inspect, text
@@ -132,6 +137,19 @@ class ArchiveProgress(SQLModel, table=True):
     ia_identifier: str | None = Field(default=None, index=True)
     operation_id: str | None = Field(default=None, index=True)
     upload_started_at: datetime | None = None
+    download_completed_at: datetime | None = None
+    ready_at: datetime | None = None
+    media_uploaded_at: datetime | None = Field(default=None, index=True)
+    uploaded_bytes: int | None = None
+    upload_receipt: str | None = None
+    upload_etag: str | None = None
+    upload_origin: str | None = None
+    upload_mode: str = "create"
+    transfer_bytes: int = 0
+    transfer_progress_at: datetime | None = None
+    retry_attempts: int = 0
+    reserved_bytes: int = 0
+    download_estimated_bytes: int | None = None
     media_verified_at: datetime | None = None
     recovery_result: str | None = None
     failure_phase: str | None = None
@@ -141,6 +159,35 @@ class ArchiveProgress(SQLModel, table=True):
     cleaned_at: datetime | None = None
     last_error: str | None = None
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class ArchiveJob(SQLModel, table=True):
+    """Claim background work independently of a video's transfer claim."""
+
+    video_id: str = Field(foreign_key="archiveprogress.video_id", primary_key=True)
+    kind: str = Field(primary_key=True)
+    status: str = Field(default="pending", index=True)
+    attempts: int = 0
+    retry_at: datetime | None = Field(default=None, index=True)
+    deadline_at: datetime | None = None
+    claim_token: str | None = None
+    claimed_at: datetime | None = None
+    last_error: str | None = None
+    updated_at: datetime = Field(default_factory=utcnow)
+
+
+class WorkerTiming(SQLModel, table=True):
+    """Persist cumulative worker occupancy by job kind."""
+
+    kind: str = Field(primary_key=True)
+    seconds: float = 0.0
+
+
+class SchemaMigration(SQLModel, table=True):
+    """Record one-time data migrations independently of additive columns."""
+
+    version: int = Field(primary_key=True)
+    applied_at: datetime = Field(default_factory=utcnow)
 
 
 class ReportCheckpoint(SQLModel, table=True):
@@ -174,6 +221,20 @@ class Report(SQLModel, table=True):
     lifetime_media_archived: int = 0
     media_bytes: int = 0
     lifetime_media_bytes: int = 0
+    semantics_version: int = 2
+    ready_uploads: int = 0
+    pending_downloads: int = 0
+    active_transfers: int = 0
+    failed_transfers: int = 0
+    uncertain_transfers: int = 0
+    validation_pending: int = 0
+    validation_passed: int = 0
+    validation_failed: int = 0
+    validation_expired: int = 0
+    webpage_pending: int = 0
+    webpage_completed: int = 0
+    webpage_failed: int = 0
+    recovered_uploads: int = 0
     active_channels: int = 0
     unfinished_workflows: int = 0
     awaiting_replay: int = 0
@@ -222,6 +283,7 @@ class ArchiveWork:
     progress: ArchiveProgress
     video: Video
     channel: Channel
+    job: ArchiveJob | None = None
 
 
 class StateStore:
@@ -235,7 +297,16 @@ class StateStore:
             f"sqlite:///{path}", connect_args={"check_same_thread": False}
         )
         self._write_lock = Lock()
+        self.download_pause_reason: str | None = None
         event.listen(self.engine, "connect", _configure_sqlite)
+        if "archiveprogress" in inspect(self.engine).get_table_names() and (
+            "media_uploaded_at"
+            not in {
+                column["name"]
+                for column in inspect(self.engine).get_columns("archiveprogress")
+            }
+        ):
+            self._backup_before_migration()
         SQLModel.metadata.create_all(self.engine)
         self._migrate_schema()
         logger.debug("Initialized SQLite state at {}", self.path)
@@ -244,6 +315,18 @@ class StateStore:
         """Dispose database connections."""
         self.engine.dispose()
         logger.debug("Closed SQLite state at {}", self.path)
+
+    def _backup_before_migration(self) -> None:
+        backup = self.path.with_name(f"{self.path.name}.pre-upload-first.sqlite3")
+        if not backup.exists():
+            with (
+                closing(sqlite3.connect(self.path)) as source,
+                closing(sqlite3.connect(backup)) as target,
+            ):
+                source.backup(target)
+                if target.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    raise sqlite3.DatabaseError("migration backup failed quick_check")
+            logger.info("Saved pre-migration SQLite backup at {}", backup)
 
     def register_channel(
         self, reference: str, resolved: ResolvedChannel
@@ -491,7 +574,7 @@ class StateStore:
             }
             return set(identifiers) - known_ids | ambiguous
 
-    def reset_interrupted_claims(self) -> None:
+    def reset_interrupted_claims(self, *, background_deadline: float = 86_400) -> None:
         """Return work interrupted by a prior process to safe persisted stages."""
         with self._write_lock, Session(self.engine) as session:
             deliveries = session.exec(
@@ -518,9 +601,27 @@ class StateStore:
                         "process stopped while webpage submission outcome was uncertain"
                     )
                 progress.claimed_at = None
+                progress.reserved_bytes = 0
                 progress.retry_at = None
                 progress.updated_at = utcnow()
                 session.add(progress)
+                if progress.status == "reconcile_upload":
+                    self._restart_recovery_job(
+                        session,
+                        progress.video_id,
+                        delay=0,
+                        deadline=background_deadline,
+                    )
+            jobs = session.exec(
+                select(ArchiveJob).where(col(ArchiveJob.claim_token).is_not(None))
+            ).all()
+            for job in jobs:
+                if job.status == "submitting":
+                    job.status = "failed"
+                    job.last_error = "process stopped before webpage receipt was saved"
+                job.claim_token = None
+                job.claimed_at = None
+                session.add(job)
             reports = session.exec(
                 select(Report).where(Report.status == "sending")
             ).all()
@@ -543,20 +644,29 @@ class StateStore:
             logger.debug("No interrupted workflow claims required recovery")
 
     def claim_archive(
-        self, *, prefer_recent: bool, now: datetime | None = None
+        self,
+        *,
+        prefer_recent: bool,
+        now: datetime | None = None,
+        lane: str = "transfer",
+        free_bytes: int | None = None,
+        minimum_free_bytes: int = 0,
+        buffer: int = 2,
+        unknown_download_bytes: int = 10_000_000_000,
     ) -> ArchiveWork | None:
-        """Claim one due archive row, prioritizing downstream archive stages."""
+        """Atomically claim due transfer work within its reserved worker lane."""
         current = now or utcnow()
-        terminal = ("complete", "unavailable", "operator_action")
+        stages = {
+            "upload": ("upload",),
+            "download": ("download",),
+            "metadata": ("metadata",),
+            "transfer": ("upload", "download", "metadata"),
+        }[lane]
         queue_order = (
             case(
-                (col(ArchiveProgress.status) == "cleanup", 0),
-                (col(ArchiveProgress.status).in_(("uploading", "reconcile_upload")), 1),
-                (col(ArchiveProgress.status).in_(("webpage", "wayback_wait")), 2),
-                (col(ArchiveProgress.status) == "upload", 3),
-                (col(ArchiveProgress.status) == "download", 4),
-                (col(ArchiveProgress.status) == "metadata", 5),
-                else_=6,
+                (col(ArchiveProgress.status) == "upload", 0),
+                (col(ArchiveProgress.status) == "download", 1),
+                else_=2,
             ),
             case((col(ArchiveProgress.failure_phase) == "disk", 1), else_=0),
             *(
@@ -568,23 +678,99 @@ class StateStore:
             col(ArchiveProgress.video_id),
         )
         with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if lane == "download":
+                staged = session.exec(
+                    select(func.count(col(ArchiveProgress.video_id))).where(
+                        col(ArchiveProgress.media_uploaded_at).is_(None),
+                        ArchiveProgress.status == "upload",
+                    )
+                ).one()
+                active = session.exec(
+                    select(func.count(col(ArchiveProgress.video_id))).where(
+                        ArchiveProgress.status == "download",
+                        col(ArchiveProgress.claimed_at).is_not(None),
+                    )
+                ).one()
+                if staged + active >= buffer:
+                    self.download_pause_reason = "upload-ready buffer full"
+                    return None
+                reserved = session.exec(
+                    select(
+                        func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
+                    )
+                ).one()
+            else:
+                reserved = 0
+            if (
+                lane == "metadata"
+                and session.exec(
+                    select(func.count(col(ArchiveProgress.video_id))).where(
+                        ArchiveProgress.status == "download",
+                        col(ArchiveProgress.failure_phase).is_(None)
+                        | (ArchiveProgress.failure_phase != "disk"),
+                    )
+                ).one()
+                >= 2 * buffer
+            ):
+                return None
             statement = (
                 select(ArchiveProgress, Video, Channel)
                 .join(Video, col(ArchiveProgress.video_id) == col(Video.id))
                 .join(Channel, col(Video.channel_id) == col(Channel.id))
                 .where(
-                    col(ArchiveProgress.status).not_in(terminal),
+                    col(ArchiveProgress.status).in_(stages),
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
                     col(ArchiveProgress.claimed_at).is_(None),
                     col(ArchiveProgress.retry_at).is_(None)
                     | (col(ArchiveProgress.retry_at) <= current),
                 )
             )
             statement = statement.order_by(*queue_order)
-            row = session.exec(statement).first()
-            if row is None:
+            rows = (
+                session.exec(statement).all()
+                if lane == "download"
+                else (
+                    [row]
+                    if (row := session.exec(statement).first()) is not None
+                    else []
+                )
+            )
+            selected = None
+            for progress, video, channel in rows:
+                reservation = 0
+                if lane == "download":
+                    metadata = json.loads(progress.frozen_metadata or "{}")
+                    reservation = 2 * max(
+                        progress.download_estimated_bytes
+                        or metadata.get("estimated_bytes")
+                        or unknown_download_bytes,
+                        1,
+                    )
+                    if (
+                        free_bytes is None
+                        or free_bytes < minimum_free_bytes + reserved + reservation
+                    ):
+                        self.download_pause_reason = "disk budget full"
+                        progress.failure_phase = "disk"
+                        progress.last_error = (
+                            "waiting for download and merge disk budget"
+                        )
+                        session.add(progress)
+                        continue
+                selected = progress, video, channel
+                progress.reserved_bytes = reservation
+                break
+            if selected is None:
+                if not rows and lane == "download":
+                    self.download_pause_reason = "no eligible download"
+                session.commit()
                 return None
-
-            progress, video, channel = row
+            progress, video, channel = selected
+            if lane == "download":
+                self.download_pause_reason = None
+                progress.failure_phase = None
+                progress.last_error = None
             progress.claimed_at = current
             progress.attempts += 1
             progress.updated_at = current
@@ -601,6 +787,256 @@ class StateStore:
             )
             return ArchiveWork(progress=progress, video=video, channel=channel)
 
+    @staticmethod
+    def _queue_job(
+        session: Session, video_id: str, kind: str, *, deadline: float | None = None
+    ) -> None:
+        if session.get(ArchiveJob, (video_id, kind)) is None:
+            session.add(
+                ArchiveJob(
+                    video_id=video_id,
+                    kind=kind,
+                    deadline_at=utcnow() + timedelta(seconds=deadline)
+                    if deadline
+                    else None,
+                )
+            )
+
+    def claim_background(
+        self, kind: str, *, now: datetime | None = None, max_attempts: int = 12
+    ) -> ArchiveWork | None:
+        """Claim one bounded background job without acquiring its transfer row."""
+        current = now or utcnow()
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            jobs = session.exec(
+                select(ArchiveJob)
+                .where(
+                    ArchiveJob.kind == kind,
+                    col(ArchiveJob.status).in_(("pending", "waiting")),
+                    col(ArchiveJob.claim_token).is_(None),
+                    col(ArchiveJob.retry_at).is_(None)
+                    | (col(ArchiveJob.retry_at) <= current),
+                )
+                .order_by(col(ArchiveJob.updated_at), col(ArchiveJob.video_id))
+            ).all()
+            for job in jobs:
+                if kind != "cleanup" and (
+                    job.attempts >= max_attempts
+                    or (
+                        job.deadline_at and _as_utc(job.deadline_at) <= _as_utc(current)
+                    )
+                ):
+                    job.status = "expired"
+                    session.add(job)
+                    continue
+                progress = session.get(ArchiveProgress, job.video_id)
+                assert progress is not None
+                if kind == "recovery" and progress.media_uploaded_at is not None:
+                    job.status = "passed"
+                    session.add(job)
+                    continue
+                video = session.get(Video, job.video_id)
+                assert video is not None
+                channel = session.get(Channel, video.channel_id)
+                assert channel is not None
+                job.claim_token = str(uuid4())
+                job.claimed_at = current
+                job.attempts += 1
+                session.add(job)
+                session.commit()
+                for item in (job, progress, video, channel):
+                    session.refresh(item)
+                    session.expunge(item)
+                return ArchiveWork(progress, video, channel, job)
+            session.commit()
+            return None
+
+    @staticmethod
+    def _restart_recovery_job(
+        session: Session, video_id: str, *, delay: float, deadline: float
+    ) -> None:
+        """Give a newly uncertain transfer its own recovery budget and claim."""
+        job = session.get(ArchiveJob, (video_id, "recovery"))
+        if job is None:
+            job = ArchiveJob(video_id=video_id, kind="recovery")
+        now = utcnow()
+        job.status = "pending"
+        job.attempts = 0
+        job.retry_at = now + timedelta(seconds=delay)
+        job.deadline_at = now + timedelta(seconds=deadline)
+        job.claim_token = None
+        job.claimed_at = None
+        job.last_error = None
+        job.updated_at = now
+        session.add(job)
+
+    def update_job(
+        self,
+        work: ArchiveWork,
+        *,
+        status: str,
+        retry_after: float | None = None,
+        error: str | None = None,
+        **facts: Any,
+    ) -> None:
+        """Commit background facts only for the current independent claim."""
+        assert work.job is not None
+        with self._write_lock, Session(self.engine) as session:
+            job = session.get(ArchiveJob, (work.video.id, work.job.kind))
+            if job is None or job.claim_token != work.job.claim_token:
+                raise RuntimeError("background claim no longer belongs to this worker")
+            progress = session.get(ArchiveProgress, work.video.id)
+            assert progress is not None
+            if progress.operation_id != work.progress.operation_id:
+                raise RuntimeError(
+                    "background job belongs to a different Saga operation"
+                )
+            for name, value in facts.items():
+                if name not in {
+                    "webpage_status",
+                    "wayback_job_id",
+                    "ziggy_receipt",
+                    "media_verified_at",
+                    "cleaned_at",
+                    "media_path",
+                    "working_directory",
+                }:
+                    raise ValueError(f"invalid background fact {name}")
+                setattr(progress, name, value)
+            job.status = status
+            job.last_error = error
+            job.updated_at = utcnow()
+            if status != "submitting":
+                job.claim_token = None
+                job.claimed_at = None
+            job.retry_at = (
+                utcnow() + timedelta(seconds=retry_after)
+                if retry_after is not None
+                else None
+            )
+            session.add_all((job, progress))
+            session.commit()
+
+    def acknowledge_upload(
+        self,
+        work: ArchiveWork,
+        *,
+        receipt: str,
+        etag: str | None,
+        recovered: bool = False,
+        validation: bool = False,
+        deadline: float = 86_400,
+    ) -> None:
+        """Commit upload completion and enqueue cleanup in the same transaction."""
+        with self._write_lock, Session(self.engine) as session:
+            progress = session.get(ArchiveProgress, work.video.id)
+            if (
+                progress is None
+                or not progress.operation_id
+                or progress.operation_id != work.progress.operation_id
+            ):
+                raise RuntimeError(
+                    "upload receipt does not belong to this Saga operation"
+                )
+            if progress.media_uploaded_at is None:
+                progress.media_uploaded_at = utcnow()
+                progress.uploaded_bytes = progress.media_size
+                progress.upload_receipt = receipt
+                progress.upload_etag = etag
+                progress.upload_origin = "recovered" if recovered else "transferred"
+            progress.status = "complete"
+            progress.claimed_at = None
+            progress.retry_at = None
+            progress.reserved_bytes = 0
+            progress.last_error = None
+            progress.failure_phase = None
+            progress.updated_at = utcnow()
+            session.add(progress)
+            self._queue_job(session, work.video.id, "cleanup")
+            self._queue_job(session, work.video.id, "webpage", deadline=deadline)
+            if validation:
+                self._queue_job(session, work.video.id, "validation", deadline=deadline)
+            session.commit()
+
+    def defer_transfer(
+        self,
+        work: ArchiveWork,
+        *,
+        status: str,
+        error: str,
+        delay: float,
+        deadline: float,
+    ) -> None:
+        """Release failed or uncertain transfers and give checks their own queue."""
+        with self._write_lock, Session(self.engine) as session:
+            progress = session.get(ArchiveProgress, work.video.id)
+            if progress is None or progress.operation_id != work.progress.operation_id:
+                raise RuntimeError("transfer belongs to a different Saga operation")
+            if progress.media_uploaded_at is not None:
+                return
+            progress.status = status
+            progress.claimed_at = None
+            progress.retry_at = utcnow() + timedelta(seconds=delay)
+            progress.last_error = error
+            progress.failure_phase = "initial_upload"
+            progress.retry_attempts += 1
+            progress.updated_at = utcnow()
+            session.add(progress)
+            if status == "reconcile_upload":
+                self._restart_recovery_job(
+                    session, work.video.id, delay=delay, deadline=deadline
+                )
+            session.commit()
+
+    def queue_webpage_only(self, video_id: str, *, deadline: float) -> None:
+        """Finish Ziggy-only prerequisites and schedule its capture separately."""
+        with self._write_lock, Session(self.engine) as session:
+            progress = session.get(ArchiveProgress, video_id)
+            if progress is None:
+                raise LookupError(f"Unknown archive progress for {video_id}")
+            progress.status = "complete"
+            progress.claimed_at = None
+            session.add(progress)
+            self._queue_job(session, video_id, "webpage", deadline=deadline)
+            session.commit()
+
+    def record_worker_time(self, kind: str, seconds: float) -> None:
+        """Accumulate worker occupancy without changing report snapshots."""
+        with self._write_lock, Session(self.engine) as session:
+            timing = session.get(WorkerTiming, kind) or WorkerTiming(kind=kind)
+            timing.seconds += seconds
+            session.add(timing)
+            session.commit()
+
+    def guard_download_space(
+        self, video_id: str, expected: int, downloaded: int, free: int, minimum: int
+    ) -> None:
+        """Adjust a download/merge reservation as yt-dlp learns stream sizes."""
+        with self._write_lock, Session(self.engine) as session:
+            progress = session.get(ArchiveProgress, video_id)
+            assert progress is not None
+            others = session.exec(
+                select(
+                    func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
+                ).where(ArchiveProgress.video_id != video_id)
+            ).one()
+            remaining = max(2 * expected - downloaded, expected)
+            progress.download_estimated_bytes = max(
+                expected, progress.download_estimated_bytes or 0
+            )
+            permitted = free >= minimum + others + remaining
+            if permitted:
+                progress.reserved_bytes = remaining
+            session.add(progress)
+            session.commit()
+            if not permitted:
+                from core.youtube import DiskSpaceError
+
+                raise DiskSpaceError(
+                    "download and merge exceed available disk reservations"
+                )
+
     def update_archive(
         self,
         video_id: str,
@@ -611,25 +1047,11 @@ class StateStore:
         **values: Any,
     ) -> None:
         """Persist an archive transition without holding a network transaction."""
-        allowed = {
-            "working_directory",
-            "media_path",
-            "media_name",
-            "media_size",
-            "media_md5",
-            "media_sha1",
-            "frozen_metadata",
-            "ia_identifier",
-            "operation_id",
-            "upload_started_at",
-            "media_verified_at",
-            "recovery_result",
-            "failure_phase",
-            "wayback_job_id",
-            "webpage_status",
-            "ziggy_receipt",
-            "cleaned_at",
-            "last_error",
+        allowed = set(ArchiveProgress.model_fields) - {
+            "video_id",
+            "status",
+            "claimed_at",
+            "retry_at",
         }
         unknown = set(values) - allowed
         if unknown:
@@ -648,6 +1070,7 @@ class StateStore:
                 setattr(progress, name, value)
             if release:
                 progress.claimed_at = None
+                progress.reserved_bytes = 0
                 progress.retry_at = (
                     utcnow() + timedelta(seconds=retry_after)
                     if retry_after is not None
@@ -785,20 +1208,21 @@ class StateStore:
                 media_period = session.exec(
                     select(
                         func.count(col(ArchiveProgress.video_id)),
-                        func.coalesce(func.sum(col(ArchiveProgress.media_size)), 0),
+                        func.coalesce(func.sum(col(ArchiveProgress.uploaded_bytes)), 0),
                     ).where(
-                        col(ArchiveProgress.media_verified_at).is_not(None),
-                        col(ArchiveProgress.media_verified_at) >= window_start,
-                        col(ArchiveProgress.media_verified_at) < window_end,
+                        col(ArchiveProgress.media_uploaded_at).is_not(None),
+                        col(ArchiveProgress.media_uploaded_at) >= window_start,
+                        col(ArchiveProgress.media_uploaded_at) < window_end,
+                        ArchiveProgress.upload_origin == "transferred",
                     )
                 ).one()
                 media_lifetime = session.exec(
                     select(
                         func.count(col(ArchiveProgress.video_id)),
-                        func.coalesce(func.sum(col(ArchiveProgress.media_size)), 0),
+                        func.coalesce(func.sum(col(ArchiveProgress.uploaded_bytes)), 0),
                     ).where(
-                        col(ArchiveProgress.media_verified_at).is_not(None),
-                        col(ArchiveProgress.media_verified_at) < window_end,
+                        col(ArchiveProgress.media_uploaded_at).is_not(None),
+                        col(ArchiveProgress.media_uploaded_at) < window_end,
                     )
                 ).one()
                 active_channels = session.exec(
@@ -847,6 +1271,7 @@ class StateStore:
                     awaiting_replay=int(awaiting_replay),
                     unavailable=int(unavailable),
                     operator_action=int(operator_action),
+                    **self._queue_counts(session),
                 )
                 session.add(existing)
             checkpoint = session.get(ReportCheckpoint, 1)
@@ -860,6 +1285,126 @@ class StateStore:
             session.refresh(existing)
             session.expunge(existing)
             return existing
+
+    @staticmethod
+    def _queue_counts(session: Session) -> dict[str, Any]:
+        statuses = dict(
+            session.exec(
+                select(
+                    ArchiveProgress.status, func.count(col(ArchiveProgress.video_id))
+                ).group_by(ArchiveProgress.status)
+            ).all()
+        )
+        jobs = {
+            (kind, status): count
+            for kind, status, count in session.exec(
+                select(
+                    ArchiveJob.kind,
+                    ArchiveJob.status,
+                    func.count(col(ArchiveJob.video_id)),
+                ).group_by(ArchiveJob.kind, ArchiveJob.status)
+            ).all()
+        }
+        return {
+            "ready_uploads": statuses.get("upload", 0),
+            "pending_downloads": statuses.get("download", 0)
+            + statuses.get("metadata", 0),
+            "active_transfers": statuses.get("uploading", 0),
+            "failed_transfers": session.exec(
+                select(func.count(col(ArchiveProgress.video_id))).where(
+                    ArchiveProgress.status == "upload",
+                    col(ArchiveProgress.last_error).is_not(None),
+                )
+            ).one(),
+            "uncertain_transfers": statuses.get("reconcile_upload", 0),
+            "recovered_uploads": session.exec(
+                select(func.count(col(ArchiveProgress.video_id))).where(
+                    col(ArchiveProgress.upload_origin).in_(("recovered", "historical"))
+                )
+            ).one(),
+            **{
+                f"validation_{status}": jobs.get(("validation", status), 0)
+                + (jobs.get(("validation", "waiting"), 0) if status == "pending" else 0)
+                for status in ("pending", "passed", "failed", "expired")
+            },
+            "webpage_pending": sum(
+                jobs.get(("webpage", status), 0)
+                for status in ("pending", "waiting", "submitting")
+            ),
+            "webpage_completed": jobs.get(("webpage", "passed"), 0),
+            "webpage_failed": jobs.get(("webpage", "failed"), 0)
+            + jobs.get(("webpage", "expired"), 0),
+        }
+
+    def transfer_health(
+        self, *, stall_timeout: float, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Explain waiting uploads and detect absent or stalled upload capacity."""
+        current = now or utcnow()
+        with Session(self.engine) as session:
+            ready = session.exec(
+                select(ArchiveProgress).where(ArchiveProgress.status == "upload")
+            ).all()
+            active = session.exec(
+                select(ArchiveProgress).where(ArchiveProgress.status == "uploading")
+            ).all()
+            due = [
+                row
+                for row in ready
+                if not row.retry_at or _as_utc(row.retry_at) <= _as_utc(current)
+            ]
+            oldest = min(
+                (_as_utc(row.ready_at or row.updated_at) for row in due), default=None
+            )
+            stalled = any(
+                (
+                    current
+                    - _as_utc(
+                        row.transfer_progress_at
+                        or row.upload_started_at
+                        or row.updated_at
+                    )
+                ).total_seconds()
+                > stall_timeout
+                for row in active
+            )
+            idle_stall = bool(
+                oldest
+                and not active
+                and (current - oldest).total_seconds() > stall_timeout
+            )
+            last = session.exec(
+                select(func.max(col(ArchiveProgress.media_uploaded_at)))
+            ).one()
+            return {
+                "healthy": not (stalled or idle_stall),
+                "last_upload": str(last) if last else None,
+                "oldest_ready": oldest.isoformat() if oldest else None,
+                "waiting_reason": "transfer in progress"
+                if active
+                else "retry backoff"
+                if ready and not due
+                else None,
+                "active": [
+                    {
+                        "video_id": row.video_id,
+                        "bytes": row.transfer_bytes,
+                        "size": row.media_size,
+                        "progress_at": str(row.transfer_progress_at),
+                    }
+                    for row in active
+                ],
+                "download_pause_reason": self.download_pause_reason,
+                "reserved_bytes": session.exec(
+                    select(
+                        func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
+                    )
+                ).one(),
+                "worker_seconds": {
+                    row.kind: row.seconds
+                    for row in session.exec(select(WorkerTiming)).all()
+                },
+            }
 
     def claim_report(self, now: datetime | None = None) -> Report | None:
         """Claim the oldest report whose delivery is due."""
@@ -1056,12 +1601,108 @@ class StateStore:
                 "ALTER TABLE reportcheckpoint ADD COLUMN schedule VARCHAR NOT NULL "
                 "DEFAULT ''"
             )
-        if not statements:
-            return
-        logger.info("Applying {} SQLite schema migration(s)", len(statements))
+        for model in (ArchiveProgress, Report):
+            table = cast(Any, model).__table__
+            existing = {column["name"] for column in schema.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                default = model.model_fields[column.name].default
+                definition = column.type.compile(dialect=self.engine.dialect)
+                if column.name == "semantics_version":
+                    default = 1
+                if default is not None:
+                    literal = (
+                        f"'{default}'"
+                        if isinstance(default, str)
+                        else str(int(default))
+                    )
+                    definition += f" NOT NULL DEFAULT {literal}"
+                statements.append(
+                    f"ALTER TABLE {table.name} ADD COLUMN {column.name} {definition}"
+                )
         with self.engine.begin() as connection:
             for statement in statements:
                 connection.execute(text(statement))
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_archiveprogress_media_uploaded_at "
+                    "ON archiveprogress(media_uploaded_at)"
+                )
+            )
+        with self._write_lock, Session(self.engine) as session:
+            if session.get(SchemaMigration, 2) is not None:
+                return
+            for progress in session.exec(select(ArchiveProgress)).all():
+                old_status = progress.status
+                if progress.media_size and progress.status in {
+                    "upload",
+                    "uploading",
+                    "reconcile_upload",
+                }:
+                    progress.download_completed_at = progress.updated_at
+                    progress.ready_at = progress.updated_at
+                if progress.media_verified_at is not None:
+                    progress.media_uploaded_at = progress.media_verified_at
+                    progress.uploaded_bytes = progress.media_size
+                    progress.upload_origin = "historical"
+                    progress.upload_receipt = json.dumps(
+                        {"migration": 2, "verified_at": str(progress.media_verified_at)}
+                    )
+                    progress.status = "complete"
+                    if progress.working_directory and not progress.cleaned_at:
+                        self._queue_job(session, progress.video_id, "cleanup")
+                    if progress.webpage_status not in {"queued", "captured"}:
+                        self._queue_job(
+                            session, progress.video_id, "webpage", deadline=86_400
+                        )
+                        if old_status in {"ziggy_submitting", "wayback_submitting"} or (
+                            old_status == "operator_action"
+                            and progress.failure_phase
+                            in {"ziggy", "wayback", "webpage_submission"}
+                        ):
+                            session.flush()
+                            job = session.get(
+                                ArchiveJob, (progress.video_id, "webpage")
+                            )
+                            assert job is not None
+                            job.status = "failed"
+                            job.last_error = progress.last_error or (
+                                "historical webpage submission outcome is uncertain"
+                            )
+                            progress.webpage_status = (
+                                progress.webpage_status or "uncertain"
+                            )
+                            session.add(job)
+                elif progress.status in {"uploading", "reconcile_upload"}:
+                    progress.status = "reconcile_upload"
+                    self._queue_job(
+                        session, progress.video_id, "recovery", deadline=86_400
+                    )
+                elif progress.status == "upload":
+                    if (
+                        not progress.media_path
+                        or not Path(progress.media_path).is_file()
+                    ):
+                        progress.status = (
+                            "download" if progress.frozen_metadata else "metadata"
+                        )
+                        progress.media_path = None
+                    elif progress.media_size:
+                        progress.download_completed_at = progress.updated_at
+                        progress.ready_at = progress.updated_at
+                progress.claimed_at = None
+                progress.reserved_bytes = 0
+                session.add(progress)
+            session.add(SchemaMigration(version=2))
+            session.commit()
+
+
+def retry_delay(base: float, attempts: int) -> float:
+    """Use increasing retry intervals with bounded jitter and a six-hour cap."""
+    return min(
+        21_600.0, base * 2 ** min(max(attempts - 1, 0), 12) * random.uniform(0.8, 1.2)
+    )
 
 
 def webhook_key(url: str) -> str:
