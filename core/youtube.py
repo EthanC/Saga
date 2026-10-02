@@ -282,6 +282,7 @@ class YouTubeClient:
 
         options.update(
             {
+                **media_retry_options(),
                 "skip_download": False,
                 "noplaylist": True,
                 "format": "bestvideo+bestaudio",
@@ -420,7 +421,11 @@ class _LimitedResponse(Response):
         if amount == 0:
             return self.fp.read(0)
         self.limiter.acquire(amount)
-        chunk = self.fp.read(amount)
+        try:
+            chunk = self.fp.read(amount)
+        except Exception:
+            self.limiter.refund(amount)
+            raise
         self.limiter.refund(amount - len(chunk))
         if self.fp.closed:
             self.close()
@@ -458,6 +463,18 @@ def _limited_downloader(downloader_type: type[Any], limiter: ByteLimiter) -> typ
                 self._media_download_active = previous
 
     return LimitedYoutubeDL
+
+
+def media_retry_options() -> dict[str, Any]:
+    """Bound per-request retries without changing metadata's outer retry policy."""
+    return {
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 30,
+        "retry_sleep_functions": {
+            kind: lambda n: min(2 ** max(n, 0), 8) for kind in ("http", "fragment")
+        },
+    }
 
 
 def _channel_url(reference: str) -> str:

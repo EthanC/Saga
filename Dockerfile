@@ -9,7 +9,8 @@ COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project --no-cache \
+    && .venv/bin/python -c "import urllib3, urllib3_future, requests, niquests; from yt_dlp.networking import _requests; assert requests.packages.urllib3 is urllib3; assert _requests.urllib3 is urllib3; assert niquests.packages.urllib3 is urllib3_future; assert urllib3.__file__ != urllib3_future.__file__"
 
 FROM python:3.14-alpine
 

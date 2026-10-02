@@ -61,6 +61,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,format=long
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -69,3 +70,7 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Smoke test image namespaces and unprivileged startup
+        if: github.event_name == 'push'
+        run: |
+          docker run --rm --user 1000:1000 --entrypoint python ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }} -c "import urllib3, urllib3_future, requests, niquests; from yt_dlp.networking import _requests; assert requests.packages.urllib3 is urllib3; assert _requests.urllib3 is urllib3; assert niquests.packages.urllib3 is urllib3_future; assert urllib3.__file__ != urllib3_future.__file__; print(urllib3.__version__, urllib3.__file__, urllib3_future.__version__, urllib3_future.__file__)"

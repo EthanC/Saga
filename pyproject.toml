@@ -36,6 +36,10 @@ dev = [
 fix = true
 show-fixes = true
 
+[tool.uv]
+no-binary-package = ["urllib3-future"]
+extra-build-variables = { "urllib3-future" = { URLLIB3_NO_OVERRIDE = "1" } }
+
 [tool.ruff.format]
 docstring-code-format = true
 line-ending = "lf"
