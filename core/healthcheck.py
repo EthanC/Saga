@@ -2,6 +2,7 @@
 
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from core.config import load_settings, load_youtube_configs
@@ -27,9 +28,16 @@ def is_healthy(project_root: Path) -> bool:
             ):
                 return False
             document = json.loads(transfer_path.read_text(encoding="utf-8"))
+            if isinstance(document, dict) and document.get("version") == 2:
+                stamp = datetime.fromisoformat(document["generated_at"])
+                if (
+                    stamp.tzinfo is None
+                    or not 0 <= (datetime.now(UTC) - stamp).total_seconds() <= 120
+                ):
+                    return False
             return isinstance(document, dict) and document.get("healthy") is True
         return True
-    except OSError, ValueError:
+    except OSError, ValueError, KeyError, TypeError:
         return False
 
 

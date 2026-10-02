@@ -243,6 +243,8 @@ def test_transfer_health_publishes_stalls_and_survives_cleanup_race(
     video_id, _, _ = seed_upload(state, tmp_path)
     state.update_archive(video_id, ready_at=utcnow() - timedelta(hours=1))
     saga = service.SagaService(settings(tmp_path), (), state, youtube.YouTubeClient())
+    saga.started_at = utcnow() - timedelta(hours=1)
+    state._eligible_since["upload"] = saga.started_at
 
     async def wait(_: float) -> None:
         saga.request_stop()

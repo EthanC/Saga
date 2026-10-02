@@ -305,6 +305,9 @@ class StateStore:
         self._write_lock = Lock()
         self.download_pause_reason: str | None = None
         self.metadata_pause_reasons: dict[str, str | None] = {}
+        self.health_started_at = utcnow()
+        self._eligible_since: dict[str, datetime] = {}
+        self.lane_progress: dict[str, datetime] = {}
         event.listen(self.engine, "connect", _configure_sqlite)
         if "archiveprogress" in inspect(self.engine).get_table_names() and (
             "media_uploaded_at"
@@ -538,7 +541,8 @@ class StateStore:
                 )
                 added += not existed
 
-            channel.last_polled_at = now
+            if not backfill:
+                channel.last_polled_at = now
             channel.updated_at = now
             session.add(channel)
             session.commit()
@@ -1258,6 +1262,8 @@ class StateStore:
             progress.updated_at = utcnow()
             session.add(progress)
             session.commit()
+            if previous_status != progress.status:
+                self.lane_progress[previous_status] = utcnow()
         logger.trace(
             "Persisted archive transition for {}: {} -> {}, release={}",
             video_id,
@@ -1516,74 +1522,111 @@ class StateStore:
         }
 
     def transfer_health(
-        self, *, stall_timeout: float, now: datetime | None = None
+        self,
+        *,
+        stall_timeout: float,
+        now: datetime | None = None,
+        started_at: datetime | None = None,
+        upload_workers: int = 1,
+        download_workers: int = 1,
+        channel_intervals: dict[str, float] | None = None,
     ) -> dict[str, Any]:
-        """Explain waiting uploads and detect absent or stalled upload capacity."""
+        """Measure progress, due age, and backpressure independently across lanes."""
+        from core.pipeline_health import build_pipeline_health
+
         current = now or utcnow()
         with Session(self.engine) as session:
-            ready = session.exec(
-                select(ArchiveProgress).where(ArchiveProgress.status == "upload")
-            ).all()
-            active = session.exec(
-                select(ArchiveProgress).where(ArchiveProgress.status == "uploading")
-            ).all()
-            due = [
-                row
-                for row in ready
-                if not row.retry_at or _as_utc(row.retry_at) <= _as_utc(current)
-            ]
-            oldest = min(
-                (_as_utc(row.ready_at or row.updated_at) for row in due), default=None
-            )
-            stalled = any(
-                (
-                    current
-                    - _as_utc(
-                        row.transfer_progress_at
-                        or row.upload_started_at
-                        or row.updated_at
+            rows = list(
+                session.exec(
+                    select(ArchiveProgress, Video).join(
+                        Video, col(ArchiveProgress.video_id) == col(Video.id)
                     )
-                ).total_seconds()
-                > stall_timeout
-                for row in active
+                ).all()
             )
-            idle_stall = bool(
-                oldest
-                and not active
-                and (current - oldest).total_seconds() > stall_timeout
+            health = build_pipeline_health(
+                rows,
+                list(session.exec(select(ArchiveJob)).all()),
+                now=current,
+                started_at=started_at or self.health_started_at,
+                stall_timeout=stall_timeout,
+                capacities={
+                    "upload": upload_workers,
+                    "download": download_workers,
+                    "metadata": 1,
+                },
+                eligible_since=self._eligible_since,
+                metadata_reasons=self.metadata_pause_reasons,
+                download_reason=self.download_pause_reason,
+                lane_progress=self.lane_progress,
             )
+            polling: dict[str, Any] = {}
+            for channel_id, interval in (channel_intervals or {}).items():
+                channel = session.get(Channel, channel_id)
+                stamp = channel.last_polled_at if channel else None
+                age = (
+                    (_as_utc(current) - _as_utc(stamp)).total_seconds()
+                    if stamp
+                    else None
+                )
+                healthy = age is not None and 0 <= age <= max(300, 3 * interval)
+                if (
+                    _as_utc(current) - _as_utc(started_at or self.health_started_at)
+                ).total_seconds() < 120:
+                    healthy = True
+                polling[channel_id] = {
+                    "healthy": healthy,
+                    "last_success_at": _as_utc(stamp).isoformat() if stamp else None,
+                    "age_seconds": age,
+                }
+                if not healthy:
+                    health["healthy"] = False
+                    health["alerts"].append(
+                        {
+                            "key": f"poll:{channel_id}",
+                            "severity": "error",
+                            "message": "channel polling heartbeat stale",
+                            "details": {"channel_id": channel_id, "age_seconds": age},
+                        }
+                    )
+            health["polling"] = polling
             last = session.exec(
                 select(func.max(col(ArchiveProgress.media_uploaded_at)))
             ).one()
-            return {
-                "healthy": not (stalled or idle_stall),
-                "last_upload": str(last) if last else None,
-                "oldest_ready": oldest.isoformat() if oldest else None,
-                "waiting_reason": "transfer in progress"
-                if active
-                else "retry backoff"
-                if ready and not due
-                else None,
-                "active": [
-                    {
-                        "video_id": row.video_id,
-                        "bytes": row.transfer_bytes,
-                        "size": row.media_size,
-                        "progress_at": str(row.transfer_progress_at),
-                    }
-                    for row in active
-                ],
-                "download_pause_reason": self.download_pause_reason,
-                "reserved_bytes": session.exec(
-                    select(
-                        func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
-                    )
-                ).one(),
-                "worker_seconds": {
-                    row.kind: row.seconds
-                    for row in session.exec(select(WorkerTiming)).all()
-                },
-            }
+            health.update(
+                {
+                    "last_upload": str(last) if last else None,
+                    "oldest_ready": min(
+                        (
+                            _as_utc(row.ready_at or row.updated_at).isoformat()
+                            for row, _ in rows
+                            if row.status == "upload"
+                            and (
+                                not row.retry_at
+                                or _as_utc(row.retry_at) <= _as_utc(current)
+                            )
+                        ),
+                        default=None,
+                    ),
+                    "waiting_reason": "transfer in progress"
+                    if health["lanes"]["upload"]["active_count"]
+                    else health["lanes"]["upload"]["waiting_reason"],
+                    "active": health["lanes"]["upload"]["active"],
+                    "metadata_pause_reasons": self.metadata_pause_reasons,
+                    "download_pause_reason": self.download_pause_reason,
+                    "reserved_bytes": session.exec(
+                        select(
+                            func.coalesce(
+                                func.sum(col(ArchiveProgress.reserved_bytes)), 0
+                            )
+                        )
+                    ).one(),
+                    "worker_seconds": {
+                        row.kind: row.seconds
+                        for row in session.exec(select(WorkerTiming)).all()
+                    },
+                }
+            )
+            return health
 
     def claim_report(self, now: datetime | None = None) -> Report | None:
         """Claim the oldest report whose delivery is due."""

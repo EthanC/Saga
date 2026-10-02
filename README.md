@@ -118,9 +118,11 @@ Validation is disabled by default. Enable `SAGA_VALIDATION_ENABLED` for one remo
 
 If a connection is lost before acknowledgement, Saga retains staging and checks the persisted operation's remote original in the recovery queue. Confirmed originals become recovered completions; confirmed missing files return to upload priority. Ambiguous outcomes expire after the background budget while other transfers continue. Saga pins Archivist 1.3.0 and supplies its transport-only recovery extension in `core/transport.py`; recovery rechecks account ownership and Saga provenance before a missing-file PUT.
 
-`data/transfers.json` records the last successful upload, active transfer byte progress, oldest due ready file, staging usage, disk reservations, download-pause reason, and cumulative worker time. The healthcheck requires both a polling heartbeat and a recent transfer-health record. Upload work with no progress or waiting reason for `SAGA_TRANSFER_STALL_TIMEOUT` seconds produces an error and an unhealthy result.
+`data/transfers.json` version 2 records metadata/download/upload and background lanes, active worker counts, due queue ages, real byte/merge-output progress, oldest recent videos, staging capacity, reservations, and partial-retention decisions. Byte counts can lag by the five-second checkpoint interval. Each monitored channel has its own successful-poll timestamp; history scans do not refresh a failed recent poll.
 
-### Migrating an Existing Queue
+The healthcheck requires a fresh polling heartbeat and health publisher. Active primary lanes without byte or phase progress beyond `SAGA_TRANSFER_STALL_TIMEOUT=900` become unhealthy. Expected disk, retry, buffer, maintenance, and occupied-worker waits are named backpressure. Old ready work gets 120 seconds of application startup grace followed by a fresh eligibility-based dispatch window. Recent metadata waiting five minutes and recent downloads waiting 15 minutes produce preservation warnings; optional failed/expired jobs get their own alerts while uploads continue. Alerts emit on transition and recovery, with reminders no more often than every 15 minutes. Begin with alert-only handling; Docker's `unless-stopped` policy does not restart an unhealthy container.
+
+### Scheduling and staging
 
 Download byte counts and shrinking reservations are durable checkpoints that can lag by five seconds. Disk headroom is checked on every callback using read-only reservation totals; an increased estimate receives an immediate transactional reservation check. Stream boundaries, merge boundaries, disk pauses, and claim release flush progress sooner. Completion receipts, upload acknowledgements, recovery outcomes, and cleanup transitions commit immediately. Repeated identical byte callbacks do not renew the last-progress timestamp.
 
@@ -128,9 +130,11 @@ Partial inputs are inventoried by operation and selected format in `inputs.json`
 
 The download cadence favors recent, resume, recent, then backfill work. Resume credit reduces only remaining input/merge allocations, not the free-space floor. Retention runs independently each minute. `SAGA_PARTIAL_RETENTION_MODE=observe` reports inactive candidates without deleting them; after a day of review, `enforce` can remove recognized inputs exceeding `SAGA_PARTIAL_MAX_BYTES` that have been inactive for `SAGA_PARTIAL_MIN_AGE`. Claimed, completed, upload-ready, uploading, and reconciliation work is protected. In enforcement mode, protected bytes above the target pause fresh downloads while resumable work and uploads continue.
 
-Recent-work priority follows the durable notification-candidate flag, including discoveries delayed for days. Recent metadata has its own allowance equal to the ready buffer; backfill metadata has twice that allowance. Due prepared downloads and claimed metadata consume their class's allowance. Retry-delayed and disk-blocked downloads do not. Metadata capacity does not bypass download disk or ready-buffer limits. Workers favor recent work for three successful claims, then favor backfill for one; empty polls do not spend a turn.
+Recent-work priority follows the durable notification-candidate flag, including discoveries delayed for days. Recent metadata has its own allowance equal to the ready buffer; backfill metadata has twice that allowance. Due prepared downloads and claimed metadata consume their class's allowance. Retry-delayed and disk-blocked downloads do not. Metadata capacity does not bypass download disk or ready-buffer limits. Metadata and upload workers favor recent work for three successful claims, then favor backfill for one. The download cadence is described above; empty polls do not spend a turn.
 
-1. Stop the old Saga instance and retain a consistent SQLite backup. The new version also creates `saga.sqlite.pre-upload-first.sqlite3` before changing a legacy schema.
+### Migrating an Existing Queue
+
+1. Stop the old Saga instance and retain a consistent SQLite backup. The new version creates `saga.sqlite.pre-upload-first.sqlite3` for the legacy upload migration, or `saga.sqlite.pre-staging-audit.sqlite3` before adding the audit's shared progress and maintenance fields.
 2. Rehearse with a consistent backup using the tested version:
 
    ```console

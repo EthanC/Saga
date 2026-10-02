@@ -29,7 +29,7 @@ from core.reporting import (
 )
 from core.shutdown import CooperativeStop, StopController
 from core.staging import maintain_partials
-from core.state import DiscoveredVideo, ResolvedChannel, StateStore
+from core.state import DiscoveredVideo, ResolvedChannel, StateStore, utcnow
 from core.youtube import YouTubeClient
 
 
@@ -78,12 +78,17 @@ class SagaService:
         self.stop = asyncio.Event()
         self._work_changed = asyncio.Condition()
         self._partial_health: dict[str, Any] = {}
+        self.started_at = utcnow()
+        self._channel_intervals: dict[str, float] = {}
+        self._health_alerts: dict[str, tuple[str, float]] = {}
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
         logger.info("Initializing Saga service")
         self._remove_healthcheck()
         monitored = await self._initialize()
+        self.started_at = utcnow()
+        self._channel_intervals = {item.channel.id: item.cooldown for item in monitored}
         self.state.reset_interrupted_claims(
             background_deadline=self.settings.background_deadline
         )
@@ -550,19 +555,60 @@ class SagaService:
     async def _transfer_health_loop(self) -> None:
         """Publish transfer progress separately from the polling heartbeat."""
         while not self.stop.is_set():
-            health = self.state.transfer_health(
-                stall_timeout=self.settings.transfer_stall_timeout
-            )
-            root = self.settings.download_root
-            health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
-            health["partials"] = self._partial_health
-            path = self.settings.data_path / "transfers.json"
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(health, sort_keys=True), encoding="utf-8")
-            temporary.replace(path)
-            if not health["healthy"]:
-                logger.error("Upload queue stalled: {}", health)
+            try:
+                health = self.state.transfer_health(
+                    stall_timeout=self.settings.transfer_stall_timeout,
+                    started_at=self.started_at,
+                    upload_workers=self.settings.upload_workers,
+                    download_workers=self.settings.download_workers,
+                    channel_intervals=self._channel_intervals,
+                )
+                root = self.settings.download_root
+                health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
+                health["staging"] = {
+                    "path": str(root),
+                    "filesystem_id": root.stat().st_dev,
+                    "available_bytes": shutil.disk_usage(root).free,
+                    "reserved_bytes": health["reserved_bytes"],
+                    "minimum_free_bytes": self.settings.minimum_free_bytes,
+                    "waiting_reason": health["download_pause_reason"],
+                }
+                health["partials"] = self._partial_health
+                path = self.settings.data_path / "transfers.json"
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps(health, sort_keys=True), encoding="utf-8"
+                )
+                temporary.replace(path)
+                self._emit_health_alerts(health["alerts"])
+            except OSError as error:
+                self._emit_health_alerts(
+                    [
+                        {
+                            "key": "publisher",
+                            "severity": "error",
+                            "message": "transfer health publisher failed",
+                            "details": {"cause": type(error).__name__},
+                        }
+                    ]
+                )
             await self._wait(30)
+
+    def _emit_health_alerts(self, alerts: list[dict[str, Any]]) -> None:
+        now = time.monotonic()
+        active = {alert["key"] for alert in alerts}
+        for alert in alerts:
+            key = alert["key"]
+            message = alert["message"]
+            previous = self._health_alerts.get(key)
+            if previous is None or previous[0] != message or now - previous[1] >= 900:
+                log = logger.error if alert["severity"] == "error" else logger.warning
+                log("{}: {}", message, alert["details"])
+                self._health_alerts[key] = (message, now)
+        for key in tuple(self._health_alerts):
+            if key not in active:
+                message, _ = self._health_alerts.pop(key)
+                logger.info("Pipeline condition recovered: {}", message)
 
     async def _partial_maintenance_loop(self) -> None:
         while not self.stop.is_set():

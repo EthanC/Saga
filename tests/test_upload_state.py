@@ -256,7 +256,13 @@ def test_transfer_health_detects_idle_and_stalled_uploads(tmp_path: Path) -> Non
     video_id, _, _ = seed_upload(store, tmp_path)
     now = utcnow()
     store.update_archive(video_id, ready_at=now - timedelta(hours=1))
-    assert store.transfer_health(stall_timeout=30)["healthy"] is False
+    assert store.transfer_health(stall_timeout=30, now=now)["healthy"] is True
+    assert (
+        store.transfer_health(stall_timeout=30, now=now + timedelta(seconds=151))[
+            "healthy"
+        ]
+        is False
+    )
     store.update_archive(video_id, release=True, retry_after=60)
     health = store.transfer_health(stall_timeout=30)
     assert health["healthy"] and health["waiting_reason"] == "retry backoff"
