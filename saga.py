@@ -9,8 +9,9 @@ from loguru import logger
 
 from core.bandwidth import ByteLimiter
 from core.config import load_logging_settings, load_settings, load_youtube_configs
-from core.logging import configure_logging
+from core.logging import bind_stop_controller, configure_logging
 from core.service import SagaService
+from core.shutdown import CooperativeStop, StopController
 from core.state import StateStore
 from core.youtube import YouTubeClient
 
@@ -38,8 +39,14 @@ async def start() -> None:
     state = StateStore(
         settings.data_path / "saga.sqlite", archival_enabled=settings.archival_enabled
     )
-    download_limiter = ByteLimiter(settings.download_bytes_per_second)
-    upload_limiter = ByteLimiter(settings.upload_bytes_per_second)
+    controller = StopController(settings.shutdown_timeout)
+    bind_stop_controller(controller)
+    download_limiter = ByteLimiter(
+        settings.download_bytes_per_second, stop_controller=controller
+    )
+    upload_limiter = ByteLimiter(
+        settings.upload_bytes_per_second, stop_controller=controller
+    )
     service = SagaService(
         settings,
         configurations,
@@ -48,8 +55,11 @@ async def start() -> None:
             settings.youtube_cookies_path,
             download_limiter,
             pot_provider_url=settings.youtube_pot_provider_url,
+            stop_controller=controller,
+            managed=True,
         ),
         upload_limiter=upload_limiter,
+        stop_controller=controller,
     )
     loop = asyncio.get_running_loop()
 
@@ -70,11 +80,15 @@ async def start() -> None:
     logger.info("Using persistent state at {}", state.path)
     try:
         await service.run()
+    except CooperativeStop:
+        pass
     finally:
         logger.debug("Closing persistent state and releasing process lock")
+        logger.info("Saved shutdown operations: {}", state.shutdown_summary())
         state.close()
         lock.release()
         logger.info("Saga stopped")
+        logger.complete()
 
 
 if __name__ == "__main__":

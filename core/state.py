@@ -884,6 +884,24 @@ class StateStore:
                 session.expunge(row)
             return rows
 
+    def shutdown_summary(self) -> list[dict[str, str | None]]:
+        """Identify stopped and uncertain operations before closing durable state."""
+        with Session(self.engine) as session:
+            rows = session.exec(
+                select(ArchiveProgress).where(
+                    (col(ArchiveProgress.failure_phase) == "shutdown")
+                    | (col(ArchiveProgress.status) == "reconcile_upload")
+                )
+            ).all()
+            return [
+                {
+                    "video_id": row.video_id,
+                    "operation_id": row.operation_id,
+                    "stage": row.status,
+                }
+                for row in rows
+            ]
+
     def claim_partial_maintenance(self, video_id: str, operation_id: str) -> str | None:
         """Exclude download claims while deleting one inactive operation's inputs."""
         with self._write_lock, Session(self.engine) as session:
@@ -1178,6 +1196,8 @@ class StateStore:
                 ).where(ArchiveProgress.video_id != video_id)
             ).one()
             remaining = download_reservation(expected, downloaded)
+            if facts.get("download_phase") in {"merging", "merged"}:
+                remaining = max(expected - facts.get("merge_bytes", 0), 0)
             progress.download_estimated_bytes = max(
                 expected, progress.download_estimated_bytes or 0
             )

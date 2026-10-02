@@ -5,12 +5,24 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterable, Iterator
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol
 
 from niquests.adapters import HTTPAdapter
 from niquests.models import PreparedRequest, Response
 
+from core.shutdown import StopController
+
 MAX_CHUNK_BYTES = 64 * 1024
+
+
+class Limiter(Protocol):
+    @property
+    def enabled(self) -> bool: ...
+
+    chunk_size: int
+
+    def acquire(self, byte_count: int) -> None: ...
+    def refund(self, byte_count: int) -> None: ...
 
 
 class ByteLimiter:
@@ -22,11 +34,17 @@ class ByteLimiter:
         *,
         clock: Callable[[], float] = time.monotonic,
         wait: Callable[[float], None] = time.sleep,
+        stop_controller: StopController | None = None,
     ) -> None:
         if bytes_per_second < 0:
             raise ValueError("bytes_per_second must be non-negative")
         self.bytes_per_second = bytes_per_second
-        self.chunk_size = min(bytes_per_second, MAX_CHUNK_BYTES)
+        self.chunk_size = (
+            min(bytes_per_second, MAX_CHUNK_BYTES)
+            if bytes_per_second
+            else MAX_CHUNK_BYTES
+        )
+        self.stop_controller = stop_controller
         self._clock = clock
         self._wait = wait
         self._lock = Lock()
@@ -42,6 +60,8 @@ class ByteLimiter:
         """Reserve allowance for a transfer, splitting requests when necessary."""
         if byte_count < 0:
             raise ValueError("byte_count must be non-negative")
+        if self.stop_controller:
+            self.stop_controller.check()
         if not self.enabled:
             return
         remaining = byte_count
@@ -66,7 +86,10 @@ class ByteLimiter:
                     self._allowance -= byte_count
                     return
                 delay = (byte_count - self._allowance) / self.bytes_per_second
-            self._wait(delay)
+            if self.stop_controller:
+                self.stop_controller.wait(delay)
+            else:
+                self._wait(delay)
 
     def _refill(self, now: float) -> None:
         elapsed = max(now - self._updated_at, 0.0)
@@ -79,7 +102,7 @@ class ByteLimiter:
 class ThrottledBody:
     """Pace a file or iterable request body without changing its bytes."""
 
-    def __init__(self, body: Any, limiter: ByteLimiter) -> None:
+    def __init__(self, body: Any, limiter: Limiter) -> None:
         self.body = body
         self.limiter = limiter
 
@@ -112,7 +135,7 @@ class ThrottledBody:
 class BandwidthHTTPAdapter(HTTPAdapter):
     """Pace non-empty binary PUT bodies at the transport boundary."""
 
-    def __init__(self, limiter: ByteLimiter, **kwargs: Any) -> None:
+    def __init__(self, limiter: Limiter, **kwargs: Any) -> None:
         self.limiter = limiter
         super().__init__(**kwargs)
 

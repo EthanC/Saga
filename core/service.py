@@ -27,6 +27,7 @@ from core.reporting import (
     report_has_activity,
     send_report,
 )
+from core.shutdown import CooperativeStop, StopController
 from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore
 from core.youtube import YouTubeClient
@@ -54,15 +55,25 @@ class SagaService:
         youtube: YouTubeClient,
         archival: ArchiveProcessor | None = None,
         upload_limiter: ByteLimiter | None = None,
+        stop_controller: StopController | None = None,
     ) -> None:
         self.settings = settings
         self.configurations = configurations
         self.state = state
         self.youtube = youtube
+        self.stop_controller = stop_controller or StopController(
+            settings.shutdown_timeout
+        )
+        if isinstance(youtube, YouTubeClient):
+            youtube.stop_controller = self.stop_controller
         self.archival = archival
         if self.archival is None and settings.archival_enabled:
             self.archival = ArchiveProcessor(
-                settings, state, youtube, upload_limiter=upload_limiter
+                settings,
+                state,
+                youtube,
+                upload_limiter=upload_limiter,
+                stop_controller=self.stop_controller,
             )
         self.stop = asyncio.Event()
         self._work_changed = asyncio.Condition()
@@ -94,7 +105,10 @@ class SagaService:
                 if self.settings.backup.enabled:
                     workers.create_task(
                         run_backup_scheduler(
-                            self.state.path, self.settings.backup, self.stop
+                            self.state.path,
+                            self.settings.backup,
+                            self.stop,
+                            stop_controller=self.stop_controller,
                         ),
                         name="backup-scheduler",
                     )
@@ -346,6 +360,7 @@ class SagaService:
             only = self.state.publication_detail_ids(video.id for video in videos)
         resolved: list[DiscoveredVideo] = []
         for video in videos:
+            self.stop_controller.check()
             ambiguous_date = (
                 video.published_at is not None
                 and not video.published_precise
@@ -390,9 +405,12 @@ class SagaService:
     ) -> Any:
         """Run one blocking YouTube request with its configured retry policy."""
         for attempt in range(retries + 1):
+            self.stop_controller.check()
             try:
                 return await asyncio.to_thread(operation, *args, **kwargs)
             except asyncio.CancelledError:
+                raise
+            except CooperativeStop:
                 raise
             except Exception:
                 if attempt >= retries:
@@ -406,17 +424,19 @@ class SagaService:
                 await self._wait(retry_delay)
         raise AssertionError("unreachable")  # pragma: no cover
 
-    @staticmethod
     def _youtube_request_sync(
-        operation: Any, retries: int, retry_delay: float, *args: Any
+        self, operation: Any, retries: int, retry_delay: float, *args: Any
     ) -> Any:
         for attempt in range(retries + 1):
+            self.stop_controller.check()
             try:
                 return operation(*args)
+            except CooperativeStop:
+                raise
             except Exception:
                 if attempt >= retries:
                     raise
-                time.sleep(retry_delay)
+                self.stop_controller.wait(retry_delay)
         raise AssertionError("unreachable")  # pragma: no cover
 
     async def _delivery_loop(self) -> None:
@@ -435,7 +455,10 @@ class SagaService:
                 message_id = await send_video(
                     delivery.webhook_url,
                     delivery.video_id,
-                    self.settings.notification_timeout,
+                    min(
+                        self.settings.notification_timeout,
+                        self.settings.shutdown_timeout - 5,
+                    ),
                 )
             except asyncio.CancelledError:
                 raise
@@ -623,7 +646,12 @@ class SagaService:
                     continue
                 try:
                     message_id = await send_report(
-                        report, webhook_url, self.settings.notification_timeout
+                        report,
+                        webhook_url,
+                        min(
+                            self.settings.notification_timeout,
+                            self.settings.shutdown_timeout - 5,
+                        ),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -656,6 +684,7 @@ class SagaService:
         """Request cooperative service shutdown."""
         logger.debug("Setting the cooperative shutdown event")
         self.stop.set()
+        self.stop_controller.request()
 
     def _write_healthcheck(self) -> None:
         path = self.settings.healthcheck_file

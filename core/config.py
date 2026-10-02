@@ -129,6 +129,7 @@ class Settings:
     partial_retention_mode: str = "observe"
     partial_max_bytes: int = 100_000_000_000
     partial_min_age: float = 86_400.0
+    shutdown_timeout: float = 90.0
 
     @property
     def download_root(self) -> Path:
@@ -307,6 +308,9 @@ def load_settings(project_root: Path) -> Settings:
     partial_retention_mode = env.str("SAGA_PARTIAL_RETENTION_MODE", "observe")
     if partial_retention_mode not in {"observe", "enforce"}:
         raise ValueError("SAGA_PARTIAL_RETENTION_MODE must be observe or enforce")
+    shutdown_timeout = _positive_env_float(env, "SAGA_SHUTDOWN_TIMEOUT", 90)
+    if shutdown_timeout < 10:
+        raise ValueError("SAGA_SHUTDOWN_TIMEOUT must allow at least 10 seconds")
 
     return Settings(
         config_path=config_path,
@@ -361,6 +365,7 @@ def load_settings(project_root: Path) -> Settings:
             env, "SAGA_PARTIAL_MAX_BYTES", 100_000_000_000
         ),
         partial_min_age=_positive_env_float(env, "SAGA_PARTIAL_MIN_AGE", 86_400),
+        shutdown_timeout=shutdown_timeout,
     )
 
 

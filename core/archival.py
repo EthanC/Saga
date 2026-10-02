@@ -37,13 +37,15 @@ from archivist import (
 from loguru import logger
 from niquests import Session
 
-from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
+from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import Settings
 from core.logging import redact_diagnostics
 from core.progress import DownloadCheckpoint
+from core.shutdown import CooperativeStop, StopController
 from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
+from core.workers import run_managed
 from core.youtube import (
     DiskSpaceError,
     VideoMetadata,
@@ -108,15 +110,23 @@ class AcceptedSubmissionPersistenceError(RuntimeError):
 
 
 class _ProgressStream:
-    def __init__(self, stream: Any, callback: Callable[[int], None]) -> None:
+    def __init__(
+        self,
+        stream: Any,
+        callback: Callable[[int], None],
+        controller: StopController | None = None,
+    ) -> None:
         self.stream = stream
         self.callback = callback
         self.last_update = time.monotonic()
+        self.controller = controller
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.stream, name)
 
     def read(self, amount: int = -1) -> bytes:
+        if self.controller:
+            self.controller.check()
         chunk = self.stream.read(amount)
         if time.monotonic() - self.last_update >= 5:
             self.callback(self.stream.tell())
@@ -124,11 +134,26 @@ class _ProgressStream:
         return chunk
 
 
+class _StopSession(Session):
+    def __init__(self, controller: StopController) -> None:
+        super().__init__(retries=0)
+        self.controller = controller
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        self.controller.check()
+        return super().request(*args, **kwargs)
+
+
 class ArchiveGateway:
     """Keep transfers one-shot and status reads bounded by request timeouts."""
 
     def __init__(
-        self, settings: Settings, upload_limiter: ByteLimiter | None = None
+        self,
+        settings: Settings,
+        upload_limiter: Limiter | None = None,
+        *,
+        stop_controller: StopController | None = None,
+        managed: bool = False,
     ) -> None:
         assert settings.internet_archive_email is not None
         assert settings.internet_archive_password is not None
@@ -137,9 +162,13 @@ class ArchiveGateway:
         )
         self.request_timeout = settings.archive_request_timeout
         self.upload_limiter = upload_limiter or ByteLimiter(0)
+        self.settings = settings
+        self.stop_controller = stop_controller or StopController()
+        self.managed = managed
 
     def _session(self) -> Session:
-        session = Session(retries=0)
+        self.stop_controller.check()
+        session = _StopSession(self.stop_controller)
         if self.upload_limiter.enabled:
             for prefix in ("https://", "http://"):
                 previous = session.get_adapter(prefix)
@@ -161,6 +190,8 @@ class ArchiveGateway:
         *,
         progress: Callable[[int], None],
     ) -> InternetArchiveUploadResult:
+        if self.managed:
+            return self._managed("upload", (metadata, media_path), {}, progress)
         options = InternetArchiveUploadOptions(
             identifier=metadata.identifier,
             title=metadata.title,
@@ -181,7 +212,8 @@ class ArchiveGateway:
             self._client(session) as client,
         ):
             file = InternetArchiveUploadFile(
-                cast(Any, _ProgressStream(stream, progress)), name=metadata.media_name
+                cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
+                name=metadata.media_name,
             )
             return client.upload([file], options, wait=False)
 
@@ -194,6 +226,17 @@ class ArchiveGateway:
         sha1_hash: str | None = None,
         validation: bool = False,
     ) -> Inspection:
+        if self.managed:
+            return self._managed(
+                "inspect",
+                (metadata,),
+                {
+                    "size": size,
+                    "md5_hash": md5_hash,
+                    "sha1_hash": sha1_hash,
+                    "validation": validation,
+                },
+            )
         with self._session() as session, self._client(session) as client:
             item = client.get_item(metadata.identifier)
         return inspect_item(
@@ -207,6 +250,8 @@ class ArchiveGateway:
         *,
         progress: Callable[[int], None],
     ) -> InternetArchiveUploadResult:
+        if self.managed:
+            return self._managed("recover", (metadata, media_path), {}, progress)
         with (
             media_path.open("rb") as stream,
             self._session() as session,
@@ -215,7 +260,7 @@ class ArchiveGateway:
             return client.add_file_transport(
                 metadata.identifier,
                 InternetArchiveUploadFile(
-                    cast(Any, _ProgressStream(stream, progress)),
+                    cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
                     name=metadata.media_name,
                 ),
                 expected_metadata={
@@ -226,12 +271,41 @@ class ArchiveGateway:
             )
 
     def submit_page(self, url: str) -> str:
+        if self.managed:
+            return self._managed("submit_page", (url,), {})
         with self._session() as session, self._client(session) as client:
             return client.submit(url).job_id
 
     def page_status(self, job_id: str) -> InternetArchiveCaptureStatus:
+        if self.managed:
+            return self._managed("page_status", (job_id,), {})
         with self._session() as session, self._client(session) as client:
             return client.status(job_id)
+
+    def _managed(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        progress: Callable[[int], None] | None = None,
+    ) -> Any:
+        return run_managed(
+            "gateway",
+            method,
+            {
+                "settings": self.settings,
+                "limiter_enabled": self.upload_limiter.enabled,
+                "chunk_size": self.upload_limiter.chunk_size,
+            },
+            args,
+            kwargs,
+            self.stop_controller,
+            {
+                "acquire": self.upload_limiter.acquire,
+                "refund": self.upload_limiter.refund,
+                "progress": progress or (lambda value: None),
+            },
+        )
 
 
 class ArchiveBackend(Protocol):
@@ -272,18 +346,27 @@ class ArchiveProcessor:
         youtube: YouTubeClient,
         gateway: ArchiveBackend | None = None,
         upload_limiter: ByteLimiter | None = None,
+        stop_controller: StopController | None = None,
     ) -> None:
         self.settings = settings
         self.state = state
         self.youtube = youtube
+        self.stop_controller = stop_controller or StopController()
+        self.managed_io = isinstance(youtube, YouTubeClient) and youtube.managed
         self.gateway = gateway
         if gateway is None and settings.media_archival_enabled:
-            self.gateway = ArchiveGateway(settings, upload_limiter)
+            self.gateway = ArchiveGateway(
+                settings,
+                upload_limiter,
+                stop_controller=self.stop_controller,
+                managed=self.managed_io,
+            )
         self.download_root = ensure_download_root(settings.download_root)
 
     def process(self, work: ArchiveWork) -> None:
         stage = work.job.kind if work.job else work.progress.status
         try:
+            self.stop_controller.check()
             handlers = {
                 "metadata": self._metadata,
                 "download": self._download,
@@ -296,6 +379,29 @@ class ArchiveProcessor:
             if stage not in handlers:
                 raise RecoveryConflictError(f"unknown archive stage {stage!r}")
             handlers[stage](work)
+        except CooperativeStop as error:
+            if work.job:
+                self.state.update_job(
+                    work,
+                    status="failed" if work.job.status == "submitting" else "waiting",
+                    retry_after=0,
+                    error=_error_text(error),
+                )
+            elif stage == "upload" and work.progress.status == "uploading":
+                self.state.defer_transfer(
+                    work,
+                    status="reconcile_upload",
+                    error=_error_text(error),
+                    delay=0,
+                    deadline=self.settings.background_deadline,
+                )
+            else:
+                self.state.update_archive(
+                    work.video.id,
+                    release=True,
+                    last_error=_error_text(error),
+                    failure_phase="shutdown",
+                )
         except VideoUnavailableError as error:
             self.state.update_archive(
                 work.video.id,
@@ -379,6 +485,14 @@ class ArchiveProcessor:
     def _download(self, work: ArchiveWork) -> None:
         frozen = _frozen(work)
         directory = _working_directory(work)
+        if (
+            directory.is_symlink()
+            or directory.resolve().parent != self.download_root.resolve()
+            or directory.name != frozen.operation_id
+        ):
+            raise RecoveryConflictError(
+                "download staging is outside its owned operation"
+            )
         checkpoint = DownloadCheckpoint(
             self.state, work, directory, self.settings.minimum_free_bytes
         )
@@ -453,11 +567,16 @@ class ArchiveProcessor:
             last_error=None,
         )
         work.progress.status = "uploading"
+        work.progress.transfer_bytes = 0
 
         def progress(bytes_sent: int) -> None:
-            self.state.update_archive(
-                work.video.id, transfer_bytes=bytes_sent, transfer_progress_at=utcnow()
-            )
+            if bytes_sent > work.progress.transfer_bytes:
+                self.state.update_archive(
+                    work.video.id,
+                    transfer_bytes=bytes_sent,
+                    transfer_progress_at=utcnow(),
+                )
+                work.progress.transfer_bytes = bytes_sent
 
         try:
             operation = (
@@ -470,6 +589,7 @@ class ArchiveProcessor:
             if self._acknowledged(work, error.result):
                 self._acknowledge(work, error.result)
                 return
+            self.stop_controller.check()
             code = error.cause.status_code
             known_failure = (
                 not isinstance(error.cause, NetworkError)
@@ -490,6 +610,7 @@ class ArchiveProcessor:
             )
             return
         except ServiceError as error:
+            self.stop_controller.check()
             # Both upload APIs wrap service failures once a mutation starts.
             # Retry transient preflight failures without waiting for a remote item.
             if not (
@@ -636,13 +757,21 @@ class ArchiveProcessor:
             else work.video.webpage_url
         )
         self.state.update_job(work, status="submitting")
+        work.job.status = "submitting"
         try:
             if self.settings.ziggy_host:
-                receipt = submit_ziggy(
+                arguments = (
                     self.settings.ziggy_host,
                     self.settings.ziggy_identifier or "saga",
                     url,
                     self.settings.archive_request_timeout,
+                )
+                receipt = (
+                    run_managed(
+                        "ziggy", "submit", {}, arguments, {}, self.stop_controller
+                    )
+                    if self.managed_io
+                    else submit_ziggy(*arguments)
                 )
                 try:
                     self.state.update_job(

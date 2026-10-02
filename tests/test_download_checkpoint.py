@@ -85,12 +85,12 @@ def test_merge_boundaries_and_output_growth_checkpoint_actual_progress(
     store, worker, now = checkpoint(tmp_path, monkeypatch)
     worker.record(10000, 10000)
     worker.boundary("merging", 0)
-    now[0] = 1
+    now[0] = 5
     worker.boundary("merging", 500)
     row = saved(store, worker.video_id)
     assert row.download_phase == "merging" and row.merge_bytes == 500
     timestamp = row.download_progress_at
-    now[0] = 2
+    now[0] = 6
     worker.boundary("merging", 500)
     assert saved(store, worker.video_id).download_progress_at == timestamp
     worker.boundary("merged", 1000)

@@ -33,7 +33,7 @@ services:
       - ./config:/config:ro
       - ./data:/data
     restart: unless-stopped
-    stop_grace_period: 30s
+    stop_grace_period: 120s
     logging:
       driver: json-file
       options:
@@ -105,6 +105,8 @@ Set `REPORT_DISCORD_WEBHOOK_URL` for Discord reports covering discoveries, video
 Report semantics version 2 counts a video when its upload acknowledgement commits. Recovered and migrated uploads contribute to lifetime totals but are excluded from the reporting window's newly transferred videos and bytes. Existing version 1 snapshots retain their stored counts and labels.
 
 ## Preservation
+
+Saga's application stop budget is `SAGA_SHUTDOWN_TIMEOUT=90` seconds. Keep Compose's stop grace above that budget (the example uses 120 seconds). The entrypoint runs blocking YouTube, archive, and log HTTP work in owned processes with parent-side durable callbacks and shared bandwidth accounting. Stop interrupts retries and bandwidth waits; work that cannot cooperate is terminated with its owned child-process group. Downloads retain inputs and release reservations, uncertain uploads enter reconciliation, and acknowledged uploads save receipts before cleanup. SQLite backups check stop between bounded page batches. Discord delivery and report outcomes remain at least once when a response is lost.
 
 Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encoding and uploads it to `opensource_movies`. Download completion is recorded after a successful downloader/merge result, a nonempty output, and an atomic rename. A leftover MKV without its completion receipt is downloaded again.
 

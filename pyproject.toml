@@ -59,6 +59,8 @@ testpaths = ["tests"]
 [tool.coverage.run]
 branch = true
 source = ["core"]
+concurrency = ["thread", "multiprocessing"]
+patch = ["subprocess"]
 
 [tool.coverage.report]
 show_missing = true

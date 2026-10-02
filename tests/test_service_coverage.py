@@ -89,7 +89,7 @@ def test_run_starts_named_channel_workers(
     async def initialize() -> tuple[MonitoredChannel, ...]:
         return (monitored,)
 
-    async def worker(*args: Any) -> None:
+    async def worker(*args: Any, **kwargs: Any) -> None:
         task = asyncio.current_task()
         assert task is not None
         names.append(task.get_name())
@@ -162,7 +162,7 @@ def test_youtube_request_helpers_retry_configured_failures(
 
     outcomes[:] = [RuntimeError("temporary"), "sync-result"]
     sleeps: list[float] = []
-    monkeypatch.setattr(service_module.time, "sleep", sleeps.append)
+    monkeypatch.setattr(service.stop_controller, "wait", sleeps.append)
     assert service._youtube_request_sync(operation, 1, 3) == "sync-result"
     assert sleeps == [3]
 

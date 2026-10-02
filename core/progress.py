@@ -55,7 +55,11 @@ class DownloadCheckpoint:
             self.progress_at = utcnow()
         self.expected = max(expected, self.expected)
         self.downloaded = downloaded
-        required = download_reservation(self.expected, downloaded)
+        required = (
+            max(self.expected - self.merge_bytes, 0)
+            if self.phase in {"merging", "merged"}
+            else download_reservation(self.expected, downloaded)
+        )
         free = shutil.disk_usage(self.directory).free
         others = self.state.other_download_reservations(self.video_id)
         checkpoint = (
@@ -83,11 +87,12 @@ class DownloadCheckpoint:
         if phase == "stream_finished":
             self.record(self.expected, self.downloaded, force=True)
             return
-        if phase != self.phase or output_bytes > self.merge_bytes:
+        changed = phase != self.phase
+        if changed or output_bytes > self.merge_bytes:
             self.progress_at = utcnow()
         self.phase = phase
         self.merge_bytes = output_bytes
-        self.record(self.expected, self.downloaded, force=True)
+        self.record(self.expected, self.downloaded, force=changed)
 
     def flush(self) -> None:
         """Save pending progress on failure/stop without granting a larger write."""

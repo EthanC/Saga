@@ -20,11 +20,13 @@ from yt_dlp.downloader import FFmpegFD, get_suitable_downloader
 from yt_dlp.networking.common import Response
 from yt_dlp.utils import DownloadError
 
-from core.bandwidth import ByteLimiter
+from core.bandwidth import ByteLimiter, Limiter
 from core.config import ALL_CONTENT_TYPES, ContentType
 from core.logging import DownloaderLogger, redact_diagnostics
+from core.shutdown import StopController
 from core.staging import download_reservation, inventory_inputs, prepare_inputs
 from core.state import DiscoveredVideo, ResolvedChannel
+from core.workers import run_managed
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
 CONTENT_TABS: tuple[tuple[ContentType, str], ...] = (
@@ -77,13 +79,17 @@ class YouTubeClient:
     def __init__(
         self,
         cookies_path: Path | None = None,
-        download_limiter: ByteLimiter | None = None,
+        download_limiter: Limiter | None = None,
         *,
         pot_provider_url: str = "http://127.0.0.1:4416",
+        stop_controller: StopController | None = None,
+        managed: bool = False,
     ) -> None:
         self.cookies_path = cookies_path
         self.download_limiter = download_limiter or ByteLimiter(0)
         self.pot_provider_url = pot_provider_url
+        self.stop_controller = stop_controller or StopController()
+        self.managed = managed
         logger.debug(
             "Initialized YouTube client (cookies {}, PO token provider {})",
             "enabled" if cookies_path is not None else "disabled",
@@ -92,11 +98,16 @@ class YouTubeClient:
 
     def resolve_channel(self, reference: str) -> ResolvedChannel:
         """Resolve a configured handle or URL to a canonical channel ID."""
+        self.stop_controller.check()
+        if self.managed:
+            return self._managed("resolve_channel", (reference,), {})
         base_url = _channel_url(reference)
         logger.debug("Requesting YouTube channel metadata for {}", reference)
         options = self._options()
         options.update({"extract_flat": True})
-        with YoutubeDL(options) as downloader:
+        with _limited_downloader(
+            YoutubeDL, self.download_limiter, self.stop_controller
+        )(options) as downloader:
             info: Any = downloader.extract_info(f"{base_url}/about", download=False)
 
         if not isinstance(info, dict):
@@ -131,6 +142,13 @@ class YouTubeClient:
         content_types: Iterable[ContentType] = ALL_CONTENT_TYPES,
     ) -> tuple[DiscoveredVideo, ...]:
         """Return a deduplicated recent snapshot across enabled channel tabs."""
+        self.stop_controller.check()
+        if self.managed:
+            return self._managed(
+                "recent_videos",
+                (channel, limit_per_tab),
+                {"content_types": tuple(content_types)},
+            )
         enabled = frozenset(content_types)
         logger.debug(
             "Fetching recent {} content for channel {}",
@@ -156,6 +174,15 @@ class YouTubeClient:
         content_types: Iterable[ContentType] = ALL_CONTENT_TYPES,
     ) -> None:
         """Enumerate enabled tabs and persist bounded batches through a callback."""
+        self.stop_controller.check()
+        if self.managed:
+            self._managed(
+                "scan_history",
+                (channel,),
+                {"batch_size": batch_size, "content_types": tuple(content_types)},
+                {"record_batch": record_batch},
+            )
+            return
         enabled = frozenset(content_types)
         logger.debug(
             "Starting full history scan for channel {} ({})",
@@ -183,11 +210,16 @@ class YouTubeClient:
 
     def video_metadata(self, video_id: str) -> VideoMetadata:
         """Extract full metadata for one replay without downloading it."""
+        self.stop_controller.check()
+        if self.managed:
+            return self._managed("video_metadata", (video_id,), {})
         logger.debug("Fetching full metadata for video {}", video_id)
         options = self._options()
         options.update({"noplaylist": True})
         try:
-            with YoutubeDL(options) as downloader:
+            with _limited_downloader(
+                YoutubeDL, self.download_limiter, self.stop_controller
+            )(options) as downloader:
                 info: Any = downloader.extract_info(
                     f"https://www.youtube.com/watch?v={video_id}", download=False
                 )
@@ -211,6 +243,35 @@ class YouTubeClient:
         phase_hook: Callable[[str, int], None] | None = None,
     ) -> Path:
         """Resume a strict bestvideo+bestaudio download and return its MKV path."""
+        self.stop_controller.check()
+        if self.managed:
+            merging_active = False
+
+            def phase(phase: str, amount: int) -> None:
+                nonlocal merging_active
+                merging_active = phase == "merging"
+                if phase_hook:
+                    phase_hook(phase, amount)
+
+            def probe() -> None:
+                path = directory / "merging.mkv"
+                if merging_active and phase_hook and path.is_file():
+                    phase_hook("merging", path.stat().st_size)
+
+            return self._managed(
+                "download_video",
+                (video_id, directory),
+                {
+                    "minimum_free_bytes": minimum_free_bytes,
+                    "estimated_bytes": estimated_bytes,
+                    "operation_id": operation_id,
+                },
+                {
+                    "disk_guard": disk_guard or (lambda *args: None),
+                    "phase_hook": phase,
+                    "merge_probe": probe,
+                },
+            )
         directory.mkdir(parents=True, exist_ok=True)
         output = directory / "media.mkv"
         marker = directory / "download.json"
@@ -254,6 +315,7 @@ class YouTubeClient:
         streams: dict[str, tuple[int, int]] = {}
 
         def guard(event: dict[str, Any]) -> None:
+            self.stop_controller.check()
             downloaded = max(int(event.get("downloaded_bytes") or 0), 0)
             total = max(
                 int(
@@ -282,6 +344,7 @@ class YouTubeClient:
                 phase_hook("stream_finished", 0)
 
         def before_merge(event: dict[str, Any]) -> None:
+            self.stop_controller.check()
             if event.get("status") != "started":
                 if event.get("status") == "finished" and phase_hook:
                     phase_hook(
@@ -303,7 +366,7 @@ class YouTubeClient:
 
         options.update(
             {
-                **media_retry_options(),
+                **media_retry_options(self.stop_controller),
                 "skip_download": False,
                 "noplaylist": True,
                 "format": "bestvideo+bestaudio",
@@ -328,7 +391,9 @@ class YouTubeClient:
                     "hls_prefer_native": True,
                 }
             )
-            downloader_type = _limited_downloader(YoutubeDL, self.download_limiter)
+        downloader_type = _limited_downloader(
+            YoutubeDL, self.download_limiter, self.stop_controller
+        )
         if operation_id:
 
             def prepare(info: dict[str, Any]) -> None:
@@ -384,6 +449,32 @@ class YouTubeClient:
         logger.info("Downloaded video {}", video_id)
         return output
 
+    def _managed(
+        self,
+        method: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        callbacks: dict[str, Callable[..., Any]] | None = None,
+    ) -> Any:
+        return run_managed(
+            "youtube",
+            method,
+            {
+                "cookies_path": self.cookies_path,
+                "pot_provider_url": self.pot_provider_url,
+                "limiter_enabled": self.download_limiter.enabled,
+                "chunk_size": self.download_limiter.chunk_size,
+            },
+            args,
+            kwargs,
+            self.stop_controller,
+            {
+                "acquire": self.download_limiter.acquire,
+                "refund": self.download_limiter.refund,
+                **(callbacks or {}),
+            },
+        )
+
     def _tab_videos(
         self,
         channel: ResolvedChannel,
@@ -400,7 +491,9 @@ class YouTubeClient:
             options["playlist_items"] = f"1:{limit}"
 
         logger.trace("Reading YouTube {} tab for channel {}", tab, channel.id)
-        with YoutubeDL(options) as downloader:
+        with _limited_downloader(
+            YoutubeDL, self.download_limiter, self.stop_controller
+        )(options) as downloader:
             try:
                 info: Any = downloader.extract_info(
                     f"{channel.url}/{tab}", download=False
@@ -415,6 +508,7 @@ class YouTubeClient:
                     f"yt-dlp returned no {tab} tab data for {channel.id}"
                 )
             for entry in info["entries"]:
+                self.stop_controller.check()
                 video = _video(entry, content_type)
                 if video is not None:
                     yield video
@@ -427,6 +521,7 @@ class YouTubeClient:
             "logger": DownloaderLogger(),
             "skip_download": True,
             "ignoreerrors": False,
+            "socket_timeout": 30,
         }
         if self.cookies_path is not None:
             # yt-dlp saves cookies on close; keep each worker's updates in memory.
@@ -440,7 +535,7 @@ class YouTubeClient:
 
 
 class _LimitedResponse(Response):
-    def __init__(self, response: Response, limiter: ByteLimiter) -> None:
+    def __init__(self, response: Response, limiter: Limiter) -> None:
         super().__init__(
             response,
             response.url,
@@ -487,11 +582,17 @@ class _LimitedResponse(Response):
         return chunk
 
 
-def _limited_downloader(downloader_type: type[Any], limiter: ByteLimiter) -> type[Any]:
+def _limited_downloader(
+    downloader_type: type[Any],
+    limiter: Limiter,
+    controller: StopController | None = None,
+) -> type[Any]:
     class LimitedYoutubeDL(downloader_type):
         _media_download_active = False
 
         def urlopen(self, request: Any) -> Response:
+            if controller:
+                controller.check()
             response = super().urlopen(request)
             if self._media_download_active:
                 return _LimitedResponse(response, limiter)
@@ -505,7 +606,13 @@ def _limited_downloader(downloader_type: type[Any], limiter: ByteLimiter) -> typ
             test: bool = False,
         ) -> bool:
             params = self.params if not test else {**self.params, "test": True}
-            if get_suitable_downloader(info, params, to_stdout=name == "-") is FFmpegFD:
+            if controller:
+                controller.check()
+            if (
+                limiter.enabled
+                and get_suitable_downloader(info, params, to_stdout=name == "-")
+                is FFmpegFD
+            ):
                 raise DownloadError(
                     "selected formats require an external network downloader, "
                     "which is disabled while bandwidth limiting is enabled"
@@ -520,15 +627,21 @@ def _limited_downloader(downloader_type: type[Any], limiter: ByteLimiter) -> typ
     return LimitedYoutubeDL
 
 
-def media_retry_options() -> dict[str, Any]:
+def media_retry_options(controller: StopController | None = None) -> dict[str, Any]:
     """Bound per-request retries without changing metadata's outer retry policy."""
+
+    def retry_sleep(n: int) -> float:
+        seconds = min(2 ** max(n, 0), 8)
+        if controller:
+            controller.wait(seconds)
+            return 0
+        return seconds
+
     return {
         "retries": 3,
         "fragment_retries": 3,
         "socket_timeout": 30,
-        "retry_sleep_functions": {
-            kind: lambda n: min(2 ** max(n, 0), 8) for kind in ("http", "fragment")
-        },
+        "retry_sleep_functions": {kind: retry_sleep for kind in ("http", "fragment")},
     }
 
 

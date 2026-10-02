@@ -15,6 +15,7 @@ from loguru import logger
 from loguru_discord import DiscordSink
 
 from core.config import LoggingSettings, Settings
+from core.shutdown import StopController
 
 DISCORD_WEBHOOK_PATTERN = re.compile(
     r"(?:https://(?:(?:www|canary|ptb)\.)?discord\.com)?"
@@ -33,6 +34,7 @@ TOKEN_PATTERN = re.compile(
 )
 _DIAGNOSTICS: OrderedDict[str, float] = OrderedDict()
 _DIAGNOSTICS_LOCK = Lock()
+_STOP_CONTROLLER: StopController | None = None
 
 
 class _SafeDiscordSink(logging.Handler):
@@ -49,7 +51,22 @@ class _SafeDiscordSink(logging.Handler):
         ]
         safe_record.args = ()
         try:
-            self.sink.emit(safe_record)
+            if _STOP_CONTROLLER is None:
+                self.sink.emit(safe_record)
+            else:
+                from core.workers import run_managed
+
+                run_managed(
+                    "log",
+                    "emit",
+                    {
+                        "webhook_url": self.sink.webhook_url,
+                        "message": safe_record.getMessage(),
+                    },
+                    (),
+                    {},
+                    _STOP_CONTROLLER,
+                )
         except Exception as error:
             stderr.write(
                 "Discord log forwarding failed "
@@ -79,6 +96,12 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
     else:
         logger.debug("Discord log forwarding is disabled")
     logging.basicConfig(level=logging.WARNING, force=True)
+
+
+def bind_stop_controller(controller: StopController) -> None:
+    """Bound queued log forwarding with the same owned-process stop budget."""
+    global _STOP_CONTROLLER
+    _STOP_CONTROLLER = controller
 
 
 def redact_discord_webhooks(value: str) -> str:

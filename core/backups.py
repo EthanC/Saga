@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 from cronsim import CronSim
 from loguru import logger
 
+from core.shutdown import StopController
+
 if TYPE_CHECKING:
     from core.config import BackupSettings
 
@@ -33,10 +35,22 @@ def next_backup_run(schedule: str, timezone: tzinfo, now: datetime) -> datetime:
     return scheduled
 
 
-async def create_backup(database: Path, directory: Path, retention_count: int) -> Path:
+async def create_backup(
+    database: Path,
+    directory: Path,
+    retention_count: int,
+    *,
+    stop_controller: StopController | None = None,
+) -> Path:
     """Create, verify, publish, and retain an online SQLite snapshot."""
     worker = asyncio.create_task(
-        asyncio.to_thread(_create_backup_sync, database, directory, retention_count)
+        asyncio.to_thread(
+            _create_backup_sync,
+            database,
+            directory,
+            retention_count,
+            **({"stop_controller": stop_controller} if stop_controller else {}),
+        )
     )
     try:
         return await asyncio.shield(worker)
@@ -52,6 +66,7 @@ def _create_backup_sync(
     retention_count: int,
     *,
     timestamp: datetime | None = None,
+    stop_controller: StopController | None = None,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
@@ -69,7 +84,14 @@ def _create_backup_sync(
             closing(sqlite3.connect(source_uri, uri=True)) as source,
             closing(sqlite3.connect(temporary)) as destination,
         ):
-            source.backup(destination)
+            if stop_controller:
+                source.backup(
+                    destination,
+                    pages=256,
+                    progress=lambda *args: stop_controller.check(),
+                )
+            else:
+                source.backup(destination)
             result = destination.execute("PRAGMA quick_check").fetchone()
             if result != ("ok",):
                 raise sqlite3.DatabaseError(f"backup quick check failed: {result!r}")
@@ -101,7 +123,11 @@ def apply_retention(database: Path, directory: Path, retention_count: int) -> No
 
 
 async def run_backup_scheduler(
-    database: Path, settings: BackupSettings, stop: asyncio.Event
+    database: Path,
+    settings: BackupSettings,
+    stop: asyncio.Event,
+    *,
+    stop_controller: StopController | None = None,
 ) -> None:
     """Run successful backups serially and isolate per-run operational failures."""
     while not stop.is_set():
@@ -113,7 +139,10 @@ async def run_backup_scheduler(
             return
         try:
             snapshot = await create_backup(
-                database, settings.directory, settings.retention_count
+                database,
+                settings.directory,
+                settings.retention_count,
+                **({"stop_controller": stop_controller} if stop_controller else {}),
             )
         except Exception:
             logger.exception("Database backup failed")
