@@ -13,7 +13,7 @@ from yt_dlp.networking import _requests
 from yt_dlp.utils import DownloadError
 
 from core.bandwidth import ByteLimiter
-from core.youtube import _limited_downloader, media_retry_options
+from core.youtube import YouTubeClient, _limited_downloader, media_retry_options
 
 
 def test_clients_use_separate_transport_namespaces() -> None:
@@ -28,7 +28,7 @@ def test_clients_use_separate_transport_namespaces() -> None:
 @pytest.mark.parametrize("limited", [False, True])
 @pytest.mark.parametrize("always_fail", [False, True])
 def test_real_disconnect_retries_keep_payload_and_resume_offset(
-    tmp_path: Path, limited: bool, always_fail: bool
+    tmp_path: Path, limited: bool, always_fail: bool, capsys: pytest.CaptureFixture[str]
 ) -> None:
     payload = bytes(range(256)) * 1024
     offsets: list[int] = []
@@ -61,9 +61,9 @@ def test_real_disconnect_retries_keep_payload_and_resume_offset(
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         options = {
+            **YouTubeClient()._options(),
             **media_retry_options(),
-            "quiet": True,
-            "noprogress": True,
+            "skip_download": False,
             "outtmpl": str(tmp_path / "media.bin"),
         }
         # Exercise retries immediately; the separately checked policy supplies sleeps.
@@ -94,3 +94,4 @@ def test_real_disconnect_retries_keep_payload_and_resume_offset(
         finally:
             server.shutdown()
             thread.join()
+    assert "\r" not in capsys.readouterr().out

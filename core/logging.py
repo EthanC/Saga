@@ -3,8 +3,13 @@
 import copy
 import logging
 import re
+import time
+from collections import OrderedDict
 from logging import LogRecord
 from sys import stderr, stdout
+from threading import Lock
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from loguru import logger
 from loguru_discord import DiscordSink
@@ -17,6 +22,17 @@ DISCORD_WEBHOOK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 DISCORD_MESSAGE_LIMIT = 1800
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+HEADER_PATTERN = re.compile(
+    r"\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]+",
+    re.IGNORECASE,
+)
+TOKEN_PATTERN = re.compile(
+    r"([\"']?(?:po_?token|integrityToken|websafeFallbackToken|access_token|refresh_token|password|s3accesskey|s3secretkey)[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\r\n]+)",
+    re.IGNORECASE,
+)
+_DIAGNOSTICS: OrderedDict[str, float] = OrderedDict()
+_DIAGNOSTICS_LOCK = Lock()
 
 
 class _SafeDiscordSink(logging.Handler):
@@ -28,7 +44,7 @@ class _SafeDiscordSink(logging.Handler):
 
     def emit(self, record: LogRecord) -> None:
         safe_record = copy.copy(record)
-        safe_record.msg = redact_discord_webhooks(record.getMessage())[
+        safe_record.msg = redact_diagnostics(record.getMessage())[
             :DISCORD_MESSAGE_LIMIT
         ]
         safe_record.args = ()
@@ -46,7 +62,7 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
     logger.level(settings.log_level)
     logger.level(settings.log_discord_level)
     logger.remove()
-    logger.add(stdout, level=settings.log_level, backtrace=False, diagnose=False)
+    logger.add(_safe_console, level=settings.log_level, backtrace=False, diagnose=False)
 
     if settings.log_discord_webhook_url is not None:
         logger.add(
@@ -55,6 +71,7 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
             backtrace=False,
             diagnose=False,
             enqueue=True,
+            filter=lambda record: not record["extra"].get("downloader_diagnostic"),
         )
         logger.info(
             "Discord log forwarding enabled at {} and above", settings.log_discord_level
@@ -67,3 +84,63 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
 def redact_discord_webhooks(value: str) -> str:
     """Remove complete or path-only Discord webhook credentials from text."""
     return DISCORD_WEBHOOK_PATTERN.sub("<discord webhook>", value)
+
+
+def redact_diagnostics(value: str) -> str:
+    """Remove credentials, signed query values, cookies, and generated tokens."""
+
+    def safe_url(match: re.Match[str]) -> str:
+        try:
+            parsed = urlsplit(match[0])
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            query = urlencode(
+                [
+                    (key, "<redacted>")
+                    for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+                ]
+            )
+            return urlunsplit((parsed.scheme, authority, parsed.path, query, ""))
+        except ValueError:
+            return "<redacted url>"
+
+    value = redact_discord_webhooks(value)
+    value = URL_PATTERN.sub(safe_url, value)
+    value = HEADER_PATTERN.sub("<redacted header>", value)
+    return TOKEN_PATTERN.sub(r"\1<redacted>", value)
+
+
+def _safe_console(message: Any) -> None:
+    stdout.write(redact_diagnostics(str(message)))
+
+
+class DownloaderLogger:
+    """Keep extractor diagnostics readable without duplicate Discord failures."""
+
+    def __init__(self) -> None:
+        self.seen: set[str] = set()
+
+    def debug(self, message: str) -> None:
+        logger.bind(downloader_diagnostic=True).debug(
+            "yt-dlp: {}", redact_diagnostics(message)
+        )
+
+    def warning(self, message: str) -> None:
+        safe = redact_diagnostics(message)
+        if safe in self.seen:
+            return
+        if len(self.seen) < 128:
+            self.seen.add(safe)
+        now = time.monotonic()
+        with _DIAGNOSTICS_LOCK:
+            previous = _DIAGNOSTICS.get(safe)
+            if previous is not None and now - previous < 60:
+                return
+            _DIAGNOSTICS[safe] = now
+            _DIAGNOSTICS.move_to_end(safe)
+            while len(_DIAGNOSTICS) > 256:
+                _DIAGNOSTICS.popitem(last=False)
+        logger.bind(downloader_diagnostic=True).warning("yt-dlp: {}", safe)
+
+    def error(self, message: str) -> None:
+        # The owning processor emits the one actionable warning with retry context.
+        self.debug(message)

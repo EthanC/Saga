@@ -34,6 +34,11 @@ services:
       - ./data:/data
     restart: unless-stopped
     stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 ```
 
 Start the container:
@@ -170,5 +175,9 @@ services:
       start_period: 10s
     restart: unless-stopped
 ```
+
+Add the same `logging` limits to the provider service. Recreate containers and inspect `HostConfig.LogConfig` to verify rotation. Use `LOG_LEVEL=INFO` and `LOG_DISCORD_LEVEL=WARNING` for ordinary operation. Saga disables yt-dlp terminal progress, retains progress hooks, and redacts credentials and signed query values before console or Discord output. Extractor diagnostics stay in console logs; the archive processor owns the actionable failure warning and retry context.
+
+Provider server 2.0.0 has no exposed quiet/log-level option in its CLI. Its token-generation logs require a separately reviewed provider change; Saga cannot redact that container's stdout. Keep its rotation limits and private network, and review a provider release that removes token output before promotion.
 
 The provider generates video-bound PO tokens on the private Compose network. It is not needed when Saga runs without authentication cookies. Do not publish its unauthenticated port. For a native installation, run provider server version `2.0.0` and set `YOUTUBE_POT_PROVIDER_URL=http://127.0.0.1:4416`. The server and Python plugin versions must match.

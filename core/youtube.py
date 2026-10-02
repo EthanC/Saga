@@ -22,6 +22,7 @@ from yt_dlp.utils import DownloadError
 
 from core.bandwidth import ByteLimiter
 from core.config import ALL_CONTENT_TYPES, ContentType
+from core.logging import DownloaderLogger, redact_diagnostics
 from core.staging import download_reservation, inventory_inputs, prepare_inputs
 from core.state import DiscoveredVideo, ResolvedChannel
 
@@ -421,7 +422,9 @@ class YouTubeClient:
     def _options(self) -> dict[str, Any]:
         options: dict[str, Any] = {
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
+            "noprogress": True,
+            "logger": DownloaderLogger(),
             "skip_download": True,
             "ignoreerrors": False,
         }
@@ -728,7 +731,7 @@ def _required_text(
 
 
 def _classify_download_error(error: DownloadError) -> RuntimeError:
-    detail = str(error)
+    detail = redact_diagnostics(str(error))
     unavailable_markers = (
         "private video",
         "video unavailable",

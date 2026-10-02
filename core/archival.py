@@ -39,6 +39,7 @@ from niquests import Session
 
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings
+from core.logging import redact_diagnostics
 from core.progress import DownloadCheckpoint
 from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
@@ -320,10 +321,17 @@ class ArchiveProcessor:
                     last_error=_error_text(error),
                 )
         except Exception as error:
-            logger.warning("{} failed for video {}: {}", stage, work.video.id, error)
             delay = retry_delay(
                 self.settings.archive_retry_delay,
                 work.job.attempts if work.job else work.progress.retry_attempts + 1,
+            )
+            logger.warning(
+                "Video {} phase {} attempt {} will retry in {:.0f}s: {}",
+                work.video.id,
+                stage,
+                work.progress.attempts,
+                delay,
+                _error_text(error),
             )
             if work.job:
                 self.state.update_job(
@@ -891,4 +899,4 @@ def _iso_date(upload_date: str) -> str:
 
 
 def _error_text(error: Exception) -> str:
-    return f"{type(error).__name__}: {error}"[:2000]
+    return redact_diagnostics(f"{type(error).__name__}: {error}")[:2000]

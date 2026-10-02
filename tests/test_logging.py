@@ -1,10 +1,12 @@
 import asyncio
 import logging
+import sys
 from io import StringIO
 from pathlib import Path
 from typing import Any
 
 import pytest
+from loguru import logger
 
 import saga
 from core import logging as logging_config
@@ -194,3 +196,77 @@ def test_safe_discord_sink_hides_transport_error(
     assert output.getvalue() == (
         "Discord log forwarding failed (RuntimeError); see console logs\n"
     )
+
+
+def test_diagnostics_redact_multiline_credentials_and_signed_urls() -> None:
+    message = (
+        "https://user:url-password@example.com/media?sig=signed-secret&empty=\n"
+        "Authorization: Bearer auth-secret\n"
+        "Cookie: SID=cookie-secret; more=other-secret\n"
+        'poToken: generated-secret\n{"integrityToken": "integrity-secret"}\n'
+        "https://discord.com/api/webhooks/1/webhook-secret\n"
+        "https://[invalid URL"
+    )
+    safe = logging_config.redact_diagnostics(message)
+    for secret in (
+        "url-password",
+        "signed-secret",
+        "auth-secret",
+        "cookie-secret",
+        "other-secret",
+        "generated-secret",
+        "integrity-secret",
+        "webhook-secret",
+    ):
+        assert secret not in safe
+    assert "example.com/media" in safe
+
+
+def test_downloader_diagnostics_are_deduplicated_and_excluded_from_discord(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console = StringIO()
+    discord: list[str] = []
+
+    class Sink:
+        def __init__(self, url: str) -> None:
+            pass
+
+        def emit(self, record: logging.LogRecord) -> None:
+            discord.append(record.getMessage())
+
+    monkeypatch.setattr(logging_config, "stdout", console)
+    monkeypatch.setattr(logging_config, "DiscordSink", Sink)
+    now = [0.0]
+    monkeypatch.setattr(logging_config.time, "monotonic", lambda: now[0])
+    logging_config._DIAGNOSTICS.clear()
+    try:
+        logging_config.configure_logging(
+            settings("https://discord.com/api/webhooks/1/test")
+        )
+        adapter = logging_config.DownloaderLogger()
+        adapter.debug("extractor debug")
+        adapter.error("Authorization: Bearer adapter-secret")
+        adapter.warning("format selection changed")
+        adapter.warning("format selection changed")
+        logging_config.DownloaderLogger().warning("format selection changed")
+        now[0] = 61
+        logging_config.DownloaderLogger().warning("format selection changed")
+        for index in range(260):
+            adapter.warning(f"unique diagnostic {index}")
+        assert len(adapter.seen) == 128 and len(logging_config._DIAGNOSTICS) == 256
+        try:
+            raise RuntimeError(
+                "https://user:failure-secret@example.com/file?sig=signed-secret"
+            )
+        except RuntimeError:
+            logger.exception("operation failed")
+        logger.complete()
+        assert console.getvalue().count("format selection changed") == 2
+        assert "extractor debug" not in console.getvalue()
+        assert len(discord) == 1
+        for output in (console.getvalue(), discord[0]):
+            assert "failure-secret" not in output and "signed-secret" not in output
+    finally:
+        logger.remove()
+        logger.add(sys.stderr)
