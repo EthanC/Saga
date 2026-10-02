@@ -19,26 +19,21 @@ Saga archives YouTube channels with the Internet Archive and posts new uploads t
 
 ## Docker Compose
 
-Create the `config` and `data` directories. Copy `config.example.toml` to `config/config.toml` and `.env.example` to `.env.saga`, then edit both files. Keep `.env.saga` private (`chmod 600 .env.saga`). Save this as `compose.yaml`, replacing the image placeholder with the digest of your tested release:
+Create the `config` and `data` directories. Copy `config.example.toml` to `config/config.toml` and `.env.example` to `.env`, then edit both files. Save this as `compose.yaml`:
 
 ```yaml
 services:
   saga:
     container_name: saga
-    image: ghcr.io/ethanc/saga@sha256:<tested-release-digest>
+    image: ghcr.io/ethanc/saga:latest
     init: true
     env_file:
-      - .env.saga
+      - .env
     volumes:
       - ./config:/config:ro
       - ./data:/data
     restart: unless-stopped
     stop_grace_period: 120s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 ```
 
 Start the container:
@@ -47,11 +42,7 @@ Start the container:
 docker compose up -d
 ```
 
-For a separate staging disk, add its existing host directory as a third bind mount to `/data/downloads`, beneath the `/data` mount. Keep the config, database, and staging mappings in your private deployment record. Saga uses `/data/downloads` for downloads and merge space even when it is a different filesystem.
-
-Compose's project `.env` supplies interpolation values; it does not automatically populate container environments. Give Saga its own `env_file`. In Arcane, remove Saga credentials and webhooks from project-wide injection so the PO-token provider receives only its own settings. Verify environment **key names** after recreating both services, without printing secret values. Confirm that Arcane and `docker compose config` resolve the same mounts, settings, and image references. Values with spaces, including cron schedules, belong on one line in `.env.saga`.
-
-CI publishes immutable `sha-<full-commit>` image tags. Resolve a tested tag to its digest before promotion, and record the prior and replacement digests, rendered configuration, snapshot path, queue totals, and deployment time. Roll back by selecting the recorded previous image and its configuration against compatible current state.
+Keep `stop_grace_period` longer than `SAGA_SHUTDOWN_TIMEOUT`, which defaults to 90 seconds.
 
 ## Python
 
@@ -60,8 +51,6 @@ Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then
 ```console
 uv sync
 ```
-
-When upgrading from an environment where urllib3.future replaced urllib3, create a fresh virtual environment before syncing. The repository now builds separate transport namespaces; a build flag cannot change an already-installed wheel. Docker builds use the source-build recipe automatically, with no runtime transport variable to set.
 
 Create `config`, copy the example files to `config/config.toml` and `.env`, then run Saga:
 
@@ -77,9 +66,7 @@ Saga reads `.env` and process variables, with process values taking precedence. 
 
 ## Database Backups
 
-Saga creates online SQLite snapshots and checks each one with `PRAGMA quick_check`. By default, it runs daily at 7:00 AM, keeps seven backups, and stores them in `data/backups`. The schedule, timezone, location, and retention are configurable in `.env`.
-
-Local snapshots do not cover host loss.
+Saga creates online SQLite snapshots and checks each one with `PRAGMA quick_check`. By default, backups run daily at 7:00 AM in the system timezone, with the latest seven kept in `data/backups`. The schedule, timezone, location, and retention are configurable in `.env`.
 
 ## Configuration
 
@@ -102,66 +89,24 @@ References accept handles, channel IDs, and YouTube channel URLs. Videos, Shorts
 
 ## Archival Reports
 
-Set `REPORT_DISCORD_WEBHOOK_URL` for Discord reports covering discoveries, videos uploaded, bytes uploaded, lifetime uploads, and outstanding transfers. Reports run at midnight UTC by default and are written to the log when no webhook is set. Validation and webpage results are reported separately.
-
-Report semantics version 2 counts a video when its upload acknowledgement commits. Recovered and migrated uploads contribute to lifetime totals but are excluded from the reporting window's newly transferred videos and bytes. Existing version 1 snapshots retain their stored counts and labels.
+Set `REPORT_DISCORD_WEBHOOK_URL` for Discord reports covering discoveries, uploaded videos and bytes, lifetime totals, and unfinished work. Reports run at midnight UTC by default and are written to the log when no webhook is set.
 
 ## Preservation
 
-Saga's application stop budget is `SAGA_SHUTDOWN_TIMEOUT=90` seconds. Keep Compose's stop grace above that budget (the example uses 120 seconds). The entrypoint runs blocking YouTube, archive, and log HTTP work in owned processes with parent-side durable callbacks and shared bandwidth accounting. Stop interrupts retries and bandwidth waits; work that cannot cooperate is terminated with its owned child-process group. Downloads retain inputs and release reservations, uncertain uploads enter reconciliation, and acknowledged uploads save receipts before cleanup. SQLite backups check stop between bounded page batches. Discord delivery and report outcomes remain at least once when a response is lost.
+Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encoding and uploads it to `opensource_movies`. It saves the Internet Archive upload acknowledgement before deleting local files. Optional remote validation runs separately; enable it with `SAGA_VALIDATION_ENABLED=true`.
 
-Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encoding and uploads it to `opensource_movies`. Download completion is recorded after a successful downloader/merge result, a nonempty output, and an atomic rename. A leftover MKV without its completion receipt is downloaded again.
-
-Internet Archive's acknowledgement of the expected original file completes the transfer. Saga saves the item ID, operation ID, filename, size, receipt, ETag, and completion time before scheduling staging deletion. Derivative processing, public visibility, validation, and webpage capture do not delay cleanup or upload reporting.
-
-The default pipeline has one upload worker, one download worker, and a buffer of two upload-ready files. Downloads reserve space for both their streams and ffmpeg's merge output. Saga pauses new downloads when the buffer or disk budget is full and keeps uploads running. `SAGA_UNKNOWN_DOWNLOAD_BYTES` supplies an estimate when YouTube omits one; progress hooks adjust reservations as stream sizes become known. Failed transfers release their worker and retry with exponential backoff and jitter.
-
-Validation is disabled by default. Enable `SAGA_VALIDATION_ENABLED` for one remote-only validation worker using saved receipts, sizes, and existing checksums. Background validation, recovery checks, and captures each have separate claims, request timeouts, a deadline, and a retry budget. No automatic upload or status-check path hashes staging files or runs ffprobe.
-
-If a connection is lost before acknowledgement, Saga retains staging and checks the persisted operation's remote original in the recovery queue. Confirmed originals become recovered completions; confirmed missing files return to upload priority. Ambiguous outcomes expire after the background budget while other transfers continue. Saga pins Archivist 1.3.0 and supplies its transport-only recovery extension in `core/transport.py`; recovery rechecks account ownership and Saga provenance before a missing-file PUT.
-
-`data/transfers.json` version 2 records metadata/download/upload and background lanes, active worker counts, due queue ages, real byte/merge-output progress, oldest recent videos, staging capacity, reservations, and partial-retention decisions. Byte counts can lag by the five-second checkpoint interval. Each monitored channel has its own successful-poll timestamp; history scans do not refresh a failed recent poll.
-
-The healthcheck requires a fresh polling heartbeat and health publisher. Active primary lanes without byte or phase progress beyond `SAGA_TRANSFER_STALL_TIMEOUT=900` become unhealthy. Expected disk, retry, buffer, maintenance, and occupied-worker waits are named backpressure. Old ready work gets 120 seconds of application startup grace followed by a fresh eligibility-based dispatch window. Recent metadata waiting five minutes and recent downloads waiting 15 minutes produce preservation warnings; optional failed/expired jobs get their own alerts while uploads continue. Alerts emit on transition and recovery, with reminders no more often than every 15 minutes. Begin with alert-only handling; Docker's `unless-stopped` policy does not restart an unhealthy container.
-
-### Scheduling and staging
-
-Download byte counts and shrinking reservations are durable checkpoints that can lag by five seconds. Disk headroom is checked on every callback using read-only reservation totals; an increased estimate receives an immediate transactional reservation check. Stream boundaries, merge boundaries, disk pauses, and claim release flush progress sooner. Completion receipts, upload acknowledgements, recovery outcomes, and cleanup transitions commit immediately. Repeated identical byte callbacks do not renew the last-progress timestamp.
-
-Partial inputs are inventoried by operation and selected format in `inputs.json`. Compatible legacy `media.f<format>.<ext>.part` files and downloader sidecars are renamed as a restart-safe set before resumption. Conflicting formats, symlinks, malformed sidecars, and unknown operations are retained with an inventory finding. No partial creates a download-completion receipt.
-
-The download cadence favors recent, resume, recent, then backfill work. Resume credit reduces only remaining input/merge allocations, not the free-space floor. Retention runs independently each minute. `SAGA_PARTIAL_RETENTION_MODE=observe` reports inactive candidates without deleting them; after a day of review, `enforce` can remove recognized inputs exceeding `SAGA_PARTIAL_MAX_BYTES` that have been inactive for `SAGA_PARTIAL_MIN_AGE`. Claimed, completed, upload-ready, uploading, and reconciliation work is protected. In enforcement mode, protected bytes above the target pause fresh downloads while resumable work and uploads continue.
-
-Recent-work priority follows the durable notification-candidate flag, including discoveries delayed for days. Recent metadata has its own allowance equal to the ready buffer; backfill metadata has twice that allowance. Due prepared downloads and claimed metadata consume their class's allowance. Retry-delayed and disk-blocked downloads do not. Metadata capacity does not bypass download disk or ready-buffer limits. Metadata and upload workers favor recent work for three successful claims, then favor backfill for one. The download cadence is described above; empty polls do not spend a turn.
-
-### Migrating an Existing Queue
-
-1. Stop the old Saga instance and retain a consistent SQLite backup. The new version creates `saga.sqlite.pre-upload-first.sqlite3` for the legacy upload migration, or `saga.sqlite.pre-staging-audit.sqlite3` before adding the audit's shared progress and maintenance fields.
-2. Rehearse with a consistent backup using the tested version:
-
-   ```console
-   uv run python -m core.migration data/saga.sqlite --directory data/migration-rehearsal
-   ```
-
-   The command migrates an online SQLite snapshot twice, checks database integrity and foreign keys, and prints its path. It leaves the source database unchanged.
-3. Deploy the tested image pinned to its `sha-<full-commit>` tag or digest. Start one Saga instance against the original data directory. Startup applies the idempotent schema and queue migration under Saga's process lock.
-4. Verified historical successes become upload completions with their original verification timestamp. Their pending staging cleanup and capture jobs are scheduled independently. Interrupted uploads enter remote recovery using their saved file facts. Staging is deleted only after those originals are confirmed. Upload-ready rows with missing media return to downloading.
-5. Check `transfers.json`, the logs, and the next version 2 report as transfers resume. Keep the pre-migration backup and the pinned previous image until the queue and reclaimed staging have been checked.
-
-### Upload worker trial
-
-Keep one upload worker while deploying the audit fixes. After disk, resume, shutdown, and lane-health checks pass in production, record a representative one-worker baseline, then trial `SAGA_UPLOAD_WORKERS=2` on the same pinned image. Keep one download worker, buffer two, both aggregate rate limits at 100 MB/s, and the 25 GB staging floor. Compare acknowledged payload bytes per active wall-clock hour, retries/recovery, disk pauses, staging peaks, worker supply, and host contention. Keep two workers only if the measured gain reaches the proposed 20% target without more failures or floor violations. Otherwise return to one worker using the same image and bounded shutdown. Measure merge/process/cache peaks before a separate resource-limit trial.
+Saga retries failed transfers, resumes interrupted downloads, and pauses new downloads when disk space is low. Livestreams wait until a replay is available. See `data/transfers.json` for transfer progress, queue status, and staging space.
 
 ## Webpage Capture
 
-Saga submits watch pages directly to the Internet Archive unless both [Ziggy](https://github.com/EthanC/Ziggy) variables are set. [Ziggy](https://github.com/EthanC/Ziggy) queues captures separately and does not require Internet Archive credentials:
+Saga submits watch pages directly to the Internet Archive unless both [Ziggy](https://github.com/EthanC/Ziggy) variables are set. Ziggy queues captures separately and does not require Internet Archive credentials:
 
 ```dotenv
 ZIGGY_HOST=http://ziggy:9449
 ZIGGY_IDENTIFIER=saga
 ```
 
-[Ziggy](https://github.com/EthanC/Ziggy)'s listener has no authentication and should remain on a trusted network.
+Ziggy's listener has no authentication and should remain on a trusted network.
 
 ## YouTube Authentication
 
@@ -177,7 +122,7 @@ services:
         condition: service_healthy
 
   saga-pot:
-    image: brainicism/bgutil-ytdlp-pot-provider@sha256:<tested-provider-digest>
+    image: brainicism/bgutil-ytdlp-pot-provider:2.0.0
     init: true
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
@@ -188,8 +133,4 @@ services:
     restart: unless-stopped
 ```
 
-Add the same `logging` limits to the provider service. Recreate containers and inspect `HostConfig.LogConfig` to verify rotation. Use `LOG_LEVEL=INFO` and `LOG_DISCORD_LEVEL=WARNING` for ordinary operation. Saga disables yt-dlp terminal progress, retains progress hooks, and redacts credentials and signed query values before console or Discord output. Extractor diagnostics stay in console logs; the archive processor owns the actionable failure warning and retry context.
-
-Provider server 2.0.0 has no exposed quiet/log-level option in its CLI. Its token-generation logs require a separately reviewed provider change; Saga cannot redact that container's stdout. Keep its rotation limits and private network, and review a provider release that removes token output before promotion.
-
-The provider generates video-bound PO tokens on the private Compose network. It is not needed when Saga runs without authentication cookies. Do not publish its unauthenticated port. For a native installation, run provider server version `2.0.0` and set `YOUTUBE_POT_PROVIDER_URL=http://127.0.0.1:4416`. The server and Python plugin versions must match.
+The provider generates PO tokens on the private Compose network. Do not publish its unauthenticated port. For a native installation, run provider server version `2.0.0` and set `YOUTUBE_POT_PROVIDER_URL=http://127.0.0.1:4416` in `.env`. The server and Python plugin versions must match.
