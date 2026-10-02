@@ -467,7 +467,7 @@ class SagaService:
                     prefer_recent=claim_count % 4 != 3,
                     lane=lane,
                     buffer=self.settings.upload_ready_buffer,
-                    free_bytes=shutil.disk_usage(self.settings.data_path).free
+                    free_bytes=shutil.disk_usage(self.settings.download_root).free
                     if lane == "download"
                     else None,
                     minimum_free_bytes=self.settings.minimum_free_bytes,
@@ -516,7 +516,7 @@ class SagaService:
             health = self.state.transfer_health(
                 stall_timeout=self.settings.transfer_stall_timeout
             )
-            root = self.settings.data_path / "downloads"
+            root = self.settings.download_root
             health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
             path = self.settings.data_path / "transfers.json"
             temporary = path.with_suffix(".tmp")

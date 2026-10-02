@@ -29,6 +29,7 @@ from sqlmodel import (
 )
 
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
+from core.staging import download_reservation
 
 
 def utcnow() -> datetime:
@@ -757,11 +758,13 @@ class StateStore:
                 reservation = 0
                 if lane == "download":
                     metadata = json.loads(progress.frozen_metadata or "{}")
-                    reservation = 2 * max(
-                        progress.download_estimated_bytes
-                        or metadata.get("estimated_bytes")
-                        or unknown_download_bytes,
-                        1,
+                    reservation = download_reservation(
+                        max(
+                            progress.download_estimated_bytes
+                            or metadata.get("estimated_bytes")
+                            or unknown_download_bytes,
+                            1,
+                        )
                     )
                     if (
                         free_bytes is None
@@ -1030,6 +1033,7 @@ class StateStore:
     ) -> None:
         """Adjust a download/merge reservation as yt-dlp learns stream sizes."""
         with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             progress = session.get(ArchiveProgress, video_id)
             assert progress is not None
             others = session.exec(
@@ -1037,7 +1041,7 @@ class StateStore:
                     func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
                 ).where(ArchiveProgress.video_id != video_id)
             ).one()
-            remaining = max(2 * expected - downloaded, expected)
+            remaining = download_reservation(expected, downloaded)
             progress.download_estimated_bytes = max(
                 expected, progress.download_estimated_bytes or 0
             )

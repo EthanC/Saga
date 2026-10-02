@@ -128,6 +128,11 @@ class Settings:
     report_finalization_grace: float = 300.0
 
     @property
+    def download_root(self) -> Path:
+        """Return the filesystem root used for all transfer staging."""
+        return self.data_path / "downloads"
+
+    @property
     def archival_enabled(self) -> bool:
         """Return whether either preservation provider is configured."""
         return self.internet_archive_email is not None or self.ziggy_host is not None

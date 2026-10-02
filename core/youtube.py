@@ -22,6 +22,7 @@ from yt_dlp.utils import DownloadError
 
 from core.bandwidth import ByteLimiter
 from core.config import ALL_CONTENT_TYPES, ContentType
+from core.staging import download_reservation
 from core.state import DiscoveredVideo, ResolvedChannel
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
@@ -226,7 +227,7 @@ class YouTubeClient:
         if merging.exists():
             merging.unlink()
         # ffmpeg keeps both input streams while writing the merged output.
-        required = minimum_free_bytes + 2 * max(estimated_bytes or 0, 0)
+        required = minimum_free_bytes + download_reservation(estimated_bytes or 0)
         free = shutil.disk_usage(directory).free
         if free < required:
             logger.warning(
@@ -258,8 +259,26 @@ class YouTubeClient:
             )
             if disk_guard:
                 disk_guard(expected, sum(value[1] for value in streams.values()))
-            elif shutil.disk_usage(directory).free < minimum_free_bytes + expected:
+            elif shutil.disk_usage(
+                directory
+            ).free < minimum_free_bytes + download_reservation(
+                expected, sum(value[1] for value in streams.values())
+            ):
                 raise DiskSpaceError("insufficient space for temporary merge output")
+
+        def before_merge(event: dict[str, Any]) -> None:
+            if event.get("status") != "started":
+                return
+            expected = max(
+                sum(value[0] for value in streams.values()), estimated_bytes or 0
+            )
+            downloaded = sum(value[1] for value in streams.values())
+            if disk_guard:
+                disk_guard(expected, downloaded)
+            elif shutil.disk_usage(
+                directory
+            ).free < minimum_free_bytes + download_reservation(expected, downloaded):
+                raise DiskSpaceError("insufficient space before merge")
 
         options.update(
             {
@@ -271,6 +290,7 @@ class YouTubeClient:
                 "skip_unavailable_fragments": False,
                 "overwrites": False,
                 "progress_hooks": [guard],
+                "postprocessor_hooks": [before_merge],
                 "outtmpl": {"default": str(directory / "merging.%(ext)s")},
             }
         )

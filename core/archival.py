@@ -39,6 +39,7 @@ from niquests import Session
 
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings
+from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
 from core.youtube import (
@@ -276,7 +277,7 @@ class ArchiveProcessor:
         self.gateway = gateway
         if gateway is None and settings.media_archival_enabled:
             self.gateway = ArchiveGateway(settings, upload_limiter)
-        self.download_root = settings.data_path / "downloads"
+        self.download_root = ensure_download_root(settings.download_root)
 
     def process(self, work: ArchiveWork) -> None:
         stage = work.job.kind if work.job else work.progress.status
