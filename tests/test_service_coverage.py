@@ -101,6 +101,7 @@ def test_run_starts_named_channel_workers(
     monkeypatch.setattr(service, "_report_loop", worker)
     monkeypatch.setattr(service, "_archive_loop", worker)
     monkeypatch.setattr(service, "_transfer_health_loop", worker)
+    monkeypatch.setattr(service, "_partial_maintenance_loop", worker)
     monkeypatch.setattr(service_module, "run_backup_scheduler", worker)
     service.stop.set()
 
@@ -119,6 +120,7 @@ def test_run_starts_named_channel_workers(
         "webpage:0",
         "recovery:0",
         "transfer-health",
+        "partial-maintenance",
     }
     assert not (tmp_path / "healthy").exists()
     store.close()

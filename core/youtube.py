@@ -22,7 +22,7 @@ from yt_dlp.utils import DownloadError
 
 from core.bandwidth import ByteLimiter
 from core.config import ALL_CONTENT_TYPES, ContentType
-from core.staging import download_reservation
+from core.staging import download_reservation, inventory_inputs, prepare_inputs
 from core.state import DiscoveredVideo, ResolvedChannel
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
@@ -206,6 +206,7 @@ class YouTubeClient:
         minimum_free_bytes: int,
         estimated_bytes: int | None,
         disk_guard: Callable[[int, int], None] | None = None,
+        operation_id: str | None = None,
     ) -> Path:
         """Resume a strict bestvideo+bestaudio download and return its MKV path."""
         directory.mkdir(parents=True, exist_ok=True)
@@ -227,7 +228,14 @@ class YouTubeClient:
         if merging.exists():
             merging.unlink()
         # ffmpeg keeps both input streams while writing the merged output.
-        required = minimum_free_bytes + download_reservation(estimated_bytes or 0)
+        reusable = (
+            inventory_inputs(directory, operation_id, video_id).reusable_bytes
+            if operation_id
+            else 0
+        )
+        required = minimum_free_bytes + download_reservation(
+            estimated_bytes or 0, reusable
+        )
         free = shutil.disk_usage(directory).free
         if free < required:
             logger.warning(
@@ -253,7 +261,10 @@ class YouTubeClient:
                 ),
                 downloaded,
             )
-            streams[str(event.get("filename", "media"))] = total, downloaded
+            streams[str(event.get("filename", "media")).removesuffix(".part")] = (
+                total,
+                downloaded,
+            )
             expected = max(
                 sum(value[0] for value in streams.values()), estimated_bytes or 0
             )
@@ -308,6 +319,38 @@ class YouTubeClient:
                 }
             )
             downloader_type = _limited_downloader(YoutubeDL, self.download_limiter)
+        if operation_id:
+
+            def prepare(info: dict[str, Any]) -> None:
+                if info.get("id") != video_id:
+                    raise RuntimeError("selected video does not match operation")
+                selected = info.get("requested_formats") or [info]
+                inventory = prepare_inputs(directory, operation_id, video_id, selected)
+                for path in inventory.files:
+                    if (
+                        path.name.startswith("merging.")
+                        and not path.name.endswith(".ytdl")
+                        and "-Frag" not in path.name
+                    ):
+                        size = path.stat().st_size
+                        streams[str(path).removesuffix(".part")] = size, size
+                expected = max(
+                    estimated_bytes or 0,
+                    sum(
+                        item.get("filesize") or item.get("filesize_approx") or 0
+                        for item in selected
+                    ),
+                )
+                if disk_guard:
+                    disk_guard(expected, inventory.reusable_bytes)
+                elif shutil.disk_usage(
+                    directory
+                ).free < minimum_free_bytes + download_reservation(
+                    expected, inventory.reusable_bytes
+                ):
+                    raise DiskSpaceError("selected input and merge disk budget full")
+
+            downloader_type = _staging_downloader(downloader_type, prepare)
         try:
             with downloader_type(options) as downloader:
                 result = downloader.download(
@@ -475,6 +518,17 @@ def media_retry_options() -> dict[str, Any]:
             kind: lambda n: min(2 ** max(n, 0), 8) for kind in ("http", "fragment")
         },
     }
+
+
+def _staging_downloader(
+    downloader_type: type[Any], prepare: Callable[[dict[str, Any]], None]
+) -> type[Any]:
+    class StagingYoutubeDL(downloader_type):
+        def process_info(self, info: dict[str, Any]) -> Any:
+            prepare(info)
+            return super().process_info(info)
+
+    return StagingYoutubeDL
 
 
 def _channel_url(reference: str) -> str:

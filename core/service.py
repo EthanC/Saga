@@ -27,6 +27,7 @@ from core.reporting import (
     report_has_activity,
     send_report,
 )
+from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore
 from core.youtube import YouTubeClient
 
@@ -65,6 +66,7 @@ class SagaService:
             )
         self.stop = asyncio.Event()
         self._work_changed = asyncio.Condition()
+        self._partial_health: dict[str, Any] = {}
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
@@ -112,6 +114,9 @@ class SagaService:
                             )
                     workers.create_task(
                         self._transfer_health_loop(), name="transfer-health"
+                    )
+                    workers.create_task(
+                        self._partial_maintenance_loop(), name="partial-maintenance"
                     )
                 await self.stop.wait()
         finally:
@@ -472,6 +477,15 @@ class SagaService:
                     else None,
                     minimum_free_bytes=self.settings.minimum_free_bytes,
                     unknown_download_bytes=self.settings.unknown_download_bytes,
+                    download_root=self.settings.download_root,
+                    pause_fresh_downloads=self.settings.partial_retention_mode
+                    == "enforce"
+                    and bool(self._partial_health.get("waiting_reason")),
+                    dispatch_class=("recent", "resume", "recent", "backfill")[
+                        claim_count % 4
+                    ]
+                    if lane == "download"
+                    else None,
                 )
             else:
                 work = self.state.claim_background(
@@ -518,6 +532,7 @@ class SagaService:
             )
             root = self.settings.download_root
             health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
+            health["partials"] = self._partial_health
             path = self.settings.data_path / "transfers.json"
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps(health, sort_keys=True), encoding="utf-8")
@@ -525,6 +540,16 @@ class SagaService:
             if not health["healthy"]:
                 logger.error("Upload queue stalled: {}", health)
             await self._wait(30)
+
+    async def _partial_maintenance_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                self._partial_health = await asyncio.to_thread(
+                    maintain_partials, self.state, self.settings
+                )
+            except Exception:
+                logger.exception("Partial inventory maintenance failed")
+            await self._wait(60)
 
     async def _report_loop(self) -> None:
         logger.debug(

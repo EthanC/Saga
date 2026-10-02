@@ -384,6 +384,7 @@ class ArchiveProcessor:
                 shutil.disk_usage(directory).free,
                 self.settings.minimum_free_bytes,
             ),
+            operation_id=frozen.operation_id,
         )
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError("downloader did not produce nonempty media")

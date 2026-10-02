@@ -115,6 +115,10 @@ If a connection is lost before acknowledgement, Saga retains staging and checks 
 
 ### Migrating an Existing Queue
 
+Partial inputs are inventoried by operation and selected format in `inputs.json`. Compatible legacy `media.f<format>.<ext>.part` files and downloader sidecars are renamed as a restart-safe set before resumption. Conflicting formats, symlinks, malformed sidecars, and unknown operations are retained with an inventory finding. No partial creates a download-completion receipt.
+
+The download cadence favors recent, resume, recent, then backfill work. Resume credit reduces only remaining input/merge allocations, not the free-space floor. Retention runs independently each minute. `SAGA_PARTIAL_RETENTION_MODE=observe` reports inactive candidates without deleting them; after a day of review, `enforce` can remove recognized inputs exceeding `SAGA_PARTIAL_MAX_BYTES` that have been inactive for `SAGA_PARTIAL_MIN_AGE`. Claimed, completed, upload-ready, uploading, and reconciliation work is protected. In enforcement mode, protected bytes above the target pause fresh downloads while resumable work and uploads continue.
+
 Recent-work priority follows the durable notification-candidate flag, including discoveries delayed for days. Recent metadata has its own allowance equal to the ready buffer; backfill metadata has twice that allowance. Due prepared downloads and claimed metadata consume their class's allowance. Retry-delayed and disk-blocked downloads do not. Metadata capacity does not bypass download disk or ready-buffer limits. Workers favor recent work for three successful claims, then favor backfill for one; empty polls do not spend a turn.
 
 1. Stop the old Saga instance and retain a consistent SQLite backup. The new version also creates `saga.sqlite.pre-upload-first.sqlite3` before changing a legacy schema.

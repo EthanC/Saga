@@ -17,7 +17,7 @@ from core.youtube import _limited_downloader, media_retry_options
 
 
 def test_clients_use_separate_transport_namespaces() -> None:
-    assert getattr(requests.packages, "urllib3") is urllib3
+    assert vars(requests.packages)["urllib3"] is urllib3
     assert niquests.packages.urllib3 is urllib3_future
     assert _requests.urllib3 is urllib3
     assert not hasattr(urllib3, "AsyncPoolManager")

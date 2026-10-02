@@ -126,6 +126,9 @@ class Settings:
     report_discord_webhook_url: str | None = None
     report_schedule: str = "0 0 * * *"
     report_finalization_grace: float = 300.0
+    partial_retention_mode: str = "observe"
+    partial_max_bytes: int = 100_000_000_000
+    partial_min_age: float = 86_400.0
 
     @property
     def download_root(self) -> Path:
@@ -301,6 +304,9 @@ def load_settings(project_root: Path) -> Settings:
     report_finalization_grace = _positive_env_float(
         env, "SAGA_REPORT_FINALIZATION_GRACE", 300.0
     )
+    partial_retention_mode = env.str("SAGA_PARTIAL_RETENTION_MODE", "observe")
+    if partial_retention_mode not in {"observe", "enforce"}:
+        raise ValueError("SAGA_PARTIAL_RETENTION_MODE must be observe or enforce")
 
     return Settings(
         config_path=config_path,
@@ -350,6 +356,11 @@ def load_settings(project_root: Path) -> Settings:
         report_discord_webhook_url=report_discord_webhook_url,
         report_schedule=report_schedule,
         report_finalization_grace=report_finalization_grace,
+        partial_retention_mode=partial_retention_mode,
+        partial_max_bytes=_nonnegative_env_int(
+            env, "SAGA_PARTIAL_MAX_BYTES", 100_000_000_000
+        ),
+        partial_min_age=_positive_env_float(env, "SAGA_PARTIAL_MIN_AGE", 86_400),
     )
 
 

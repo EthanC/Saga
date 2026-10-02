@@ -29,7 +29,7 @@ from sqlmodel import (
 )
 
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
-from core.staging import download_reservation
+from core.staging import download_reservation, inventory_inputs
 
 
 def utcnow() -> datetime:
@@ -151,6 +151,11 @@ class ArchiveProgress(SQLModel, table=True):
     retry_attempts: int = 0
     reserved_bytes: int = 0
     download_estimated_bytes: int | None = None
+    download_bytes: int = 0
+    download_progress_at: datetime | None = None
+    download_phase: str | None = None
+    merge_bytes: int = 0
+    maintenance_token: str | None = None
     media_verified_at: datetime | None = None
     recovery_result: str | None = None
     failure_phase: str | None = None
@@ -309,6 +314,14 @@ class StateStore:
             }
         ):
             self._backup_before_migration()
+        elif "archiveprogress" in inspect(self.engine).get_table_names() and (
+            "download_phase"
+            not in {
+                column["name"]
+                for column in inspect(self.engine).get_columns("archiveprogress")
+            }
+        ):
+            self._backup_before_migration("pre-staging-audit")
         SQLModel.metadata.create_all(self.engine)
         self._migrate_schema()
         logger.debug("Initialized SQLite state at {}", self.path)
@@ -318,8 +331,8 @@ class StateStore:
         self.engine.dispose()
         logger.debug("Closed SQLite state at {}", self.path)
 
-    def _backup_before_migration(self) -> None:
-        backup = self.path.with_name(f"{self.path.name}.pre-upload-first.sqlite3")
+    def _backup_before_migration(self, label: str = "pre-upload-first") -> None:
+        backup = self.path.with_name(f"{self.path.name}.{label}.sqlite3")
         if not backup.exists():
             with (
                 closing(sqlite3.connect(self.path)) as source,
@@ -591,6 +604,7 @@ class StateStore:
             archive_rows = session.exec(
                 select(ArchiveProgress).where(
                     col(ArchiveProgress.claimed_at).is_not(None)
+                    | col(ArchiveProgress.maintenance_token).is_not(None)
                 )
             ).all()
             for progress in archive_rows:
@@ -603,6 +617,7 @@ class StateStore:
                         "process stopped while webpage submission outcome was uncertain"
                     )
                 progress.claimed_at = None
+                progress.maintenance_token = None
                 progress.reserved_bytes = 0
                 progress.retry_at = None
                 progress.updated_at = utcnow()
@@ -655,6 +670,9 @@ class StateStore:
         minimum_free_bytes: int = 0,
         buffer: int = 2,
         unknown_download_bytes: int = 10_000_000_000,
+        download_root: Path | None = None,
+        dispatch_class: str | None = None,
+        pause_fresh_downloads: bool = False,
     ) -> ArchiveWork | None:
         """Atomically claim due transfer work within its reserved worker lane."""
         current = now or utcnow()
@@ -735,6 +753,7 @@ class StateStore:
                     col(ArchiveProgress.status).in_(stages),
                     col(ArchiveProgress.media_uploaded_at).is_(None),
                     col(ArchiveProgress.claimed_at).is_(None),
+                    col(ArchiveProgress.maintenance_token).is_(None),
                     col(ArchiveProgress.retry_at).is_(None)
                     | (col(ArchiveProgress.retry_at) <= current),
                 )
@@ -745,7 +764,7 @@ class StateStore:
                 )
             statement = statement.order_by(*queue_order)
             rows = (
-                session.exec(statement).all()
+                list(session.exec(statement).all())
                 if lane == "download"
                 else (
                     [row]
@@ -754,9 +773,51 @@ class StateStore:
                 )
             )
             selected = None
+            inventories = {
+                progress.video_id: inventory_inputs(
+                    Path(progress.working_directory), progress.operation_id, video.id
+                )
+                for progress, video, _ in rows
+                if lane == "download"
+                and download_root is not None
+                and progress.working_directory
+                and progress.operation_id
+                and Path(progress.working_directory).parent.resolve()
+                == download_root.resolve()
+            }
+            if lane == "download" and dispatch_class:
+
+                def priority(row: Any) -> tuple[int, datetime, str]:
+                    progress, video, _ = row
+                    inventory = inventories.get(video.id)
+                    category = (
+                        "recent"
+                        if video.notification_candidate
+                        else "resume"
+                        if inventory and inventory.reusable_bytes
+                        else "backfill"
+                    )
+                    order = [
+                        dispatch_class,
+                        *(
+                            kind
+                            for kind in ("recent", "resume", "backfill")
+                            if kind != dispatch_class
+                        ),
+                    ]
+                    return order.index(category), progress.updated_at, video.id
+
+                rows.sort(key=priority)
             for progress, video, channel in rows:
                 reservation = 0
                 if lane == "download":
+                    if pause_fresh_downloads and not (
+                        video.id in inventories and inventories[video.id].reusable_bytes
+                    ):
+                        self.download_pause_reason = (
+                            "protected partials exceed retention target"
+                        )
+                        continue
                     metadata = json.loads(progress.frozen_metadata or "{}")
                     reservation = download_reservation(
                         max(
@@ -764,7 +825,10 @@ class StateStore:
                             or metadata.get("estimated_bytes")
                             or unknown_download_bytes,
                             1,
-                        )
+                        ),
+                        inventories[video.id].reusable_bytes
+                        if video.id in inventories
+                        else 0,
                     )
                     if (
                         free_bytes is None
@@ -805,6 +869,63 @@ class StateStore:
                 progress.status,
             )
             return ArchiveWork(progress=progress, video=video, channel=channel)
+
+    def staging_rows(self) -> list[ArchiveProgress]:
+        """Read detached operation facts for inventory and narrow maintenance."""
+        with Session(self.engine) as session:
+            rows = list(
+                session.exec(
+                    select(ArchiveProgress).where(
+                        col(ArchiveProgress.working_directory).is_not(None)
+                    )
+                ).all()
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def claim_partial_maintenance(self, video_id: str, operation_id: str) -> str | None:
+        """Exclude download claims while deleting one inactive operation's inputs."""
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            row = session.get(ArchiveProgress, video_id)
+            if (
+                row is None
+                or row.operation_id != operation_id
+                or row.status != "download"
+                or row.claimed_at
+                or row.maintenance_token
+                or row.media_uploaded_at
+                or row.download_completed_at
+            ):
+                return None
+            token = str(uuid4())
+            row.maintenance_token = token
+            row.claimed_at = utcnow()
+            session.add(row)
+            session.commit()
+            return token
+
+    def release_partial_maintenance(
+        self, video_id: str, token: str, *, error: str
+    ) -> None:
+        """Release maintenance without changing retry deadlines or attempt counts."""
+        with self._write_lock, Session(self.engine) as session:
+            row = session.get(ArchiveProgress, video_id)
+            if row is None or row.maintenance_token != token:
+                raise RuntimeError("partial maintenance claim changed")
+            row.maintenance_token = None
+            row.claimed_at = None
+            row.reserved_bytes = 0
+            row.last_error = error
+            if error.startswith("partial inputs evicted"):
+                row.failure_phase = "partial_evicted"
+                row.download_bytes = 0
+                row.download_progress_at = None
+                row.download_phase = None
+                row.merge_bytes = 0
+            session.add(row)
+            session.commit()
 
     @staticmethod
     def _queue_job(
@@ -1652,6 +1773,9 @@ class StateStore:
             )
         with self._write_lock, Session(self.engine) as session:
             if session.get(SchemaMigration, 2) is not None:
+                if session.get(SchemaMigration, 3) is None:
+                    session.add(SchemaMigration(version=3))
+                    session.commit()
                 return
             for progress in session.exec(select(ArchiveProgress)).all():
                 old_status = progress.status
@@ -1715,6 +1839,7 @@ class StateStore:
                 progress.reserved_bytes = 0
                 session.add(progress)
             session.add(SchemaMigration(version=2))
+            session.add(SchemaMigration(version=3))
             session.commit()
 
 
