@@ -51,9 +51,7 @@ For a separate staging disk, add its existing host directory as a third bind mou
 
 Compose's project `.env` supplies interpolation values; it does not automatically populate container environments. Give Saga its own `env_file`. In Arcane, remove Saga credentials and webhooks from project-wide injection so the PO-token provider receives only its own settings. Verify environment **key names** after recreating both services, without printing secret values. Confirm that Arcane and `docker compose config` resolve the same mounts, settings, and image references. Values with spaces, including cron schedules, belong on one line in `.env.saga`.
 
-CI publishes immutable `sha-<full-commit>` image tags. Resolve a tested tag to its digest before promotion, and record the prior and replacement digests, rendered configuration, snapshot path, queue totals, and deployment time. Roll back by selecting the recorded previous image and its configuration against compatible current state. [Recovery](RECOVERY.md) covers restoration when a database copy is needed.
-
-The audit's production values and deployment checks are collected in [the configuration handoff](OPERATIONS.md).
+CI publishes immutable `sha-<full-commit>` image tags. Resolve a tested tag to its digest before promotion, and record the prior and replacement digests, rendered configuration, snapshot path, queue totals, and deployment time. Roll back by selecting the recorded previous image and its configuration against compatible current state.
 
 ## Python
 
@@ -81,7 +79,7 @@ Saga reads `.env` and process variables, with process values taking precedence. 
 
 Saga creates online SQLite snapshots and checks each one with `PRAGMA quick_check`. By default, it runs daily at 7:00 AM, keeps seven backups, and stores them in `data/backups`. The schedule, timezone, location, and retention are configurable in `.env`.
 
-Local snapshots do not cover host loss. [Backup and recovery](RECOVERY.md) lists off-host inputs, freshness checks, restore rehearsals, and reconciliation when restoring older state.
+Local snapshots do not cover host loss.
 
 ## Configuration
 
