@@ -72,6 +72,8 @@ Saga reads `.env` and process variables, with process values taking precedence. 
 
 Saga creates online SQLite snapshots and checks each one with `PRAGMA quick_check`. By default, it runs daily at 7:00 AM, keeps seven backups, and stores them in `data/backups`. The schedule, timezone, location, and retention are configurable in `.env`.
 
+Local snapshots do not cover host loss. [Backup and recovery](RECOVERY.md) lists off-host inputs, freshness checks, restore rehearsals, and reconciliation when restoring older state.
+
 ## Configuration
 
 Each YouTube instance defines its channels, polling interval, and retry settings:
