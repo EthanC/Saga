@@ -207,6 +207,7 @@ class YouTubeClient:
         estimated_bytes: int | None,
         disk_guard: Callable[[int, int], None] | None = None,
         operation_id: str | None = None,
+        phase_hook: Callable[[str, int], None] | None = None,
     ) -> Path:
         """Resume a strict bestvideo+bestaudio download and return its MKV path."""
         directory.mkdir(parents=True, exist_ok=True)
@@ -276,9 +277,15 @@ class YouTubeClient:
                 expected, sum(value[1] for value in streams.values())
             ):
                 raise DiskSpaceError("insufficient space for temporary merge output")
+            if event.get("status") == "finished" and phase_hook:
+                phase_hook("stream_finished", 0)
 
         def before_merge(event: dict[str, Any]) -> None:
             if event.get("status") != "started":
+                if event.get("status") == "finished" and phase_hook:
+                    phase_hook(
+                        "merged", merging.stat().st_size if merging.exists() else 0
+                    )
                 return
             expected = max(
                 sum(value[0] for value in streams.values()), estimated_bytes or 0
@@ -290,6 +297,8 @@ class YouTubeClient:
                 directory
             ).free < minimum_free_bytes + download_reservation(expected, downloaded):
                 raise DiskSpaceError("insufficient space before merge")
+            if phase_hook:
+                phase_hook("merging", 0)
 
         options.update(
             {

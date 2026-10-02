@@ -1149,8 +1149,23 @@ class StateStore:
             session.add(timing)
             session.commit()
 
+    def other_download_reservations(self, video_id: str) -> int:
+        """Read other workers' conservative budgets without a write transaction."""
+        with Session(self.engine) as session:
+            return session.exec(
+                select(
+                    func.coalesce(func.sum(col(ArchiveProgress.reserved_bytes)), 0)
+                ).where(ArchiveProgress.video_id != video_id)
+            ).one()
+
     def guard_download_space(
-        self, video_id: str, expected: int, downloaded: int, free: int, minimum: int
+        self,
+        video_id: str,
+        expected: int,
+        downloaded: int,
+        free: int,
+        minimum: int,
+        **facts: Any,
     ) -> None:
         """Adjust a download/merge reservation as yt-dlp learns stream sizes."""
         with self._write_lock, Session(self.engine) as session:
@@ -1169,8 +1184,11 @@ class StateStore:
             permitted = free >= minimum + others + remaining
             if permitted:
                 progress.reserved_bytes = remaining
-            session.add(progress)
-            session.commit()
+            for name, value in facts.items():
+                setattr(progress, name, value)
+            if session.is_modified(progress):
+                session.add(progress)
+                session.commit()
             if not permitted:
                 from core.youtube import DiskSpaceError
 

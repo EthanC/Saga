@@ -115,6 +115,8 @@ If a connection is lost before acknowledgement, Saga retains staging and checks 
 
 ### Migrating an Existing Queue
 
+Download byte counts and shrinking reservations are durable checkpoints that can lag by five seconds. Disk headroom is checked on every callback using read-only reservation totals; an increased estimate receives an immediate transactional reservation check. Stream boundaries, merge boundaries, disk pauses, and claim release flush progress sooner. Completion receipts, upload acknowledgements, recovery outcomes, and cleanup transitions commit immediately. Repeated identical byte callbacks do not renew the last-progress timestamp.
+
 Partial inputs are inventoried by operation and selected format in `inputs.json`. Compatible legacy `media.f<format>.<ext>.part` files and downloader sidecars are renamed as a restart-safe set before resumption. Conflicting formats, symlinks, malformed sidecars, and unknown operations are retained with an inventory finding. No partial creates a download-completion receipt.
 
 The download cadence favors recent, resume, recent, then backfill work. Resume credit reduces only remaining input/merge allocations, not the free-space floor. Retention runs independently each minute. `SAGA_PARTIAL_RETENTION_MODE=observe` reports inactive candidates without deleting them; after a day of review, `enforce` can remove recognized inputs exceeding `SAGA_PARTIAL_MAX_BYTES` that have been inactive for `SAGA_PARTIAL_MIN_AGE`. Claimed, completed, upload-ready, uploading, and reconciliation work is protected. In enforcement mode, protected bytes above the target pause fresh downloads while resumable work and uploads continue.

@@ -14,7 +14,7 @@ from tests.test_partials import FORMATS, partial
 
 
 @pytest.mark.parametrize(
-    "case", ["guard", "plain", "disk", "identity", "merge_disk", "resume"]
+    "case", ["guard", "plain", "disk", "identity", "merge_disk", "resume", "no_phase"]
 )
 def test_selected_formats_and_merge_recheck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
@@ -50,6 +50,15 @@ def test_selected_formats_and_merge_recheck(
                     "requested_formats": [dict(FORMATS[0], filesize=4)],
                 }
             )
+            for hook in self.options["progress_hooks"]:
+                hook(
+                    {
+                        "status": "finished",
+                        "filename": str(directory / "merging.f315.webm"),
+                        "downloaded_bytes": 4,
+                        "total_bytes": 4,
+                    }
+                )
             for hook in self.options["postprocessor_hooks"]:
                 hook({"status": "finished"})
                 if case == "merge_disk":
@@ -69,6 +78,7 @@ def test_selected_formats_and_merge_recheck(
             "video",
             directory,
             operation_id="operation",
+            phase_hook=None if case == "no_phase" else lambda phase, size: None,
             minimum_free_bytes=0,
             estimated_bytes=4,
             disk_guard=(
@@ -87,7 +97,7 @@ def test_selected_formats_and_merge_recheck(
     else:
         assert run().exists()
     if case == "guard":
-        assert events == [(4, 0), (4, 0)]
+        assert events == [(4, 0), (4, 4), (4, 4)]
 
 
 @pytest.mark.parametrize(

@@ -39,6 +39,7 @@ from niquests import Session
 
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings
+from core.progress import DownloadCheckpoint
 from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
@@ -370,22 +371,24 @@ class ArchiveProcessor:
     def _download(self, work: ArchiveWork) -> None:
         frozen = _frozen(work)
         directory = _working_directory(work)
-        path = self.youtube.download_video(
-            work.video.id,
-            directory,
-            minimum_free_bytes=self.settings.minimum_free_bytes,
-            estimated_bytes=work.progress.download_estimated_bytes
-            or frozen.estimated_bytes
-            or self.settings.unknown_download_bytes,
-            disk_guard=lambda expected, downloaded: self.state.guard_download_space(
-                work.video.id,
-                expected,
-                downloaded,
-                shutil.disk_usage(directory).free,
-                self.settings.minimum_free_bytes,
-            ),
-            operation_id=frozen.operation_id,
+        checkpoint = DownloadCheckpoint(
+            self.state, work, directory, self.settings.minimum_free_bytes
         )
+        try:
+            path = self.youtube.download_video(
+                work.video.id,
+                directory,
+                minimum_free_bytes=self.settings.minimum_free_bytes,
+                estimated_bytes=work.progress.download_estimated_bytes
+                or frozen.estimated_bytes
+                or self.settings.unknown_download_bytes,
+                disk_guard=checkpoint.record,
+                phase_hook=checkpoint.boundary,
+                operation_id=frozen.operation_id,
+            )
+        except BaseException:
+            checkpoint.flush()
+            raise
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError("downloader did not produce nonempty media")
         self.state.update_archive(
@@ -401,6 +404,7 @@ class ArchiveProcessor:
             retry_attempts=0,
             failure_phase=None,
             last_error=None,
+            **checkpoint.facts(),
         )
 
     def _upload(self, work: ArchiveWork) -> None:
