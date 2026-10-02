@@ -146,6 +146,10 @@ Recent-work priority follows the durable notification-candidate flag, including 
 4. Verified historical successes become upload completions with their original verification timestamp. Their pending staging cleanup and capture jobs are scheduled independently. Interrupted uploads enter remote recovery using their saved file facts. Staging is deleted only after those originals are confirmed. Upload-ready rows with missing media return to downloading.
 5. Check `transfers.json`, the logs, and the next version 2 report as transfers resume. Keep the pre-migration backup and the pinned previous image until the queue and reclaimed staging have been checked.
 
+### Upload worker trial
+
+Keep one upload worker while deploying the audit fixes. After disk, resume, shutdown, and lane-health checks pass in production, record a representative one-worker baseline, then trial `SAGA_UPLOAD_WORKERS=2` on the same pinned image. Keep one download worker, buffer two, both aggregate rate limits at 100 MB/s, and the 25 GB staging floor. Compare acknowledged payload bytes per active wall-clock hour, retries/recovery, disk pauses, staging peaks, worker supply, and host contention. Keep two workers only if the measured gain reaches the proposed 20% target without more failures or floor violations. Otherwise return to one worker using the same image and bounded shutdown. Measure merge/process/cache peaks before a separate resource-limit trial.
+
 ## Webpage Capture
 
 Saga submits watch pages directly to the Internet Archive unless both [Ziggy](https://github.com/EthanC/Ziggy) variables are set. [Ziggy](https://github.com/EthanC/Ziggy) queues captures separately and does not require Internet Archive credentials:
