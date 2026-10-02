@@ -19,16 +19,16 @@ Saga archives YouTube channels with the Internet Archive and posts new uploads t
 
 ## Docker Compose
 
-Create the `config` and `data` directories. Copy `config.example.toml` to `config/config.toml` and `.env.example` to `.env`, then edit both files. Save this as `compose.yaml`:
+Create the `config` and `data` directories. Copy `config.example.toml` to `config/config.toml` and `.env.example` to `.env.saga`, then edit both files. Keep `.env.saga` private (`chmod 600 .env.saga`). Save this as `compose.yaml`, replacing the image placeholder with the digest of your tested release:
 
 ```yaml
 services:
   saga:
     container_name: saga
-    image: ghcr.io/ethanc/saga:latest
+    image: ghcr.io/ethanc/saga@sha256:<tested-release-digest>
     init: true
     env_file:
-      - .env
+      - .env.saga
     volumes:
       - ./config:/config:ro
       - ./data:/data
@@ -41,6 +41,12 @@ Start the container:
 ```console
 docker compose up -d
 ```
+
+For a separate staging disk, add its existing host directory as a third bind mount to `/data/downloads`, beneath the `/data` mount. Keep the config, database, and staging mappings in your private deployment record. Saga uses `/data/downloads` for downloads and merge space even when it is a different filesystem.
+
+Compose's project `.env` supplies interpolation values; it does not automatically populate container environments. Give Saga its own `env_file`. In Arcane, remove Saga credentials and webhooks from project-wide injection so the PO-token provider receives only its own settings. Verify environment **key names** after recreating both services, without printing secret values. Confirm that Arcane and `docker compose config` resolve the same mounts, settings, and image references. Values with spaces, including cron schedules, belong on one line in `.env.saga`.
+
+CI publishes immutable `sha-<full-commit>` image tags. Resolve a tested tag to its digest before promotion, and record the prior and replacement digests, rendered configuration, snapshot path, queue totals, and deployment time. Roll back by selecting the recorded previous image and its configuration against compatible current state. [Recovery](RECOVERY.md) covers restoration when a database copy is needed.
 
 ## Python
 
@@ -116,7 +122,7 @@ If a connection is lost before acknowledgement, Saga retains staging and checks 
 
    The command migrates an online SQLite snapshot twice, checks database integrity and foreign keys, and prints its path. It leaves the source database unchanged.
 3. Deploy the tested image pinned to its `sha-<full-commit>` tag or digest. Start one Saga instance against the original data directory. Startup applies the idempotent schema and queue migration under Saga's process lock.
-4. Verified historical successes become upload completions with their original verification timestamp. Their pending staging cleanup and capture jobs are scheduled independently. Interrupted uploads, including the stuck originals described in `PLAN.md`, enter remote recovery using their saved file facts. Staging is deleted only after those originals are confirmed. Upload-ready rows with missing media, including `0UCmCkIDANU`, return to downloading.
+4. Verified historical successes become upload completions with their original verification timestamp. Their pending staging cleanup and capture jobs are scheduled independently. Interrupted uploads enter remote recovery using their saved file facts. Staging is deleted only after those originals are confirmed. Upload-ready rows with missing media return to downloading.
 5. Check `transfers.json`, the logs, and the next version 2 report as transfers resume. Keep the pre-migration backup and the pinned previous image until the queue and reclaimed staging have been checked.
 
 ## Webpage Capture
@@ -144,7 +150,7 @@ services:
         condition: service_healthy
 
   saga-pot:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    image: brainicism/bgutil-ytdlp-pot-provider@sha256:<tested-provider-digest>
     init: true
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
