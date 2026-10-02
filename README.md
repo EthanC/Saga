@@ -115,6 +115,8 @@ If a connection is lost before acknowledgement, Saga retains staging and checks 
 
 ### Migrating an Existing Queue
 
+Recent-work priority follows the durable notification-candidate flag, including discoveries delayed for days. Recent metadata has its own allowance equal to the ready buffer; backfill metadata has twice that allowance. Due prepared downloads and claimed metadata consume their class's allowance. Retry-delayed and disk-blocked downloads do not. Metadata capacity does not bypass download disk or ready-buffer limits. Workers favor recent work for three successful claims, then favor backfill for one; empty polls do not spend a turn.
+
 1. Stop the old Saga instance and retain a consistent SQLite backup. The new version also creates `saga.sqlite.pre-upload-first.sqlite3` before changing a legacy schema.
 2. Rehearse with a consistent backup using the tested version:
 

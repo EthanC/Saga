@@ -820,7 +820,7 @@ def test_archive_loop_rotates_preference_and_handles_failure(
 
     asyncio.run(service._archive_loop(2))
 
-    assert state.preferences == [True, False]
+    assert state.preferences == [True, True]
 
 
 def test_wait_and_healthcheck_noop_paths(tmp_path: Path) -> None:

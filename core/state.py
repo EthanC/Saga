@@ -298,6 +298,7 @@ class StateStore:
         )
         self._write_lock = Lock()
         self.download_pause_reason: str | None = None
+        self.metadata_pause_reasons: dict[str, str | None] = {}
         event.listen(self.engine, "connect", _configure_sqlite)
         if "archiveprogress" in inspect(self.engine).get_table_names() and (
             "media_uploaded_at"
@@ -669,11 +670,7 @@ class StateStore:
                 else_=2,
             ),
             case((col(ArchiveProgress.failure_phase) == "disk", 1), else_=0),
-            *(
-                (case((col(Video.notification_candidate).is_(True), 0), else_=1),)
-                if prefer_recent
-                else ()
-            ),
+            case((col(Video.notification_candidate).is_(prefer_recent), 0), else_=1),
             col(ArchiveProgress.updated_at),
             col(ArchiveProgress.video_id),
         )
@@ -702,18 +699,33 @@ class StateStore:
                 ).one()
             else:
                 reserved = 0
-            if (
-                lane == "metadata"
-                and session.exec(
-                    select(func.count(col(ArchiveProgress.video_id))).where(
-                        ArchiveProgress.status == "download",
-                        col(ArchiveProgress.failure_phase).is_(None)
-                        | (ArchiveProgress.failure_phase != "disk"),
+            metadata_classes: list[bool] = []
+            if lane == "metadata":
+                for recent, allowance in ((True, buffer), (False, 2 * buffer)):
+                    supply = session.exec(
+                        select(func.count(col(ArchiveProgress.video_id)))
+                        .join(Video, col(ArchiveProgress.video_id) == col(Video.id))
+                        .where(
+                            col(Video.notification_candidate).is_(recent),
+                            (col(ArchiveProgress.status) == "metadata")
+                            & col(ArchiveProgress.claimed_at).is_not(None)
+                            | (col(ArchiveProgress.status) == "download")
+                            & (
+                                col(ArchiveProgress.retry_at).is_(None)
+                                | (col(ArchiveProgress.retry_at) <= current)
+                            )
+                            & (
+                                col(ArchiveProgress.failure_phase).is_(None)
+                                | (ArchiveProgress.failure_phase != "disk")
+                            ),
+                        )
+                    ).one()
+                    key = "recent" if recent else "backfill"
+                    self.metadata_pause_reasons[key] = (
+                        f"{key} metadata supply full" if supply >= allowance else None
                     )
-                ).one()
-                >= 2 * buffer
-            ):
-                return None
+                    if supply < allowance:
+                        metadata_classes.append(recent)
             statement = (
                 select(ArchiveProgress, Video, Channel)
                 .join(Video, col(ArchiveProgress.video_id) == col(Video.id))
@@ -726,6 +738,10 @@ class StateStore:
                     | (col(ArchiveProgress.retry_at) <= current),
                 )
             )
+            if lane == "metadata":
+                statement = statement.where(
+                    col(Video.notification_candidate).in_(metadata_classes)
+                )
             statement = statement.order_by(*queue_order)
             rows = (
                 session.exec(statement).all()

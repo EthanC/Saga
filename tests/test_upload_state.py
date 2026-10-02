@@ -18,6 +18,7 @@ from core.state import (
     Report,
     SchemaMigration,
     StateStore,
+    Video,
     utcnow,
 )
 from core.youtube import DiskSpaceError, YouTubeClient
@@ -177,6 +178,76 @@ def test_metadata_supply_is_bounded_but_ready_uploads_remain_claimable(
     # Files too large for the disk budget must not block metadata for later videos.
     metadata = store.claim_archive(lane="metadata", prefer_recent=False, buffer=2)
     assert metadata is not None and metadata.video.id == metadata_id
+    store.close()
+
+
+def test_recent_metadata_has_independent_atomic_allowance(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    video_id, _, _ = seed_upload(store, tmp_path)
+    with Session(store.engine) as session:
+        video = session.get(Video, video_id)
+        assert video is not None
+        channel_id = video.channel_id
+        for index in range(1400):
+            identifier = f"b{index:010d}"
+            session.add(Video(id=identifier, channel_id=channel_id, webpage_url="test"))
+            session.flush()
+            session.add(ArchiveProgress(video_id=identifier, status="download"))
+        for index, content_type in enumerate(("video", "short", "video")):
+            identifier = f"r{index:010d}"
+            session.add(
+                Video(
+                    id=identifier,
+                    channel_id=channel_id,
+                    webpage_url="test",
+                    notification_candidate=True,
+                    content_type=content_type,
+                )
+            )
+            session.flush()
+            session.add(ArchiveProgress(video_id=identifier))
+        session.commit()
+    other = StateStore(store.path)
+    with ThreadPoolExecutor(2) as workers:
+        claims = list(
+            workers.map(
+                lambda state: state.claim_archive(lane="metadata", prefer_recent=True),
+                (store, other),
+            )
+        )
+    assert {claim.video.content_type for claim in claims if claim} == {"video", "short"}
+    assert store.claim_archive(lane="metadata", prefer_recent=True) is None
+    assert store.metadata_pause_reasons == {
+        "recent": "recent metadata supply full",
+        "backfill": "backfill metadata supply full",
+    }
+    first = next(claim for claim in claims if claim)
+    store.update_archive(
+        first.video.id, status="download", release=True, retry_after=60
+    )
+    assert store.claim_archive(lane="metadata", prefer_recent=True) is not None
+    other.close()
+    store.close()
+
+
+def test_recent_disk_wait_does_not_block_metadata_and_backfill_gets_turn(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    recent, _, _ = seed_upload(store, tmp_path)
+    backfill, _, _ = seed_upload(store, tmp_path, "Backfill123")
+    with Session(store.engine) as session:
+        video = session.get(Video, recent)
+        assert video is not None
+        video.notification_candidate = True
+        session.add(video)
+        session.commit()
+    store.update_archive(recent, status="download", failure_phase="disk")
+    store.update_archive(backfill, status="metadata")
+    assert store.claim_archive(lane="metadata", prefer_recent=True, buffer=1)
+    store.update_archive(backfill, status="download", release=True)
+    claim = store.claim_archive(lane="download", prefer_recent=False, free_bytes=100)
+    assert claim is not None and claim.video.id == backfill
     store.close()
 
 

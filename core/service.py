@@ -477,12 +477,12 @@ class SagaService:
                 work = self.state.claim_background(
                     lane, max_attempts=self.settings.background_max_attempts
                 )
-            claim_count += 1
             if work is None:
                 async with self._work_changed:
                     with suppress(TimeoutError):
                         await asyncio.wait_for(self._work_changed.wait(), timeout=1)
                 continue
+            claim_count += 1
             logger.debug(
                 "Archive worker {} claimed video {}", worker_index, work.video.id
             )
