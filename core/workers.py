@@ -67,9 +67,10 @@ def _worker(
                 **options, download_limiter=limiter, stop_controller=controller
             )
             if method == "download_video":
-                kwargs["disk_guard"] = lambda *values: _rpc(
-                    connection, "disk_guard", values
-                )
+                if kwargs.pop("use_parent_guard", True):
+                    kwargs["disk_guard"] = lambda *values: _rpc(
+                        connection, "disk_guard", values
+                    )
                 kwargs["phase_hook"] = lambda *values: _rpc(
                     connection, "phase_hook", values
                 )

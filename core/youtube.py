@@ -24,7 +24,13 @@ from core.bandwidth import ByteLimiter, Limiter
 from core.config import ALL_CONTENT_TYPES, ContentType
 from core.logging import DownloaderLogger, redact_diagnostics
 from core.shutdown import StopController
-from core.staging import download_reservation, inventory_inputs, prepare_inputs
+from core.staging import (
+    StagingIdentityError,
+    completed_download_size,
+    download_reservation,
+    inventory_inputs,
+    prepare_inputs,
+)
 from core.state import DiscoveredVideo, ResolvedChannel
 from core.workers import run_managed
 
@@ -254,7 +260,7 @@ class YouTubeClient:
                     phase_hook(phase, amount)
 
             def probe() -> None:
-                path = directory / "merging.mkv"
+                path = directory / "merging.temp.mkv"
                 if merging_active and phase_hook and path.is_file():
                     phase_hook("merging", path.stat().st_size)
 
@@ -265,6 +271,7 @@ class YouTubeClient:
                     "minimum_free_bytes": minimum_free_bytes,
                     "estimated_bytes": estimated_bytes,
                     "operation_id": operation_id,
+                    "use_parent_guard": disk_guard is not None,
                 },
                 {
                     "disk_guard": disk_guard or (lambda *args: None),
@@ -272,22 +279,32 @@ class YouTubeClient:
                     "merge_probe": probe,
                 },
             )
+        if directory.is_symlink():
+            raise StagingIdentityError("symlink download operation directory")
         directory.mkdir(parents=True, exist_ok=True)
         output = directory / "media.mkv"
         marker = directory / "download.json"
-        if output.is_file() and marker.is_file():
-            try:
-                completed = json.loads(marker.read_text(encoding="utf-8"))
-            except ValueError, OSError:
-                completed = {}
-            if completed == {"video_id": video_id, "size": output.stat().st_size} and (
-                output.stat().st_size > 0
-            ):
-                return output
+        if any(
+            path.is_symlink()
+            for path in (
+                output,
+                marker,
+                directory / "merging.mkv",
+                directory / "merging.temp.mkv",
+                directory / "download.tmp",
+            )
+        ):
+            raise StagingIdentityError("symlink in download output or receipt")
+        if (
+            completed_download_size(directory, operation_id or directory.name, video_id)
+            is not None
+        ):
+            return output
         # A final filename without a completion receipt is not a completed download.
         output.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)
         merging = directory / "merging.mkv"
+        (directory / "merging.temp.mkv").unlink(missing_ok=True)
         if merging.exists():
             merging.unlink()
         # ffmpeg keeps both input streams while writing the merged output.
@@ -411,6 +428,7 @@ class YouTubeClient:
                         streams[str(path).removesuffix(".part")] = size, size
                 expected = max(
                     estimated_bytes or 0,
+                    inventory.reusable_bytes,
                     sum(
                         item.get("filesize") or item.get("filesize_approx") or 0
                         for item in selected
@@ -448,6 +466,36 @@ class YouTubeClient:
         temporary_marker.replace(marker)
         logger.info("Downloaded video {}", video_id)
         return output
+
+    def selected_formats(self, video_id: str) -> tuple[list[dict[str, Any]], int]:
+        """Resolve strict input identity for inactive partials without writing media."""
+        self.stop_controller.check()
+        if self.managed:
+            return self._managed("selected_formats", (video_id,), {})
+        options = {
+            **self._options(),
+            "noplaylist": True,
+            "format": "bestvideo+bestaudio",
+        }
+        try:
+            with _limited_downloader(
+                YoutubeDL, self.download_limiter, self.stop_controller
+            )(options) as downloader:
+                info: Any = downloader.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}", download=False
+                )
+        except DownloadError as error:
+            raise _classify_download_error(error) from error
+        if not isinstance(info, dict) or info.get("id") != video_id:
+            raise StagingIdentityError(
+                "selected video does not match partial operation"
+            )
+        selected = info.get("requested_formats") or [info]
+        expected = sum(
+            item.get("filesize") or item.get("filesize_approx") or 0
+            for item in selected
+        )
+        return selected, expected
 
     def _managed(
         self,

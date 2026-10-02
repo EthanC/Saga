@@ -103,7 +103,7 @@ def test_adoption_recovers_crash_between_moves(
     directory = tmp_path / "operation"
     directory.mkdir()
     for name in ("media.f315.webm.part", "media.f315.webm.ytdl"):
-        (directory / name).write_text('{"downloader":{}}')
+        (directory / name).write_text('{"downloader":{"current_fragment":{"index":2}}}')
     rename = Path.rename
     count = 0
 

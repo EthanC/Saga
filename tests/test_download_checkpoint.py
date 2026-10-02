@@ -79,6 +79,17 @@ def test_growth_is_immediate_and_external_depletion_does_not_wait(
     store.close()
 
 
+def test_growth_check_is_immediate_even_with_unused_durable_margin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, worker, _ = checkpoint(tmp_path, monkeypatch)
+    worker.record(10000, 9000)
+    worker.record(11000, 9000)
+    row = saved(store, worker.video_id)
+    assert row.download_estimated_bytes == 11000 and row.reserved_bytes == 13000
+    store.close()
+
+
 def test_merge_boundaries_and_output_growth_checkpoint_actual_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

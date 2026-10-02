@@ -1,4 +1,4 @@
-"""Rehearse the upload-first migration on a consistent SQLite snapshot."""
+"""Rehearse workflow migrations on a consistent SQLite snapshot."""
 
 import argparse
 import sqlite3

@@ -435,7 +435,7 @@ class ArchiveProcessor:
                 "Video {} phase {} attempt {} will retry in {:.0f}s: {}",
                 work.video.id,
                 stage,
-                work.progress.attempts,
+                work.job.attempts if work.job else work.progress.attempts,
                 delay,
                 _error_text(error),
             )
@@ -513,6 +513,9 @@ class ArchiveProcessor:
             raise
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError("downloader did not produce nonempty media")
+        facts = checkpoint.facts()
+        facts["download_phase"] = "complete"
+        facts["download_progress_at"] = utcnow()
         self.state.update_archive(
             work.video.id,
             status="upload",
@@ -526,7 +529,7 @@ class ArchiveProcessor:
             retry_attempts=0,
             failure_phase=None,
             last_error=None,
-            **checkpoint.facts(),
+            **facts,
         )
 
     def _upload(self, work: ArchiveWork) -> None:
@@ -556,6 +559,17 @@ class ArchiveProcessor:
         if path.stat().st_size != work.progress.media_size or path.stat().st_size == 0:
             raise LocalMediaChangedError(
                 "staging size changed after download completion"
+            )
+        directory = _working_directory(work)
+        if (
+            directory.is_symlink()
+            or directory.resolve().parent != self.download_root.resolve()
+            or directory.name != frozen.operation_id
+            or path.is_symlink()
+            or path.resolve().parent != directory.resolve()
+        ):
+            raise RecoveryConflictError(
+                "upload media is outside its owned staging operation"
             )
         self.state.update_archive(
             work.video.id,

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from cronsim import CronSim
 from loguru import logger
 
-from core.shutdown import StopController
+from core.shutdown import CooperativeStop, StopController
 
 if TYPE_CHECKING:
     from core.config import BackupSettings
@@ -144,6 +144,8 @@ async def run_backup_scheduler(
                 settings.retention_count,
                 **({"stop_controller": stop_controller} if stop_controller else {}),
             )
+        except CooperativeStop:
+            return
         except Exception:
             logger.exception("Database backup failed")
         else:

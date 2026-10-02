@@ -86,7 +86,11 @@ class SagaService:
         """Initialize durable state, run workers, and stop them cooperatively."""
         logger.info("Initializing Saga service")
         self._remove_healthcheck()
-        monitored = await self._initialize()
+        try:
+            monitored = await self._initialize()
+        except BaseException:
+            self.request_stop()
+            raise
         self.started_at = utcnow()
         self._channel_intervals = {item.channel.id: item.cooldown for item in monitored}
         self.state.reset_interrupted_claims(
@@ -137,7 +141,10 @@ class SagaService:
                     workers.create_task(
                         self._partial_maintenance_loop(), name="partial-maintenance"
                     )
-                await self.stop.wait()
+                try:
+                    await self.stop.wait()
+                finally:
+                    self.request_stop()
         finally:
             logger.debug("Worker group is stopping")
             self._remove_healthcheck()
@@ -279,6 +286,8 @@ class SagaService:
                 self._write_healthcheck()
             except asyncio.CancelledError:
                 raise
+            except CooperativeStop:
+                return
             except Exception:
                 logger.exception("Recent scan failed for {}", monitored.channel.title)
             await self._wait(monitored.cooldown)
@@ -328,6 +337,8 @@ class SagaService:
                 )
             except asyncio.CancelledError:
                 raise
+            except CooperativeStop:
+                return
             except Exception:
                 logger.exception("History reconciliation failed for {}", channel.title)
             await self._wait(21_600)
@@ -382,6 +393,8 @@ class SagaService:
                 details = self._youtube_request_sync(
                     self.youtube.video_metadata, retries, retry_delay, video.id
                 )
+            except CooperativeStop:
+                raise
             except Exception as error:
                 logger.warning(
                     "Could not resolve an exact publication time for {}: {}: {}",
@@ -614,8 +627,14 @@ class SagaService:
         while not self.stop.is_set():
             try:
                 self._partial_health = await asyncio.to_thread(
-                    maintain_partials, self.state, self.settings
+                    maintain_partials,
+                    self.state,
+                    self.settings,
+                    youtube=self.youtube,
+                    controller=self.stop_controller,
                 )
+            except CooperativeStop:
+                return
             except Exception:
                 logger.exception("Partial inventory maintenance failed")
             await self._wait(60)

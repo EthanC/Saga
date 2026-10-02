@@ -29,7 +29,7 @@ from sqlmodel import (
 )
 
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
-from core.staging import download_reservation, inventory_inputs
+from core.staging import completed_download_size, download_reservation, inventory_inputs
 
 
 def utcnow() -> datetime:
@@ -710,6 +710,7 @@ class StateStore:
                     select(func.count(col(ArchiveProgress.video_id))).where(
                         ArchiveProgress.status == "download",
                         col(ArchiveProgress.claimed_at).is_not(None),
+                        col(ArchiveProgress.maintenance_token).is_(None),
                     )
                 ).one()
                 if staged + active >= buffer:
@@ -789,16 +790,27 @@ class StateStore:
                 and Path(progress.working_directory).parent.resolve()
                 == download_root.resolve()
             }
+            completed = {
+                progress.video_id: completed_download_size(
+                    Path(progress.working_directory),
+                    progress.operation_id,
+                    progress.video_id,
+                )
+                for progress, _, _ in rows
+                if progress.video_id in inventories
+                and progress.working_directory
+                and progress.operation_id
+            }
             if lane == "download" and dispatch_class:
 
-                def priority(row: Any) -> tuple[int, datetime, str]:
+                def priority(row: Any) -> tuple[int, int, datetime, str]:
                     progress, video, _ = row
                     inventory = inventories.get(video.id)
                     category = (
                         "recent"
                         if video.notification_candidate
                         else "resume"
-                        if inventory and inventory.reusable_bytes
+                        if inventory and inventory.partial_bytes
                         else "backfill"
                     )
                     order = [
@@ -809,14 +821,24 @@ class StateStore:
                             if kind != dispatch_class
                         ),
                     ]
-                    return order.index(category), progress.updated_at, video.id
+                    return (
+                        int(completed.get(video.id) is None),
+                        order.index(category),
+                        progress.updated_at,
+                        video.id,
+                    )
 
                 rows.sort(key=priority)
             for progress, video, channel in rows:
                 reservation = 0
                 if lane == "download":
-                    if pause_fresh_downloads and not (
-                        video.id in inventories and inventories[video.id].reusable_bytes
+                    if (
+                        pause_fresh_downloads
+                        and completed.get(video.id) is None
+                        and not (
+                            video.id in inventories
+                            and inventories[video.id].reusable_bytes
+                        )
                     ):
                         self.download_pause_reason = (
                             "protected partials exceed retention target"
@@ -834,7 +856,9 @@ class StateStore:
                         if video.id in inventories
                         else 0,
                     )
-                    if (
+                    if completed.get(video.id) is not None:
+                        reservation = 0
+                    if reservation and (
                         free_bytes is None
                         or free_bytes < minimum_free_bytes + reserved + reservation
                     ):

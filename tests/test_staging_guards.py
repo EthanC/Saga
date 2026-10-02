@@ -23,7 +23,9 @@ def test_selected_formats_and_merge_recheck(
     if case == "resume":
         directory.mkdir()
         (directory / "media.f315.webm.part").write_bytes(b"part")
-        (directory / "media.f315.webm.ytdl").write_text('{"downloader":{}}')
+        (directory / "media.f315.webm.ytdl").write_text(
+            '{"downloader":{"current_fragment":{"index":2}}}'
+        )
     free = 100
     events: list[tuple[int, int]] = []
 

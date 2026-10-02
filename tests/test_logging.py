@@ -222,6 +222,26 @@ def test_diagnostics_redact_multiline_credentials_and_signed_urls() -> None:
     assert "example.com/media" in safe
 
 
+def test_versioned_webhooks_and_header_dictionaries_are_redacted() -> None:
+    message = (
+        "https://discord.com/api/v10/webhooks/123/webhook-secret?foo=query-secret\n"
+        "{'Cookie': 'SID=cookie-secret', 'Authorization': 'Bearer auth-secret'}\n"
+        'PO Token: generated-secret\n{"integrity_token":"integrity-secret"}'
+    )
+    safe = logging_config.redact_diagnostics(message)
+    assert all(
+        secret not in safe
+        for secret in (
+            "webhook-secret",
+            "query-secret",
+            "cookie-secret",
+            "auth-secret",
+            "generated-secret",
+            "integrity-secret",
+        )
+    )
+
+
 def test_downloader_diagnostics_are_deduplicated_and_excluded_from_discord(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

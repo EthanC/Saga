@@ -53,7 +53,8 @@ class DownloadCheckpoint:
     def record(self, expected: int, downloaded: int, *, force: bool = False) -> None:
         if downloaded > self.downloaded:
             self.progress_at = utcnow()
-        self.expected = max(expected, self.expected)
+        estimate_grew = max(expected, downloaded) > self.expected
+        self.expected = max(expected, downloaded, self.expected)
         self.downloaded = downloaded
         required = (
             max(self.expected - self.merge_bytes, 0)
@@ -64,6 +65,7 @@ class DownloadCheckpoint:
         others = self.state.other_download_reservations(self.video_id)
         checkpoint = (
             force
+            or estimate_grew
             or required > self.allowance
             or self.clock() - self.last_checkpoint >= CHECKPOINT_INTERVAL
         )

@@ -4,9 +4,11 @@ import json
 import re
 import time
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from core.logging import redact_diagnostics
 
 INPUT_PATTERN = re.compile(
     r"(?:media|merging)\.f([\w-]+)\.([a-z0-9]+)(?:\.part(?:-Frag\d+)?)?(?:\.ytdl)?$"
@@ -55,6 +57,38 @@ def _document(path: Path) -> dict[str, Any]:
     return value
 
 
+def _valid_sidecar(path: Path) -> bool:
+    downloader = _document(path).get("downloader")
+    fragment = (
+        downloader.get("current_fragment") if isinstance(downloader, dict) else None
+    )
+    index = fragment.get("index") if isinstance(fragment, dict) else None
+    return isinstance(index, int) and not isinstance(index, bool) and index >= 0
+
+
+def completed_download_size(
+    directory: Path, operation_id: str, video_id: str
+) -> int | None:
+    """Recognize an atomic native receipt without granting unreceipted MKV credit."""
+    if directory.name != operation_id or directory.is_symlink():
+        return None
+    media = directory / "media.mkv"
+    try:
+        if media.is_symlink() or not media.is_file():
+            return None
+        size = media.stat().st_size
+        receipt = _document(directory / "download.json")
+        return (
+            size
+            if size > 0
+            and type(receipt.get("size")) is int
+            and receipt == {"video_id": video_id, "size": size}
+            else None
+        )
+    except OSError, ValueError:
+        return None
+
+
 def inventory_inputs(
     directory: Path, operation_id: str, video_id: str
 ) -> PartialInventory:
@@ -94,10 +128,8 @@ def inventory_inputs(
                 raise ValueError("symlink or nonregular input")
             if match[1] not in formats or formats[match[1]].get("ext") != match[2]:
                 raise ValueError("selected format mismatch")
-            if path.name.endswith(".ytdl"):
-                sidecar = _document(path)
-                if not isinstance(sidecar.get("downloader"), dict):
-                    raise ValueError("malformed downloader sidecar")
+            if path.name.endswith(".ytdl") and not _valid_sidecar(path):
+                raise ValueError("malformed downloader sidecar")
             stat = path.stat()
             files.append(path)
             partial += stat.st_size
@@ -166,7 +198,7 @@ def prepare_inputs(
             raise StagingIdentityError("legacy selected format mismatch")
         if path.name.endswith(".ytdl"):
             try:
-                if not isinstance(_document(path).get("downloader"), dict):
+                if not _valid_sidecar(path):
                     raise ValueError("missing downloader state")
             except (OSError, ValueError) as error:
                 raise StagingIdentityError("malformed downloader sidecar") from error
@@ -187,7 +219,12 @@ def prepare_inputs(
 
 
 def maintain_partials(
-    state: Any, settings: Any, *, now: float | None = None
+    state: Any,
+    settings: Any,
+    *,
+    now: float | None = None,
+    youtube: Any = None,
+    controller: Any = None,
 ) -> dict[str, Any]:
     """Observe or reclaim only owned inactive retryable inputs above the target."""
     current = time.time() if now is None else now
@@ -198,6 +235,8 @@ def maintain_partials(
     findings: list[dict[str, Any]] = []
     inactive = 0
     for row in rows:
+        if controller:
+            controller.check()
         directory = Path(row.working_directory)
         if directory.parent.resolve() != root or not row.operation_id:
             findings.append(
@@ -205,7 +244,73 @@ def maintain_partials(
             )
             continue
         known.add(directory.name)
+        if (
+            completed_download_size(directory, row.operation_id, row.video_id)
+            is not None
+        ):
+            continue
         inventory = inventory_inputs(directory, row.operation_id, row.video_id)
+        if (
+            youtube
+            and inventory.partial_bytes
+            and inventory.finding == "input inventory changed or manifest absent"
+            and row.status == "download"
+            and not row.claimed_at
+            and not row.download_completed_at
+            and (
+                not row.retry_at
+                or row.retry_at.replace(tzinfo=UTC).timestamp() <= current
+            )
+        ):
+            token = state.claim_partial_maintenance(row.video_id, row.operation_id)
+            if token:
+                outcome = "partial inputs validated; resumption eligible"
+                try:
+                    contract = json.loads(row.frozen_metadata or "{}")
+                    if not isinstance(contract, dict) or any(
+                        contract.get(key) != value
+                        for key, value in (
+                            ("operation_id", row.operation_id),
+                            ("identifier", row.ia_identifier),
+                            ("media_name", row.media_name),
+                            (
+                                "source_url",
+                                f"https://www.youtube.com/watch?v={row.video_id}",
+                            ),
+                        )
+                    ):
+                        raise StagingIdentityError("unknown partial operation contract")
+                    selected, expected = youtube.selected_formats(row.video_id)
+                    if controller:
+                        controller.check()
+                    inventory = prepare_inputs(
+                        directory, row.operation_id, row.video_id, selected
+                    )
+                    state.update_archive(
+                        row.video_id,
+                        download_estimated_bytes=max(
+                            row.download_estimated_bytes or 0,
+                            expected,
+                            contract.get("estimated_bytes") or 0,
+                        ),
+                    )
+                    # Fresh validation protects just-adopted inputs from eviction.
+                    row.updated_at = datetime.fromtimestamp(current, UTC)
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                ) as error:
+                    outcome = redact_diagnostics(
+                        f"partial adoption failed: {type(error).__name__}: {error}"
+                    )
+                    findings.append({"video_id": row.video_id, "reason": outcome})
+                finally:
+                    state.release_partial_maintenance(
+                        row.video_id, token, error=outcome
+                    )
         if inventory.finding:
             findings.append({"video_id": row.video_id, "reason": inventory.finding})
         if (

@@ -134,6 +134,34 @@ def test_remote_callback_error_propagates_as_typed_stop() -> None:
         workers.RemoteLimiter(cast(Any, connection), True, 64).acquire(10)
 
 
+def test_managed_download_without_parent_guard_keeps_native_space_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = Connection()
+    monkeypatch.setattr(logging_module, "configure_logging", lambda settings: None)
+
+    def download(*args: Any, **kwargs: Any) -> str:
+        assert "disk_guard" not in kwargs
+        kwargs["phase_hook"]("merging", 0)
+        return "native guard"
+
+    monkeypatch.setattr(
+        youtube,
+        "YouTubeClient",
+        lambda **kwargs: SimpleNamespace(download_video=download),
+    )
+    workers._worker(
+        cast(Any, connection),
+        Event(),
+        "youtube",
+        "download_video",
+        {},
+        (),
+        {"use_parent_guard": False},
+    )
+    assert connection.messages[-1] == ("result", "native guard")
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -254,7 +282,7 @@ def test_managed_youtube_dispatch_and_merge_probe(
         if method == "download_video":
             callbacks["merge_probe"]()
             callbacks["phase_hook"]("merging", 0)
-            (tmp_path / "merging.mkv").write_bytes(b"merge")
+            (tmp_path / "merging.temp.mkv").write_bytes(b"merge")
             callbacks["merge_probe"]()
             callbacks["phase_hook"]("merged", 5)
         return "result"

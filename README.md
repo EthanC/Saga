@@ -53,6 +53,8 @@ Compose's project `.env` supplies interpolation values; it does not automaticall
 
 CI publishes immutable `sha-<full-commit>` image tags. Resolve a tested tag to its digest before promotion, and record the prior and replacement digests, rendered configuration, snapshot path, queue totals, and deployment time. Roll back by selecting the recorded previous image and its configuration against compatible current state. [Recovery](RECOVERY.md) covers restoration when a database copy is needed.
 
+The audit's production values and deployment checks are collected in [the configuration handoff](OPERATIONS.md).
+
 ## Python
 
 Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then install the dependencies:
@@ -60,6 +62,8 @@ Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then
 ```console
 uv sync
 ```
+
+When upgrading from an environment where urllib3.future replaced urllib3, create a fresh virtual environment before syncing. The repository now builds separate transport namespaces; a build flag cannot change an already-installed wheel. Docker builds use the source-build recipe automatically, with no runtime transport variable to set.
 
 Create `config`, copy the example files to `config/config.toml` and `.env`, then run Saga:
 

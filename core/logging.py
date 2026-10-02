@@ -19,7 +19,7 @@ from core.shutdown import StopController
 
 DISCORD_WEBHOOK_PATTERN = re.compile(
     r"(?:https://(?:(?:www|canary|ptb)\.)?discord\.com)?"
-    r"/api/webhooks/\d+/[A-Za-z0-9._-]+",
+    r"/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9._-]+(?:[?#][^\s\"'<>]*)?",
     re.IGNORECASE,
 )
 DISCORD_MESSAGE_LIMIT = 1800
@@ -29,7 +29,10 @@ HEADER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 TOKEN_PATTERN = re.compile(
-    r"([\"']?(?:po_?token|integrityToken|websafeFallbackToken|access_token|refresh_token|password|s3accesskey|s3secretkey)[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\r\n]+)",
+    r"([\"']?\b(?:po[ _-]?token|integrity[_-]?token|websafeFallbackToken|"
+    r"access[_-]?token|refresh[_-]?token|token|password|s3accesskey|s3secretkey|"
+    r"authorization|proxy[_-]?authorization|cookies?|set[_-]?cookie)"
+    r"[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\r\n]+)",
     re.IGNORECASE,
 )
 _DIAGNOSTICS: OrderedDict[str, float] = OrderedDict()
