@@ -179,8 +179,9 @@ def test_service_clears_previous_heartbeat_before_initializing(
 
     monkeypatch.setattr(service, "_initialize", initialize)
     try:
-        with pytest.raises(RuntimeError, match="initialization failed"):
+        with pytest.raises(ExceptionGroup) as caught:
             asyncio.run(service.run())
+        assert caught.value.subgroup(RuntimeError) is not None
         assert not heartbeat.exists()
     finally:
         state.close()

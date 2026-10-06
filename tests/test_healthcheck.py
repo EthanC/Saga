@@ -1,138 +1,112 @@
+import json
 import os
 import runpy
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from core import healthcheck
-from core.config import YouTubeConfig
 
 
 @pytest.mark.parametrize(
-    ("cooldown", "age", "expected"),
-    [
-        (60, None, False),
-        (60, -1, False),
-        (60, 0, True),
-        (60, 300, True),
-        (60, 301, False),
-        (600, 1500, True),
-        (600, 1800, True),
-        (600, 1801, False),
-    ],
+    ("age", "expected"),
+    [(None, False), (-1, False), (0, True), (120, True), (121, False)],
 )
-def test_healthcheck_respects_heartbeat_age_and_polling_schedule(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    cooldown: float,
-    age: float | None,
-    expected: bool,
+def test_healthcheck_requires_a_fresh_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age: float | None, expected: bool
 ) -> None:
     now = 1_800_000_000.0
     path = tmp_path / "custom-heartbeat"
     if age is not None:
-        path.touch()
-        os.utime(path, (now - age, now - age))
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "healthy": True,
+                    "generated_at": datetime.fromtimestamp(now - age, UTC).isoformat(),
+                }
+            )
+        )
+        os.utime(path, (now, now))
     monkeypatch.setattr(healthcheck.time, "time", lambda: now)
-    monkeypatch.setattr(
-        healthcheck,
-        "load_settings",
-        lambda _: SimpleNamespace(
-            healthcheck_file=path,
-            config_path=tmp_path,
-            data_path=tmp_path,
-            archival_enabled=False,
-        ),
-    )
-    monkeypatch.setattr(
-        healthcheck,
-        "load_youtube_configs",
-        lambda _: (
-            YouTubeConfig("fast", (), cooldown=1),
-            YouTubeConfig("slow", (), cooldown=cooldown),
-        ),
-    )
-
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(path))
     assert healthcheck.is_healthy(tmp_path) is expected
 
 
-@pytest.mark.parametrize("error", [ValueError("invalid config"), OSError("unreadable")])
-def test_healthcheck_rejects_unreadable_or_invalid_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+@pytest.mark.parametrize("payload", ["", "bad", "[]", "{}", '{"version":2}'])
+def test_healthcheck_rejects_malformed_and_legacy_heartbeats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str
 ) -> None:
-    def load(_: Path) -> None:
-        raise error
-
-    monkeypatch.setattr(healthcheck, "load_settings", load)
-
+    path = tmp_path / "healthy"
+    path.write_text(payload)
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(path))
     assert not healthcheck.is_healthy(tmp_path)
 
 
-def test_healthcheck_without_a_heartbeat_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("healthy", [True, False])
+def test_probe_entrypoint_returns_the_service_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, healthy: bool
 ) -> None:
-    monkeypatch.setattr(
-        healthcheck, "load_settings", lambda _: SimpleNamespace(healthcheck_file=None)
+    path = tmp_path / "healthy"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "healthy": healthy,
+                "generated_at": datetime.now(UTC).isoformat(),
+            }
+        )
     )
-
-    assert not healthcheck.is_healthy(tmp_path)
-
-
-def test_probe_entrypoint_fails_without_a_heartbeat(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(
-        "core.config.load_settings",
-        lambda _: SimpleNamespace(healthcheck_file=tmp_path / "missing"),
-    )
-
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(path))
     with pytest.raises(SystemExit) as caught:
         runpy.run_path(healthcheck.__file__, run_name="__main__")
+    assert caught.value.code == (0 if healthy else 1)
 
-    assert caught.value.code == 1
+
+def test_probe_honors_native_dotenv_and_process_path_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SAGA_HEALTHCHECK_FILE", raising=False)
+    monkeypatch.delenv("SAGA_DATA_PATH", raising=False)
+    assert healthcheck.heartbeat_path(tmp_path) == tmp_path / "data" / "healthy"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("SAGA_DATA_PATH=storage\n")
+    assert healthcheck.heartbeat_path(tmp_path) == tmp_path / "storage" / "healthy"
+    monkeypatch.setenv("SAGA_DATA_PATH", "override")
+    assert healthcheck.heartbeat_path(tmp_path) == tmp_path / "override" / "healthy"
+    dotenv.write_text("SAGA_HEALTHCHECK_FILE='health snapshot'\n")
+    assert healthcheck.heartbeat_path(tmp_path) == tmp_path / "health snapshot"
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(tmp_path / "process"))
+    assert healthcheck.heartbeat_path(tmp_path) == tmp_path / "process"
 
 
 @pytest.mark.parametrize("age", [0, 3600])
-def test_container_probe_exit_status(tmp_path: Path, age: int) -> None:
-    config = tmp_path / "config.toml"
-    config.write_text(
-        '[[instances.youtube]]\nname = "primary"\n'
-        '[[instances.youtube.channels]]\nreference = "@channel"\n'
-        'discord_webhook_urls = ["https://discord.com/api/webhooks/1/token"]\n',
-        encoding="utf-8",
-    )
+def test_container_probe_needs_only_the_standard_library(
+    tmp_path: Path, age: int
+) -> None:
     heartbeat = tmp_path / "custom-heartbeat"
-    heartbeat.touch()
-    (tmp_path / "transfers.json").write_text('{"healthy": true}', encoding="utf-8")
-    timestamp = time.time() - age
-    os.utime(heartbeat, (timestamp, timestamp))
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("SAGA_", "INTERNET_ARCHIVE_", "ZIGGY_"))
-        and key
-        not in {"YOUTUBE_COOKIES_PATH", "DISCORD_TIMEOUT", "REPORT_DISCORD_WEBHOOK_URL"}
-    }
-    environment.update(
-        SAGA_CONFIG_PATH=str(config),
-        SAGA_DATA_PATH=str(tmp_path),
-        SAGA_HEALTHCHECK_FILE=str(heartbeat),
-        INTERNET_ARCHIVE_EMAIL="user@example.com",
-        INTERNET_ARCHIVE_PASSWORD="password",
+    heartbeat.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "healthy": True,
+                "generated_at": datetime.fromtimestamp(
+                    time.time() - age, UTC
+                ).isoformat(),
+            }
+        )
     )
-
     result = subprocess.run(
-        [sys.executable, "-B", "-m", "core.healthcheck"],
+        [sys.executable, "-S", "-B", "-m", "core.healthcheck"],
         cwd=Path(__file__).resolve().parents[1],
-        env=environment,
+        env={**os.environ, "SAGA_HEALTHCHECK_FILE": str(heartbeat)},
         capture_output=True,
         text=True,
         timeout=5,
         check=False,
     )
-
     assert result.returncode == (0 if age == 0 else 1), result.stderr

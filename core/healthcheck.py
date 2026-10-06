@@ -1,42 +1,42 @@
-"""Check that channel polling has produced a recent heartbeat."""
+"""Read the service's health verdict without loading application dependencies."""
 
 import json
+import os
 import time
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
-from core.config import load_settings, load_youtube_configs
+MAXIMUM_AGE = 120
+
+
+def heartbeat_path(project_root: Path) -> Path:
+    """Honor process overrides and native installations' dotenv paths."""
+    value = os.environ.get("SAGA_HEALTHCHECK_FILE")
+    if value is None:
+        from dotenv import dotenv_values
+
+        values = {**dotenv_values(project_root / ".env"), **os.environ}
+        value = values.get("SAGA_HEALTHCHECK_FILE")
+        if value is None:
+            value = str(Path(values.get("SAGA_DATA_PATH") or "data") / "healthy")
+    return project_root / value
 
 
 def is_healthy(project_root: Path) -> bool:
-    """Allow three polling intervals, with at least five minutes for slow scans."""
+    """Reject missing, malformed, stale, or unhealthy service snapshots."""
     try:
-        settings = load_settings(project_root)
-        path = settings.healthcheck_file
-        if path is None or not path.is_file():
+        path = heartbeat_path(project_root)
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("version") != 1:
             return False
-        configurations = load_youtube_configs(settings.config_path)
-        maximum_age = max(300.0, 3 * max(item.cooldown for item in configurations))
-        age = time.time() - path.stat().st_mtime
-        if not 0 <= age <= maximum_age:
-            return False
-        transfer_path = settings.data_path / "transfers.json"
-        if settings.archival_enabled:
-            if (
-                not transfer_path.is_file()
-                or time.time() - transfer_path.stat().st_mtime > 120
-            ):
-                return False
-            document = json.loads(transfer_path.read_text(encoding="utf-8"))
-            if isinstance(document, dict) and document.get("version") == 2:
-                stamp = datetime.fromisoformat(document["generated_at"])
-                if (
-                    stamp.tzinfo is None
-                    or not 0 <= (datetime.now(UTC) - stamp).total_seconds() <= 120
-                ):
-                    return False
-            return isinstance(document, dict) and document.get("healthy") is True
-        return True
+        stamp = datetime.fromisoformat(document["generated_at"])
+        now = time.time()
+        return (
+            document.get("healthy") is True
+            and stamp.tzinfo is not None
+            and 0 <= now - stamp.timestamp() <= MAXIMUM_AGE
+            and 0 <= now - path.stat().st_mtime <= MAXIMUM_AGE
+        )
     except OSError, ValueError, KeyError, TypeError:
         return False
 

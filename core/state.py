@@ -95,6 +95,7 @@ class Video(SQLModel, table=True):
     notification_eligible: bool = Field(default=False, index=True)
     notification_silent: bool = False
     notification_ambiguous: bool = False
+    publication_retry_at: datetime | None = None
     webpage_url: str
 
 
@@ -592,6 +593,50 @@ class StateStore:
                 and not video.notification_eligible
             }
             return set(identifiers) - known_ids | ambiguous
+
+    def claim_publication(
+        self, channel_ids: Iterable[str], *, now: datetime | None = None
+    ) -> tuple[str, DiscoveredVideo] | None:
+        """Reserve one unresolved notification timestamp for the metadata worker.
+
+        New discoveries take precedence over retries. Persisting the retry time
+        prevents inaccessible videos from occupying the worker after a restart.
+        """
+        current = now or utcnow()
+        with self._write_lock, Session(self.engine) as session:
+            video = session.exec(
+                select(Video)
+                .where(
+                    col(Video.channel_id).in_(tuple(channel_ids)),
+                    col(Video.notification_ambiguous).is_(True),
+                    col(Video.notification_silent).is_(False),
+                    col(Video.notification_eligible).is_(False),
+                    col(Video.publication_retry_at).is_(None)
+                    | (col(Video.publication_retry_at) <= current),
+                )
+                .order_by(
+                    col(Video.publication_retry_at).is_not(None),
+                    col(Video.discovered_at).desc(),
+                    col(Video.id),
+                )
+                .limit(1)
+            ).first()
+            if video is None:
+                return None
+            video.publication_retry_at = current + timedelta(minutes=5)
+            session.add(video)
+            session.commit()
+            return video.channel_id, DiscoveredVideo(
+                id=video.id,
+                title=video.title,
+                published_at=_as_utc(video.published_at)
+                if video.published_at
+                else None,
+                live_status=video.live_status,
+                replay_ready=video.replay_ready,
+                published_precise=False,
+                content_type=cast(ContentType, video.content_type),
+            )
 
     def reset_interrupted_claims(self, *, background_deadline: float = 86_400) -> None:
         """Return work interrupted by a prior process to safe persisted stages."""
@@ -1554,6 +1599,7 @@ class StateStore:
         upload_workers: int = 1,
         download_workers: int = 1,
         channel_intervals: dict[str, float] | None = None,
+        include_archive: bool = True,
     ) -> dict[str, Any]:
         """Measure progress, due age, and backpressure independently across lanes."""
         from core.pipeline_health import build_pipeline_health
@@ -1568,8 +1614,8 @@ class StateStore:
                 ).all()
             )
             health = build_pipeline_health(
-                rows,
-                list(session.exec(select(ArchiveJob)).all()),
+                rows if include_archive else [],
+                list(session.exec(select(ArchiveJob)).all()) if include_archive else [],
                 now=current,
                 started_at=started_at or self.health_started_at,
                 stall_timeout=stall_timeout,
@@ -1841,6 +1887,10 @@ class StateStore:
             statements.append(
                 "ALTER TABLE video ADD COLUMN content_type VARCHAR NOT NULL "
                 "DEFAULT 'video'"
+            )
+        if "publication_retry_at" not in video_columns:
+            statements.append(
+                "ALTER TABLE video ADD COLUMN publication_retry_at DATETIME"
             )
         if "schedule" not in report_checkpoint_columns:
             statements.append(

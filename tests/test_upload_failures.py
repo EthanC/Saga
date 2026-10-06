@@ -21,7 +21,6 @@ from sqlmodel import Session
 
 from core import archival, healthcheck, migration, service, youtube
 from core.archival import ArchiveProcessor, inspect_item
-from core.config import YouTubeConfig
 from core.state import ArchiveJob, StateStore, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
 from tests.test_archival import (
@@ -208,31 +207,20 @@ def test_transient_upload_preflight_errors_retry_without_recovery(
 @pytest.mark.parametrize(
     "payload", [None, "stale", "[]", "bad", '{"healthy":false}', '{"healthy":true}']
 )
-def test_healthcheck_requires_recent_transfer_progress(
+def test_healthcheck_requires_a_current_service_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str | None
 ) -> None:
     heartbeat = tmp_path / "healthy"
-    heartbeat.touch()
-    transfer = tmp_path / "transfers.json"
     if payload:
-        transfer.write_text(
-            '{"healthy":true}' if payload == "stale" else payload, encoding="utf-8"
-        )
+        document = '{"healthy":true}' if payload == "stale" else payload
+        if document.startswith("{"):
+            value = json.loads(document)
+            value.update(version=1, generated_at=utcnow().isoformat())
+            document = json.dumps(value)
+        heartbeat.write_text(document, encoding="utf-8")
         if payload == "stale":
-            os.utime(transfer, (1, 1))
-    monkeypatch.setattr(
-        healthcheck,
-        "load_settings",
-        lambda _: SimpleNamespace(
-            healthcheck_file=heartbeat,
-            config_path=tmp_path,
-            data_path=tmp_path,
-            archival_enabled=True,
-        ),
-    )
-    monkeypatch.setattr(
-        healthcheck, "load_youtube_configs", lambda _: (YouTubeConfig("example", ()),)
-    )
+            os.utime(heartbeat, (1, 1))
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(heartbeat))
     assert healthcheck.is_healthy(tmp_path) == (payload == '{"healthy":true}')
 
 
@@ -250,13 +238,14 @@ def test_transfer_health_publishes_stalls_and_survives_cleanup_race(
         saga.request_stop()
 
     monkeypatch.setattr(saga, "_wait", wait)
-    asyncio.run(saga._transfer_health_loop())
+    saga._staging_bytes = service.staging_usage(saga.settings.download_root)
+    asyncio.run(saga._health_loop())
     health = json.loads((tmp_path / "transfers.json").read_text(encoding="utf-8"))
     assert not health["healthy"] and health["staging_bytes"] == 4
     state.update_archive(video_id, ready_at=utcnow())
     saga = service.SagaService(settings(tmp_path), (), state, youtube.YouTubeClient())
     monkeypatch.setattr(saga, "_wait", wait)
-    asyncio.run(saga._transfer_health_loop())
+    asyncio.run(saga._health_loop())
     assert json.loads((tmp_path / "transfers.json").read_text())["healthy"]
     gone = SimpleNamespace(
         is_file=lambda: True, stat=lambda: (_ for _ in ()).throw(FileNotFoundError())

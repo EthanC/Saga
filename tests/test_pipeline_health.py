@@ -301,7 +301,7 @@ def test_interrupted_health_publication_keeps_previous_document(
 
     monkeypatch.setattr(Path, "replace", replace)
     monkeypatch.setattr(saga, "_wait", wait)
-    asyncio.run(saga._transfer_health_loop())
+    asyncio.run(saga._health_loop())
     assert calls == 1 and "publisher" in saga._health_alerts
     state.close()
 
@@ -313,9 +313,8 @@ def test_versioned_health_checks_publisher_timestamp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamp: str
 ) -> None:
     heartbeat = tmp_path / "healthy"
-    heartbeat.touch()
     now = utcnow()
-    payload: dict[str, Any] = {"version": 2, "healthy": True}
+    payload: dict[str, Any] = {"version": 1, "healthy": True}
     if stamp != "missing":
         payload["generated_at"] = {
             "now": now.isoformat(),
@@ -324,18 +323,6 @@ def test_versioned_health_checks_publisher_timestamp(
             "naive": now.replace(tzinfo=None).isoformat(),
             "wrongtype": None,
         }[stamp]
-    (tmp_path / "transfers.json").write_text(json.dumps(payload))
-    monkeypatch.setattr(
-        healthcheck,
-        "load_settings",
-        lambda _: SimpleNamespace(
-            healthcheck_file=heartbeat,
-            config_path=tmp_path,
-            data_path=tmp_path,
-            archival_enabled=True,
-        ),
-    )
-    monkeypatch.setattr(
-        healthcheck, "load_youtube_configs", lambda _: (SimpleNamespace(cooldown=60),)
-    )
+    heartbeat.write_text(json.dumps(payload))
+    monkeypatch.setenv("SAGA_HEALTHCHECK_FILE", str(heartbeat))
     assert healthcheck.is_healthy(tmp_path) == (stamp == "now")

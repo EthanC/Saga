@@ -18,6 +18,7 @@ from core.state import (
     Report,
     ResolvedChannel,
     StateStore,
+    Video,
 )
 from core.youtube import VideoMetadata, YouTubeClient
 
@@ -100,7 +101,8 @@ def test_run_starts_named_channel_workers(
     monkeypatch.setattr(service, "_delivery_loop", worker)
     monkeypatch.setattr(service, "_report_loop", worker)
     monkeypatch.setattr(service, "_archive_loop", worker)
-    monkeypatch.setattr(service, "_transfer_health_loop", worker)
+    monkeypatch.setattr(service, "_health_loop", worker)
+    monkeypatch.setattr(service, "_publication_loop", worker)
     monkeypatch.setattr(service, "_partial_maintenance_loop", worker)
     monkeypatch.setattr(service_module, "run_backup_scheduler", worker)
     service.stop.set()
@@ -119,7 +121,8 @@ def test_run_starts_named_channel_workers(
         "cleanup:0",
         "webpage:0",
         "recovery:0",
-        "transfer-health",
+        "health",
+        "publication",
         "partial-maintenance",
     }
     assert not (tmp_path / "healthy").exists()
@@ -414,8 +417,6 @@ def test_initialize_reuses_resolution_and_merges_channel_policy(tmp_path: Path) 
 def test_poll_loop_records_successes_and_survives_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    resolved = replace(VIDEO, published_precise=True)
-
     class Youtube:
         outcomes: list[Any] = [(VIDEO,), (VIDEO,), RuntimeError("scan failed")]
 
@@ -428,29 +429,17 @@ def test_poll_loop_records_successes_and_survives_failure(
             return outcome
 
     class State:
-        details = [{VIDEO.id}, set()]
-        additions = [1, 0, 0]
-
-        def publication_detail_ids(self, ids: Any) -> set[str]:
-            tuple(ids)
-            return self.details.pop(0)
+        additions = [1, 0]
+        recorded: list[tuple[Any, ...]] = []
 
         def record_discoveries(self, *args: Any, **kwargs: Any) -> int:
+            assert kwargs == {"backfill": False}
+            self.recorded.append(args)
             return self.additions.pop(0)
 
-    service = service_with(tmp_path, State(), Youtube())
-    healthchecks = 0
-    resolutions = 0
+    state = State()
+    service = service_with(tmp_path, state, Youtube())
     waits = 0
-
-    def resolve(*args: Any) -> tuple[DiscoveredVideo, ...]:
-        nonlocal resolutions
-        resolutions += 1
-        return (resolved,)
-
-    def healthcheck() -> None:
-        nonlocal healthchecks
-        healthchecks += 1
 
     async def wait(_: float) -> None:
         nonlocal waits
@@ -458,14 +447,11 @@ def test_poll_loop_records_successes_and_survives_failure(
         if waits == 3:
             service.stop.set()
 
-    monkeypatch.setattr(service, "_resolve_publications", resolve)
-    monkeypatch.setattr(service, "_write_healthcheck", healthcheck)
     monkeypatch.setattr(service, "_wait", wait)
 
     asyncio.run(service._poll_loop(MonitoredChannel(CHANNEL, 1, frozenset({"video"}))))
 
-    assert resolutions == 1
-    assert healthchecks == 2
+    assert state.recorded == [(CHANNEL.id, (VIDEO,)), (CHANNEL.id, (VIDEO,))]
 
 
 def test_poll_loop_propagates_cancellation(tmp_path: Path) -> None:
@@ -511,9 +497,6 @@ def test_reconciliation_records_batches_and_survives_failure(
     state = State()
     service = service_with(tmp_path, state, Youtube())
     waits = 0
-    monkeypatch.setattr(
-        service, "_resolve_publications", lambda *args: (replace(VIDEO, title="Exact"),)
-    )
 
     async def wait(_: float) -> None:
         nonlocal waits
@@ -529,7 +512,7 @@ def test_reconciliation_records_batches_and_survives_failure(
 
     assert state.completed == 1
     assert state.recorded[0][1][0].title == "Video"
-    assert state.recorded[1][1][0].title == "Exact"
+    assert len(state.recorded) == 1
     assert all(item[2] is True for item in state.recorded)
 
 
@@ -572,6 +555,13 @@ def test_reconciliation_queues_archive_before_resolving_publication(
         asyncio.run(
             service._reconciliation_loop(
                 MonitoredChannel(CHANNEL, 1, frozenset({"video"}))
+            )
+        )
+        assert claimed == []
+        service.stop.clear()
+        asyncio.run(
+            service._publication_loop(
+                (MonitoredChannel(CHANNEL, 1, frozenset({"video"})),)
             )
         )
         assert claimed == [video.id]
@@ -679,8 +669,7 @@ def test_history_resolves_uploads_beyond_the_recent_snapshot(
     service = service_with(tmp_path, store, youtube)
 
     async def wait(_: float) -> None:
-        if youtube.scans == 3:
-            service.stop.set()
+        service.stop.set()
 
     monkeypatch.setattr(service, "_wait", wait)
     try:
@@ -689,6 +678,18 @@ def test_history_resolves_uploads_beyond_the_recent_snapshot(
                 MonitoredChannel(CHANNEL, 1, frozenset({"video"}))
             )
         )
+        for _ in range(2):
+            service.stop.clear()
+            with Session(store.engine) as session:
+                for row in session.exec(select(Video)).all():
+                    row.publication_retry_at = None
+                    session.add(row)
+                session.commit()
+            asyncio.run(
+                service._publication_loop(
+                    (MonitoredChannel(CHANNEL, 1, frozenset({"video"}), retries=0),)
+                )
+            )
 
         with Session(store.engine) as session:
             deliveries = session.exec(select(NotificationDelivery)).all()

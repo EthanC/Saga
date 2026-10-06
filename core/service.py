@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import Any
 
 from loguru import logger
@@ -31,6 +32,8 @@ from core.shutdown import CooperativeStop, StopController
 from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore, utcnow
 from core.youtube import YouTubeClient
+
+STARTUP_STALL_TIMEOUT = 300
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,70 +84,80 @@ class SagaService:
         self.started_at = utcnow()
         self._channel_intervals: dict[str, float] = {}
         self._health_alerts: dict[str, tuple[str, float]] = {}
+        self._initializing = False
+        self._startup_progress = time.monotonic()
+        self._publication_started: float | None = None
+        self._poll_slots = asyncio.Semaphore(2)
+        self._history_slots = asyncio.Semaphore(1)
+        self._staging_bytes: int | None = None
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
         logger.info("Initializing Saga service")
         self._remove_healthcheck()
-        try:
-            monitored = await self._initialize()
-        except BaseException:
-            self.request_stop()
-            raise
-        self.started_at = utcnow()
-        self._channel_intervals = {item.channel.id: item.cooldown for item in monitored}
-        self.state.reset_interrupted_claims(
-            background_deadline=self.settings.background_deadline
-        )
-        self._write_healthcheck()
-        logger.info("Starting workers for {} channel(s)", len(monitored))
-
+        self._initializing = True
+        self._startup_progress = time.monotonic()
         try:
             async with asyncio.TaskGroup() as workers:
-                for item in monitored:
-                    workers.create_task(
-                        self._poll_loop(item), name=f"poll:{item.channel.id}"
-                    )
-                    workers.create_task(
-                        self._reconciliation_loop(item),
-                        name=f"history:{item.channel.id}",
-                    )
-                workers.create_task(self._delivery_loop(), name="discord")
-                workers.create_task(self._report_loop(), name="reporting")
-                if self.settings.backup.enabled:
-                    workers.create_task(
-                        run_backup_scheduler(
-                            self.state.path,
-                            self.settings.backup,
-                            self.stop,
-                            stop_controller=self.stop_controller,
-                        ),
-                        name="backup-scheduler",
-                    )
-                if self.archival is not None:
-                    for lane, count in (
-                        ("upload", self.settings.upload_workers),
-                        ("download", self.settings.download_workers),
-                        ("metadata", 1),
-                        ("cleanup", 1),
-                        ("recovery", 1),
-                        ("webpage", 1),
-                        ("validation", int(self.settings.validation_enabled)),
-                    ):
-                        for index in range(count):
-                            workers.create_task(
-                                self._archive_loop(index, lane), name=f"{lane}:{index}"
-                            )
-                    workers.create_task(
-                        self._transfer_health_loop(), name="transfer-health"
-                    )
-                    workers.create_task(
-                        self._partial_maintenance_loop(), name="partial-maintenance"
-                    )
+                workers.create_task(self._health_loop(), name="health")
                 try:
+                    monitored = await self._initialize()
+                    self.started_at = utcnow()
+                    self._channel_intervals = {
+                        item.channel.id: item.cooldown for item in monitored
+                    }
+                    self.state.reset_interrupted_claims(
+                        background_deadline=self.settings.background_deadline
+                    )
+                    self._initializing = False
+                    logger.info("Starting workers for {} channel(s)", len(monitored))
+
+                    for item in monitored:
+                        workers.create_task(
+                            self._poll_loop(item), name=f"poll:{item.channel.id}"
+                        )
+                        workers.create_task(
+                            self._reconciliation_loop(item),
+                            name=f"history:{item.channel.id}",
+                        )
+                    workers.create_task(
+                        self._publication_loop(monitored), name="publication"
+                    )
+                    workers.create_task(self._delivery_loop(), name="discord")
+                    workers.create_task(self._report_loop(), name="reporting")
+                    if self.settings.backup.enabled:
+                        workers.create_task(
+                            run_backup_scheduler(
+                                self.state.path,
+                                self.settings.backup,
+                                self.stop,
+                                stop_controller=self.stop_controller,
+                            ),
+                            name="backup-scheduler",
+                        )
+                    if self.archival is not None:
+                        for lane, count in (
+                            ("upload", self.settings.upload_workers),
+                            ("download", self.settings.download_workers),
+                            ("metadata", 1),
+                            ("cleanup", 1),
+                            ("recovery", 1),
+                            ("webpage", 1),
+                            ("validation", int(self.settings.validation_enabled)),
+                        ):
+                            for index in range(count):
+                                workers.create_task(
+                                    self._archive_loop(index, lane),
+                                    name=f"{lane}:{index}",
+                                )
+                        workers.create_task(
+                            self._partial_maintenance_loop(), name="partial-maintenance"
+                        )
                     await self.stop.wait()
                 finally:
                     self.request_stop()
+        except* CooperativeStop:
+            pass
         finally:
             logger.debug("Worker group is stopping")
             self._remove_healthcheck()
@@ -185,6 +198,7 @@ class SagaService:
                     )
                     resolved_by_reference[reference] = resolved
                 self.state.register_channel(reference, resolved)
+                self._startup_progress = time.monotonic()
                 routes.append((resolved.id, channel))
                 content_types_by_channel.setdefault(resolved.id, set()).update(
                     channel.content_types
@@ -214,27 +228,6 @@ class SagaService:
             if onboarding:
                 logger.info("Establishing notification baseline for {}", channel.title)
                 self.state.establish_baseline(channel.id, ())
-                recent = await self._youtube_request(
-                    self.youtube.recent_videos,
-                    retries_by_channel[channel.id],
-                    retry_delay_by_channel[channel.id],
-                    channel,
-                    content_types=content_types_by_channel[channel.id],
-                )
-                recent = await asyncio.to_thread(
-                    self._resolve_publications,
-                    channel,
-                    recent,
-                    None,
-                    retries_by_channel[channel.id],
-                    retry_delay_by_channel[channel.id],
-                )
-                self.state.record_discoveries(channel.id, recent, backfill=False)
-                logger.info(
-                    "Established notification baseline for {} with {} video(s)",
-                    channel.title,
-                    len(recent),
-                )
 
         return tuple(
             MonitoredChannel(
@@ -256,21 +249,17 @@ class SagaService:
         while not self.stop.is_set():
             try:
                 logger.debug("Scanning recent videos for {}", monitored.channel.title)
-                recent = await self._youtube_request(
-                    self.youtube.recent_videos,
-                    monitored.retries,
-                    monitored.retry_delay,
-                    monitored.channel,
-                    content_types=monitored.content_types,
-                )
-                added = await asyncio.to_thread(
-                    self._record_videos,
-                    monitored.channel,
-                    recent,
-                    False,
-                    monitored.retries,
-                    monitored.retry_delay,
-                )
+                async with self._poll_slots:
+                    recent = await self._youtube_request(
+                        self.youtube.recent_videos,
+                        monitored.retries,
+                        monitored.retry_delay,
+                        monitored.channel,
+                        content_types=monitored.content_types,
+                    )
+                    added = self.state.record_discoveries(
+                        monitored.channel.id, recent, backfill=False
+                    )
                 if added:
                     logger.info(
                         "Discovered {} new video(s) for {}",
@@ -283,7 +272,6 @@ class SagaService:
                         monitored.channel.title,
                         len(recent),
                     )
-                self._write_healthcheck()
             except asyncio.CancelledError:
                 raise
             except CooperativeStop:
@@ -302,9 +290,7 @@ class SagaService:
 
                 def record_batch(batch: tuple[DiscoveredVideo, ...]) -> None:
                     nonlocal discovered
-                    self._record_videos(
-                        channel, batch, True, monitored.retries, monitored.retry_delay
-                    )
+                    self.state.record_discoveries(channel.id, batch, backfill=True)
                     discovered += len(batch)
                     logger.debug(
                         "Reconciled a batch of {} video(s) for {}",
@@ -313,14 +299,7 @@ class SagaService:
                     )
 
                 operation = asyncio.create_task(
-                    self._youtube_request(
-                        self.youtube.scan_history,
-                        monitored.retries,
-                        monitored.retry_delay,
-                        channel,
-                        record_batch,
-                        content_types=monitored.content_types,
-                    ),
+                    self._scan_history(monitored, record_batch),
                     name=f"history-operation:{channel.id}",
                 )
                 try:
@@ -343,25 +322,65 @@ class SagaService:
                 logger.exception("History reconciliation failed for {}", channel.title)
             await self._wait(21_600)
 
-    def _record_videos(
-        self,
-        channel: ResolvedChannel,
-        videos: tuple[DiscoveredVideo, ...],
-        backfill: bool,
-        retries: int,
-        retry_delay: float,
-    ) -> int:
-        """Queue discoveries before resolving metadata needed only for notifications."""
-        needs_detail = self.state.publication_detail_ids(video.id for video in videos)
-        if not needs_detail:
-            return self.state.record_discoveries(channel.id, videos, backfill=backfill)
+    async def _scan_history(
+        self, monitored: MonitoredChannel, record_batch: Any
+    ) -> None:
+        async with self._history_slots:
+            await self._youtube_request(
+                self.youtube.scan_history,
+                monitored.retries,
+                monitored.retry_delay,
+                monitored.channel,
+                record_batch,
+                content_types=monitored.content_types,
+            )
 
-        added = self.state.record_discoveries(channel.id, videos, backfill=True)
-        resolved = self._resolve_publications(
-            channel, videos, needs_detail, retries, retry_delay
+    async def _publication_loop(self, monitored: Sequence[MonitoredChannel]) -> None:
+        """Resolve durable notification work without delaying channel polling."""
+        channels = {item.channel.id: item for item in monitored}
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="saga-publication"
+        ) as executor:
+            while not self.stop.is_set():
+                work = self.state.claim_publication(channels)
+                if work is None:
+                    await self._wait(1)
+                    continue
+                channel_id, video = work
+                item = channels[channel_id]
+                self._publication_started = time.monotonic()
+                try:
+                    resolved = await self._run_blocking(
+                        executor,
+                        self._resolve_publications,
+                        item.channel,
+                        (video,),
+                        None,
+                        item.retries,
+                        item.retry_delay,
+                    )
+                    self.state.record_discoveries(channel_id, resolved, backfill=True)
+                except CooperativeStop:
+                    return
+                finally:
+                    self._publication_started = None
+
+    async def _run_blocking(
+        self,
+        executor: ThreadPoolExecutor | None,
+        operation: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        future = asyncio.get_running_loop().run_in_executor(
+            executor, partial(operation, *args, **kwargs)
         )
-        self.state.record_discoveries(channel.id, resolved, backfill=backfill)
-        return added
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await future
+            raise
 
     def _resolve_publications(
         self,
@@ -425,7 +444,7 @@ class SagaService:
         for attempt in range(retries + 1):
             self.stop_controller.check()
             try:
-                return await asyncio.to_thread(operation, *args, **kwargs)
+                return await self._run_blocking(None, operation, *args, **kwargs)
             except asyncio.CancelledError:
                 raise
             except CooperativeStop:
@@ -565,47 +584,82 @@ class SagaService:
             executor, self.archival.process, work
         )
 
-    async def _transfer_health_loop(self) -> None:
-        """Publish transfer progress separately from the polling heartbeat."""
-        while not self.stop.is_set():
-            try:
-                health = self.state.transfer_health(
-                    stall_timeout=self.settings.transfer_stall_timeout,
-                    started_at=self.started_at,
-                    upload_workers=self.settings.upload_workers,
-                    download_workers=self.settings.download_workers,
-                    channel_intervals=self._channel_intervals,
-                )
-                root = self.settings.download_root
-                health["staging_bytes"] = await asyncio.to_thread(staging_usage, root)
-                health["staging"] = {
-                    "path": str(root),
-                    "filesystem_id": root.stat().st_dev,
-                    "available_bytes": shutil.disk_usage(root).free,
-                    "reserved_bytes": health["reserved_bytes"],
-                    "minimum_free_bytes": self.settings.minimum_free_bytes,
-                    "waiting_reason": health["download_pause_reason"],
+    async def _health_loop(self) -> None:
+        """Publish a bounded startup or pipeline verdict independently of scans."""
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="saga-health"
+        ) as executor:
+            while not self.stop.is_set():
+                try:
+                    generated_at = None
+                    if self._initializing:
+                        healthy = (
+                            time.monotonic() - self._startup_progress
+                            <= STARTUP_STALL_TIMEOUT
+                        )
+                    else:
+                        health = await self._run_blocking(
+                            executor, self._health_snapshot
+                        )
+                        path = self.settings.data_path / "transfers.json"
+                        temporary = path.with_suffix(".tmp")
+                        temporary.write_text(
+                            json.dumps(health, sort_keys=True), encoding="utf-8"
+                        )
+                        temporary.replace(path)
+                        self._emit_health_alerts(health["alerts"])
+                        healthy = health["healthy"]
+                        generated_at = health["generated_at"]
+                    self._write_healthcheck(healthy=healthy, generated_at=generated_at)
+                except OSError as error:
+                    self._emit_health_alerts(
+                        [
+                            {
+                                "key": "publisher",
+                                "severity": "error",
+                                "message": "health publisher failed",
+                                "details": {"cause": type(error).__name__},
+                            }
+                        ]
+                    )
+                await self._wait(30)
+
+    def _health_snapshot(self) -> dict[str, Any]:
+        health = self.state.transfer_health(
+            stall_timeout=self.settings.transfer_stall_timeout,
+            started_at=self.started_at,
+            upload_workers=self.settings.upload_workers,
+            download_workers=self.settings.download_workers,
+            channel_intervals=self._channel_intervals,
+            include_archive=self.archival is not None,
+        )
+        publication_started = self._publication_started
+        if publication_started is not None and (
+            time.monotonic() - publication_started
+            > self.settings.transfer_stall_timeout
+        ):
+            health["healthy"] = False
+            health["alerts"].append(
+                {
+                    "key": "publication:stall",
+                    "severity": "error",
+                    "message": "notification metadata worker stalled",
+                    "details": {},
                 }
-                health["partials"] = self._partial_health
-                path = self.settings.data_path / "transfers.json"
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(
-                    json.dumps(health, sort_keys=True), encoding="utf-8"
-                )
-                temporary.replace(path)
-                self._emit_health_alerts(health["alerts"])
-            except OSError as error:
-                self._emit_health_alerts(
-                    [
-                        {
-                            "key": "publisher",
-                            "severity": "error",
-                            "message": "transfer health publisher failed",
-                            "details": {"cause": type(error).__name__},
-                        }
-                    ]
-                )
-            await self._wait(30)
+            )
+        if self.archival is not None:
+            root = self.settings.download_root
+            health["staging_bytes"] = self._staging_bytes
+            health["staging"] = {
+                "path": str(root),
+                "filesystem_id": root.stat().st_dev,
+                "available_bytes": shutil.disk_usage(root).free,
+                "reserved_bytes": health["reserved_bytes"],
+                "minimum_free_bytes": self.settings.minimum_free_bytes,
+                "waiting_reason": health["download_pause_reason"],
+            }
+            health["partials"] = self._partial_health
+        return health
 
     def _emit_health_alerts(self, alerts: list[dict[str, Any]]) -> None:
         now = time.monotonic()
@@ -632,6 +686,9 @@ class SagaService:
                     self.settings,
                     youtube=self.youtube,
                     controller=self.stop_controller,
+                )
+                self._staging_bytes = await asyncio.to_thread(
+                    staging_usage, self.settings.download_root
                 )
             except CooperativeStop:
                 return
@@ -751,12 +808,26 @@ class SagaService:
         self.stop.set()
         self.stop_controller.request()
 
-    def _write_healthcheck(self) -> None:
+    def _write_healthcheck(
+        self, *, healthy: bool = True, generated_at: str | None = None
+    ) -> None:
         path = self.settings.healthcheck_file
         if path is None:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "generated_at": generated_at or utcnow().isoformat(),
+                    "healthy": healthy,
+                    "phase": "initializing" if self._initializing else "running",
+                }
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
         logger.trace("Refreshed healthcheck file {}", path)
 
     def _remove_healthcheck(self) -> None:

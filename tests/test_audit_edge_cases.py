@@ -260,8 +260,9 @@ def test_fatal_component_requests_stop_before_draining_workers(
     assert saga.stop_controller.event.is_set()
     saga = SagaService(settings(tmp_path), (), state, youtube.YouTubeClient())
     monkeypatch.setattr(saga, "_initialize", fail)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ExceptionGroup) as caught:
         asyncio.run(saga.run())
+    assert caught.value.subgroup(RuntimeError) is not None
     assert saga.stop_controller.event.is_set()
     state.close()
 
