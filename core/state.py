@@ -1604,7 +1604,7 @@ class StateStore:
         """Measure progress, due age, and backpressure independently across lanes."""
         from core.pipeline_health import build_pipeline_health
 
-        current = now or utcnow()
+        intervals = channel_intervals or {}
         with Session(self.engine) as session:
             rows = list(
                 session.exec(
@@ -1613,9 +1613,22 @@ class StateStore:
                     )
                 ).all()
             )
+            jobs = (
+                list(session.exec(select(ArchiveJob)).all()) if include_archive else []
+            )
+            poll_stamps = dict(
+                session.exec(
+                    select(Channel.id, Channel.last_polled_at).where(
+                        col(Channel.id).in_(tuple(intervals))
+                    )
+                ).all()
+            )
+            # Polls can commit during these reads. Observe time after fetching
+            # their timestamps so a newly completed poll cannot have a negative age.
+            current = now or utcnow()
             health = build_pipeline_health(
                 rows if include_archive else [],
-                list(session.exec(select(ArchiveJob)).all()) if include_archive else [],
+                jobs,
                 now=current,
                 started_at=started_at or self.health_started_at,
                 stall_timeout=stall_timeout,
@@ -1630,9 +1643,8 @@ class StateStore:
                 lane_progress=self.lane_progress,
             )
             polling: dict[str, Any] = {}
-            for channel_id, interval in (channel_intervals or {}).items():
-                channel = session.get(Channel, channel_id)
-                stamp = channel.last_polled_at if channel else None
+            for channel_id, interval in intervals.items():
+                stamp = poll_stamps.get(channel_id)
                 age = (
                     (_as_utc(current) - _as_utc(stamp)).total_seconds()
                     if stamp

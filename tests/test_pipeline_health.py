@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import event
 from sqlmodel import Session
 
 from core import healthcheck, service
+from core import state as state_module
 from core.service import SagaService
 from core.state import ArchiveJob, ArchiveProgress, Channel, StateStore, Video, utcnow
 from core.youtube import YouTubeClient
@@ -241,6 +243,63 @@ def test_history_and_other_channels_cannot_refresh_failed_recent_poll(
     assert health["polling"]["healthy"]["healthy"]
     assert not health["polling"]["channel"]["healthy"]
     state.close()
+
+
+def test_poll_completed_during_health_reads_has_a_nonnegative_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state, _, began = queue(tmp_path, "upload")
+    state.establish_baseline("channel", ())
+    clock = [began]
+    completed = False
+    monkeypatch.setattr(state_module, "utcnow", lambda: clock[0])
+
+    def complete_poll(
+        connection: Any,
+        cursor: Any,
+        statement: str,
+        parameters: Any,
+        context: Any,
+        executemany: bool,
+    ) -> None:
+        nonlocal completed
+        if not completed and "FROM archiveprogress JOIN video" in statement:
+            completed = True
+            clock[0] = began + timedelta(microseconds=701218)
+            state.record_discoveries("channel", (), backfill=False)
+
+    event.listen(state.engine, "after_cursor_execute", complete_poll)
+    try:
+        health = state.transfer_health(
+            stall_timeout=900, channel_intervals={"channel": 60}
+        )
+        assert completed
+        assert health["polling"]["channel"]["age_seconds"] == 0
+        assert health["healthy"] and not health["startup_grace"]
+        assert health["generated_at"] == clock[0].isoformat()
+        assert not any(alert["key"].startswith("poll:") for alert in health["alerts"])
+    finally:
+        event.remove(state.engine, "after_cursor_execute", complete_poll)
+        state.close()
+
+
+def test_genuinely_future_poll_timestamp_still_fails_health(tmp_path: Path) -> None:
+    state, _, now = queue(tmp_path, "upload")
+    try:
+        with Session(state.engine) as session:
+            channel = session.get(Channel, "channel")
+            assert channel
+            channel.last_polled_at = now + timedelta(seconds=1)
+            session.add(channel)
+            session.commit()
+        health = state.transfer_health(
+            stall_timeout=900, now=now, channel_intervals={"channel": 60}
+        )
+        assert not health["healthy"]
+        assert health["polling"]["channel"]["age_seconds"] == -1
+        assert any(alert["key"] == "poll:channel" for alert in health["alerts"])
+    finally:
+        state.close()
 
 
 def test_alert_transitions_reminders_and_recovery_are_bounded(
