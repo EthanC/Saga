@@ -103,6 +103,20 @@ Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encodin
 
 Saga retries failed transfers, resumes interrupted downloads, and pauses new downloads when disk space is low. Livestreams wait until a replay is available. See `data/transfers.json` for transfer progress, queue status, and staging space.
 
+### Storage budget
+
+Set `SAGA_MAX_DATA_BYTES` to limit the data-directory space available for downloads and temporary merge output. For a 250 GB budget:
+
+```dotenv
+SAGA_MAX_DATA_BYTES=250000000000
+```
+
+The default is `0` (disabled). Saga counts regular-file sizes under `SAGA_DATA_PATH`, including active downloads, files awaiting upload, partials, the database, and backups stored there. It reserves estimated download and merge space across workers, pauses downloads that do not fit, and rechecks the budget during download callbacks and managed merge progress. Uploads continue and downloads become eligible again as files are removed. `data/transfers.json` includes the limit, measured usage, and remaining budget under `storage`.
+
+`SAGA_MINIMUM_FREE_BYTES` independently reserves free space on the underlying filesystem. It is not subtracted from the 250 GB data budget. `SAGA_PARTIAL_MAX_BYTES` remains a separate cleanup target for eligible inactive partials.
+
+This is an application-level transfer budget, not a filesystem quota. Database and backup writes continue, and writes between checks or underestimated merge output can exceed the configured value. Files outside `SAGA_DATA_PATH`, symlink targets, and filesystem allocation overhead are not counted.
+
 ## Webpage Capture
 
 Saga submits watch pages directly to the Internet Archive unless both [Ziggy](https://github.com/EthanC/Ziggy) variables are set. Ziggy queues captures separately and does not require Internet Archive credentials:

@@ -31,6 +31,7 @@ from core.reporting import (
 from core.shutdown import CooperativeStop, StopController
 from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore, utcnow
+from core.storage import data_usage, remaining_data_bytes
 from core.youtube import YouTubeClient
 
 STARTUP_STALL_TIMEOUT = 300
@@ -528,6 +529,16 @@ class SagaService:
         claim_count = worker_index
         while not self.stop.is_set():
             if lane in {"upload", "download", "metadata"}:
+                data_budget = (
+                    await self._run_blocking(
+                        executor,
+                        remaining_data_bytes,
+                        self.settings.data_path,
+                        self.settings.max_data_bytes,
+                    )
+                    if lane == "download" and self.settings.max_data_bytes
+                    else None
+                )
                 work = self.state.claim_archive(
                     prefer_recent=claim_count % 4 != 3,
                     lane=lane,
@@ -536,6 +547,7 @@ class SagaService:
                     if lane == "download"
                     else None,
                     minimum_free_bytes=self.settings.minimum_free_bytes,
+                    data_budget_bytes=data_budget,
                     unknown_download_bytes=self.settings.unknown_download_bytes,
                     download_root=self.settings.download_root,
                     pause_fresh_downloads=self.settings.partial_retention_mode
@@ -649,6 +661,19 @@ class SagaService:
             )
         if self.archival is not None:
             root = self.settings.download_root
+            used = (
+                data_usage(self.settings.data_path)
+                if self.settings.max_data_bytes
+                else None
+            )
+            health["storage"] = {
+                "path": str(self.settings.data_path),
+                "used_bytes": used,
+                "max_bytes": self.settings.max_data_bytes,
+                "remaining_bytes": max(self.settings.max_data_bytes - used, 0)
+                if used is not None
+                else None,
+            }
             health["staging_bytes"] = self._staging_bytes
             health["staging"] = {
                 "path": str(root),

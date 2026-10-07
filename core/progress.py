@@ -11,6 +11,7 @@ from typing import Any
 
 from core.staging import download_reservation
 from core.state import ArchiveWork, StateStore, utcnow
+from core.storage import remaining_data_bytes
 from core.youtube import DiskSpaceError
 
 CHECKPOINT_INTERVAL = 5.0
@@ -26,12 +27,16 @@ class DownloadCheckpoint:
         directory: Path,
         minimum: int,
         *,
+        data_path: Path | None = None,
+        max_data_bytes: int = 0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.state = state
         self.video_id = work.video.id
         self.directory = directory
         self.minimum = minimum
+        self.data_path = data_path or directory
+        self.max_data_bytes = max_data_bytes
         self.clock = clock
         self.last_checkpoint = clock()
         self.allowance = work.progress.reserved_bytes
@@ -62,6 +67,7 @@ class DownloadCheckpoint:
             else download_reservation(self.expected, downloaded)
         )
         free = shutil.disk_usage(self.directory).free
+        data_budget = remaining_data_bytes(self.data_path, self.max_data_bytes)
         others = self.state.other_download_reservations(self.video_id)
         checkpoint = (
             force
@@ -72,6 +78,9 @@ class DownloadCheckpoint:
         if free < self.minimum + others + required:
             self.flush()
             raise DiskSpaceError("external disk depletion or download disk budget full")
+        if data_budget is not None and data_budget < others + required:
+            self.flush()
+            raise DiskSpaceError("Saga data-directory budget full")
         if checkpoint:
             self.state.guard_download_space(
                 self.video_id,
@@ -79,6 +88,7 @@ class DownloadCheckpoint:
                 downloaded,
                 free,
                 self.minimum,
+                data_budget_bytes=data_budget,
                 **self.facts(),
             )
             self.allowance = required

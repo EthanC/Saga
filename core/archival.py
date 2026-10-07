@@ -494,7 +494,12 @@ class ArchiveProcessor:
                 "download staging is outside its owned operation"
             )
         checkpoint = DownloadCheckpoint(
-            self.state, work, directory, self.settings.minimum_free_bytes
+            self.state,
+            work,
+            directory,
+            self.settings.minimum_free_bytes,
+            data_path=self.settings.data_path,
+            max_data_bytes=self.settings.max_data_bytes,
         )
         try:
             path = self.youtube.download_video(

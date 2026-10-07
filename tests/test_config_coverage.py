@@ -44,6 +44,7 @@ SETTING_NAMES = (
     "SAGA_ARCHIVE_POLL_TIMEOUT",
     "SAGA_ARCHIVE_POLL_INTERVAL",
     "SAGA_MINIMUM_FREE_BYTES",
+    "SAGA_MAX_DATA_BYTES",
     "SAGA_DOWNLOAD_BYTES_PER_SECOND",
     "SAGA_UPLOAD_BYTES_PER_SECOND",
     "REPORT_DISCORD_WEBHOOK_URL",
@@ -188,6 +189,7 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_ARCHIVE_POLL_TIMEOUT": "3",
         "SAGA_ARCHIVE_POLL_INTERVAL": "4",
         "SAGA_MINIMUM_FREE_BYTES": "0",
+        "SAGA_MAX_DATA_BYTES": "250000000000",
         "SAGA_DOWNLOAD_BYTES_PER_SECOND": "6250000",
         "SAGA_UPLOAD_BYTES_PER_SECOND": "1250000",
         "REPORT_DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/2/report",
@@ -216,6 +218,7 @@ def test_load_settings_accepts_all_optional_values(
     assert result.notification_timeout == 2.5
     assert result.archive_workers == 4
     assert result.minimum_free_bytes == 0
+    assert result.max_data_bytes == 250_000_000_000
     assert result.download_bytes_per_second == 6_250_000
     assert result.upload_bytes_per_second == 1_250_000
     assert result.report_discord_webhook_url == values["REPORT_DISCORD_WEBHOOK_URL"]
@@ -259,6 +262,7 @@ def test_example_environment_preserves_container_paths(
     assert result.config_path == Path(paths["SAGA_CONFIG_PATH"])
     assert result.data_path == Path(paths["SAGA_DATA_PATH"])
     assert result.healthcheck_file == Path(paths["SAGA_HEALTHCHECK_FILE"])
+    assert result.max_data_bytes == 0
 
 
 def test_backup_schedule_requires_a_future_occurrence(
@@ -296,6 +300,8 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"LOG_LEVEL": "verbose"}, "valid Loguru level"),
         ({"LOG_DISCORD_LEVEL": "alert"}, "valid Loguru level"),
         ({"SAGA_MINIMUM_FREE_BYTES": "-1"}, "must be non-negative"),
+        ({"SAGA_MAX_DATA_BYTES": "-1"}, "SAGA_MAX_DATA_BYTES"),
+        ({"SAGA_MAX_DATA_BYTES": "1.5"}, "SAGA_MAX_DATA_BYTES"),
         ({"SAGA_DOWNLOAD_BYTES_PER_SECOND": "-1"}, "SAGA_DOWNLOAD_BYTES_PER_SECOND"),
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": "1.5"}, "SAGA_UPLOAD_BYTES_PER_SECOND"),
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": ""}, "SAGA_UPLOAD_BYTES_PER_SECOND"),

@@ -717,6 +717,7 @@ class StateStore:
         lane: str = "transfer",
         free_bytes: int | None = None,
         minimum_free_bytes: int = 0,
+        data_budget_bytes: int | None = None,
         buffer: int = 2,
         unknown_download_bytes: int = 10_000_000_000,
         download_root: Path | None = None,
@@ -912,6 +913,15 @@ class StateStore:
                         progress.last_error = (
                             "waiting for download and merge disk budget"
                         )
+                        session.add(progress)
+                        continue
+                    if reservation and (
+                        data_budget_bytes is not None
+                        and data_budget_bytes < reserved + reservation
+                    ):
+                        self.download_pause_reason = "data budget full"
+                        progress.failure_phase = "disk"
+                        progress.last_error = "waiting for Saga data-directory budget"
                         session.add(progress)
                         continue
                 selected = progress, video, channel
@@ -1256,6 +1266,7 @@ class StateStore:
         downloaded: int,
         free: int,
         minimum: int,
+        data_budget_bytes: int | None = None,
         **facts: Any,
     ) -> None:
         """Adjust a download/merge reservation as yt-dlp learns stream sizes."""
@@ -1274,7 +1285,9 @@ class StateStore:
             progress.download_estimated_bytes = max(
                 expected, progress.download_estimated_bytes or 0
             )
-            permitted = free >= minimum + others + remaining
+            permitted = free >= minimum + others + remaining and (
+                data_budget_bytes is None or data_budget_bytes >= others + remaining
+            )
             if permitted:
                 progress.reserved_bytes = remaining
             for name, value in facts.items():
@@ -1286,7 +1299,7 @@ class StateStore:
                 from core.youtube import DiskSpaceError
 
                 raise DiskSpaceError(
-                    "download and merge exceed available disk reservations"
+                    "download and merge exceed available disk or data reservations"
                 )
 
     def update_archive(

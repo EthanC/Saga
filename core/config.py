@@ -121,6 +121,7 @@ class Settings:
     archive_poll_timeout: float = 900.0
     archive_poll_interval: float = 5.0
     minimum_free_bytes: int = 5_000_000_000
+    max_data_bytes: int = 0
     download_bytes_per_second: int = 0
     upload_bytes_per_second: int = 0
     report_discord_webhook_url: str | None = None
@@ -355,6 +356,7 @@ def load_settings(project_root: Path) -> Settings:
         archive_poll_timeout=archive_poll_timeout,
         archive_poll_interval=archive_poll_interval,
         minimum_free_bytes=minimum_free_bytes,
+        max_data_bytes=_nonnegative_env_int(env, "SAGA_MAX_DATA_BYTES", 0),
         download_bytes_per_second=download_bytes_per_second,
         upload_bytes_per_second=upload_bytes_per_second,
         report_discord_webhook_url=report_discord_webhook_url,
