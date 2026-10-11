@@ -9,7 +9,7 @@ from tests.test_archival import seed_upload
 from tests.test_pipeline_health import queue
 
 
-def test_storage_pause_escalates_and_transfer_progress_restores_health(
+def test_storage_pause_alerts_without_restarting_progressing_workers(
     tmp_path: Path,
 ) -> None:
     store, _, now = queue(tmp_path, "download", recent=True)
@@ -17,20 +17,27 @@ def test_storage_pause_escalates_and_transfer_progress_restores_health(
     assert store.transfer_health(stall_timeout=30, now=now)["healthy"]
     later = now + timedelta(seconds=31)
     health = store.transfer_health(stall_timeout=30, now=later)
-    assert not health["healthy"]
+    assert health["healthy"] and health["lanes"]["download"]["status"] == "degraded"
     assert any(
-        a["key"] == "download:stall" and a["severity"] == "error"
+        a["key"] == "download:storage" and a["severity"] == "error"
         for a in health["alerts"]
     )
     upload, _, _ = seed_upload(store, tmp_path, "UploadVid12")
     store.update_archive(
         upload, status="uploading", transfer_progress_at=later, transfer_bytes=0
     )
-    assert not store.transfer_health(stall_timeout=30, now=later)["healthy"]
+    assert any(
+        a["key"] == "download:storage"
+        for a in store.transfer_health(stall_timeout=30, now=later)["alerts"]
+    )
     store.update_archive(
         upload, status="uploading", transfer_progress_at=later, transfer_bytes=2
     )
     assert store.transfer_health(stall_timeout=30, now=later)["healthy"]
+    assert not any(
+        a["key"] == "download:storage"
+        for a in store.transfer_health(stall_timeout=30, now=later)["alerts"]
+    )
     store.download_pause_reason = None
     assert store.transfer_health(stall_timeout=30, now=later)["healthy"]
     assert "download:storage" not in store._eligible_since
@@ -62,7 +69,7 @@ def test_persistent_access_failure_alert_clears_after_success(tmp_path: Path) ->
     )
     assert store.transfer_health(stall_timeout=30, now=now)["healthy"]
     health = store.transfer_health(stall_timeout=30, now=now + timedelta(seconds=31))
-    assert not health["healthy"]
+    assert health["healthy"]
     assert any(a["key"] == "youtube:access" for a in health["alerts"])
     store.update_archive(video_id, status="complete", failure_phase=None)
     assert store.transfer_health(stall_timeout=30, now=now + timedelta(seconds=32))[

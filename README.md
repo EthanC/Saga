@@ -50,7 +50,7 @@ The container probe reads a small health snapshot without importing the download
 
 Startup reports progress while resolving channels and establishing notification baselines. Five minutes without startup progress fails the probe. Publication timestamps are resolved by a separate worker using a persistent SQLite queue, so metadata lookups do not delay startup or polling. Channel scans are limited to two recent scans and one history scan at a time; upload and download worker limits are separate.
 
-Storage pauses are temporarily degraded while transfers free space. If the pause outlasts `SAGA_TRANSFER_STALL_TIMEOUT` without transfer progress, Saga emits an ERROR and fails the probe. Required recovery and cleanup failures or dispatch stalls also fail health; optional validation and webpage outcomes remain warnings. Persistent YouTube access failures emit an ERROR with a cookie-refresh instruction while continuing automatic retries.
+The probe measures worker liveness. Active recovery, remote-service retry backoff, rejected credentials, storage limits, and jobs requiring operator review are degraded conditions, not restart triggers. Prolonged storage or authentication failures and required-job failures emit ERROR alerts while retries continue. Undispatched due work or an active worker without progress beyond `SAGA_TRANSFER_STALL_TIMEOUT` fails the probe. Optional validation and webpage outcomes remain warnings.
 
 ## Python
 

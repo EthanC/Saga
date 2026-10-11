@@ -46,7 +46,7 @@ def test_credentials_failure_retries_and_recovers_when_access_returns(
     store.health_started_at = now - timedelta(hours=1)
     assert store.transfer_health(stall_timeout=30, now=now)["healthy"]
     health = store.transfer_health(stall_timeout=30, now=now + timedelta(seconds=31))
-    assert not health["healthy"]
+    assert health["healthy"]
     assert any(a["key"] == "archive:access" for a in health["alerts"])
     gateway.upload_error = None
     if stage == "recovery":

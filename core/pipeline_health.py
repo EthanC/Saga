@@ -156,12 +156,12 @@ def build_pipeline_health(
             )
         status = (
             "unhealthy"
-            if stalled or idle_stall or storage_stall
+            if stalled or idle_stall
             else "degraded"
             if reason and candidates
             else "healthy"
         )
-        if stalled or idle_stall or storage_stall:
+        if stalled or idle_stall:
             alerts.append(
                 {
                     "key": f"{lane}:stall",
@@ -172,6 +172,15 @@ def build_pipeline_health(
                         "due_queue_count": len(due),
                         "waiting_reason": reason,
                     },
+                }
+            )
+        if storage_stall:
+            alerts.append(
+                {
+                    "key": "download:storage",
+                    "severity": "error",
+                    "message": "download storage remains blocked",
+                    "details": {"due_queue_count": len(due), "waiting_reason": reason},
                 }
             )
         progress = [item["progress_at"] for item in activity]
@@ -240,30 +249,38 @@ def build_pipeline_health(
                 )
     for kind in ("recovery", "validation", "webpage", "cleanup"):
         work = [job for job in jobs if job.kind == kind]
+        required = kind in {"recovery", "cleanup"}
+        stalled_jobs = [
+            job
+            for job in work
+            if job.claim_token
+            and job.claimed_at
+            and (current - _as_utc(job.claimed_at)).total_seconds() > stall_timeout
+        ]
         failed = [
             job
             for job in work
-            if job.status in {"failed", "expired"}
-            or kind != "cleanup"
+            if job.status == "failed"
+            or job.status == "expired"
+            and kind != "recovery"
+            or not required
             and job.status != "passed"
-            and (
-                (job.deadline_at and _as_utc(job.deadline_at) <= current)
-                or (
-                    job.claimed_at
-                    and (current - _as_utc(job.claimed_at)).total_seconds()
-                    > stall_timeout
-                )
-            )
+            and job.deadline_at
+            and _as_utc(job.deadline_at) <= current
         ]
         due = [
             job
             for job in work
-            if job.status in {"pending", "waiting"}
+            if job.status
+            in (
+                {"pending", "waiting", "expired"}
+                if kind == "recovery"
+                else {"pending", "waiting"}
+            )
             and not job.claim_token
             and (not job.retry_at or _as_utc(job.retry_at) <= current)
         ]
         oldest = min((_as_utc(job.updated_at) for job in due), default=None)
-        required = kind in {"recovery", "cleanup"}
         dispatch_key = f"{kind}:dispatch"
         waiting = required and bool(due) and not any(job.claim_token for job in work)
         if waiting:
@@ -276,10 +293,28 @@ def build_pipeline_health(
             > stall_timeout
         )
         unhealthy = (
-            required and current >= grace_end and (bool(failed) or dispatch_stall)
+            required and current >= grace_end and (bool(stalled_jobs) or dispatch_stall)
+        )
+        reason = (
+            "worker stalled"
+            if stalled_jobs
+            else "operator review required"
+            if failed
+            else "awaiting worker dispatch"
+            if dispatch_stall or waiting
+            else "worker occupied"
+            if due
+            else "recovery in progress"
+            if kind == "recovery" and any(job.claim_token for job in work)
+            else "retry backoff"
+            if any(
+                job.status in {"pending", "waiting", "expired"} and job.retry_at
+                for job in work
+            )
+            else None
         )
         lanes[kind] = {
-            "status": "unhealthy" if unhealthy else "degraded" if failed else "healthy",
+            "status": "unhealthy" if unhealthy else "degraded" if reason else "healthy",
             "active_count": sum(bool(job.claim_token) for job in work),
             "due_queue_count": len(due),
             "oldest_due_age_seconds": max(0, (current - oldest).total_seconds())
@@ -288,11 +323,8 @@ def build_pipeline_health(
             "last_progress_at": max(
                 (_as_utc(job.updated_at).isoformat() for job in work), default=None
             ),
-            "waiting_reason": "operator review required"
-            if failed
-            else "awaiting worker dispatch"
-            if dispatch_stall
-            else None,
+            "waiting_reason": reason,
+            "active_without_progress": [job.video_id for job in stalled_jobs],
             "failed_or_expired": [
                 {
                     "video_id": job.video_id,
@@ -302,13 +334,21 @@ def build_pipeline_health(
                 for job in failed
             ],
         }
-        if failed or dispatch_stall:
+        if failed or dispatch_stall or stalled_jobs:
             alerts.append(
                 {
                     "key": f"{kind}:outcome",
-                    "severity": "error" if unhealthy else "warning",
+                    "severity": "error"
+                    if required and current >= grace_end
+                    else "warning",
                     "message": f"{kind} jobs failed or stalled",
-                    "details": {"count": len(failed), "due_queue_count": len(due)},
+                    "details": {
+                        "count": len(failed),
+                        "due_queue_count": len(due),
+                        "active_without_progress": [
+                            job.video_id for job in stalled_jobs
+                        ],
+                    },
                 }
             )
     access_failures = [
@@ -331,7 +371,6 @@ def build_pipeline_health(
         and job.status != "passed"
         and "AuthenticationError:" in (job.last_error or "")
     }
-    access_stall = False
     for key, message, count in (
         (
             "youtube:access",
@@ -353,7 +392,6 @@ def build_pipeline_health(
             and (current - max(eligible_since[key], grace_end)).total_seconds()
             > stall_timeout
         ):
-            access_stall = True
             alerts.append(
                 {
                     "key": key,
@@ -395,8 +433,7 @@ def build_pipeline_health(
     return {
         "version": 2,
         "generated_at": current.isoformat(),
-        "healthy": not access_stall
-        and all(
+        "healthy": all(
             lanes[lane]["status"] != "unhealthy"
             for lane in ("metadata", "download", "upload", "recovery", "cleanup")
         ),
