@@ -28,13 +28,16 @@ HEADER_PATTERN = re.compile(
     r"\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:\s*[^\r\n]+",
     re.IGNORECASE,
 )
-TOKEN_PATTERN = re.compile(
-    r"([\"']?\b(?:po[ _-]?token|integrity[_-]?token|websafeFallbackToken|"
+SECRET_NAMES = (
+    r"po[ _-]?token|integrity[_-]?token|websafeFallbackToken|"
     r"access[_-]?token|refresh[_-]?token|token|password|s3accesskey|s3secretkey|"
-    r"authorization|proxy[_-]?authorization|cookies?|set[_-]?cookie)"
-    r"[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;\r\n]+)",
-    re.IGNORECASE,
+    r"authorization|proxy[_-]?authorization|cookies?|set[_-]?cookie"
 )
+SECRET_PREFIX = rf"[\"']?\b(?:{SECRET_NAMES})[\"']?\s*[:=]\s*"
+TOKEN_PATTERN = re.compile(
+    rf"({SECRET_PREFIX})(?:\"[^\"]*\"|'[^']*'|[^\s,;\r\n{{}}\[\]]+)", re.IGNORECASE
+)
+STRUCTURED_TOKEN_PATTERN = re.compile(rf"({SECRET_PREFIX})(?=[{{\[])", re.IGNORECASE)
 _DIAGNOSTICS: OrderedDict[str, float] = OrderedDict()
 _DIAGNOSTICS_LOCK = Lock()
 _STOP_CONTROLLER: StopController | None = None
@@ -131,8 +134,58 @@ def redact_diagnostics(value: str) -> str:
 
     value = redact_discord_webhooks(value)
     value = URL_PATTERN.sub(safe_url, value)
+    value = _redact_structured_tokens(value)
     value = HEADER_PATTERN.sub("<redacted header>", value)
     return TOKEN_PATTERN.sub(r"\1<redacted>", value)
+
+
+def _redact_structured_tokens(value: str) -> str:
+    """Redact complete credential containers without eating prose alert counts."""
+    pieces: list[str] = []
+    cursor = copied = 0
+    while match := STRUCTURED_TOKEN_PATTERN.search(value, cursor):
+        start = match.end()
+        end = _container_end(value, start)
+        prefix = value[: match.start()].rstrip()
+        # An unquoted prose label with a numeric diagnostic count is not a
+        # credential field. Quoted keys, assignments, and headers remain private.
+        count_in_prose = (
+            match[1].strip().casefold() == "cookies:"
+            and bool(prefix)
+            and prefix[-1].isalnum()
+            and re.fullmatch(r"\{\s*[\"']count[\"']\s*:\s*\d+\s*\}", value[start:end])
+        )
+        if not count_in_prose:
+            pieces.extend((value[copied:start], "<redacted>"))
+            copied = end
+        cursor = end
+    return "".join(pieces) + value[copied:]
+
+
+def _container_end(value: str, start: int) -> int:
+    stack: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for position in range(start, len(value)):
+        character = value[position]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character in "{[":
+            stack.append("}" if character == "{" else "]")
+        elif character in "}]":
+            if character != stack.pop():
+                return len(value)
+            if not stack:
+                return position + 1
+    # An incomplete secret container must not leave its trailing values exposed.
+    return len(value)
 
 
 def _safe_console(message: Any) -> None:
