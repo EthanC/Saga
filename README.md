@@ -121,6 +121,10 @@ Internet Archive authentication failures also retry with backoff. Startup restor
 
 Generic HTML HTTP 400 login errors and malformed CSRF/login replies are service failures, not password rejections. Queue records retain the error category, HTTP status, and request phase. Startup corrects older generic HTTP 400 login errors that were mislabeled as authentication failures.
 
+Transfer and recovery workers share a durable Archive cooldown after network, service, or authentication failures. One worker probes recovery at a time, with backoff capped at 15 minutes unless Archive supplies a longer `Retry-After`. A successful upload or verified remote original releases queued service retries. A metadata-only probe hands a missing original to one upload worker before reopening normal traffic. Legacy multi-hour delays do not postpone the initial probe. `data/transfers.json` exposes the cooldown, next retry, and probe status under `archive_service`.
+
+The upload-ready buffer counts due uploads and active downloads, not originals waiting in retry backoff. Saga can prepare the next video while Archive recovers; retained originals still count toward the data budget and remain until acknowledgement is saved.
+
 ### Storage budget
 
 Set `SAGA_MAX_DATA_BYTES` to limit the data-directory space available for downloads and temporary merge output. For a 250 GB budget:

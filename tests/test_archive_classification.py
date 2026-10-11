@@ -34,6 +34,7 @@ def wire(
     status: int,
     payload: Any,
     identifier: str = "item",
+    retry_after: str | None = None,
 ) -> list[str]:
     puts: list[str] = []
 
@@ -62,6 +63,8 @@ def wire(
         if phase == endpoint:
             response.status_code = status
             content = payload
+            if retry_after is not None:
+                response.headers["Retry-After"] = retry_after
         response._content = (
             content.encode()
             if isinstance(content, str)

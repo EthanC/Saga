@@ -38,6 +38,7 @@ from loguru import logger
 from niquests import Session
 
 from core.archive_errors import failure_cause, failure_facts
+from core.archive_retry import retry_hint, retryable_error
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import Settings
 from core.logging import redact_diagnostics
@@ -374,6 +375,28 @@ class ArchiveProcessor:
         self.download_root = ensure_download_root(settings.download_root)
 
     def process(self, work: ArchiveWork) -> None:
+        try:
+            self._process(work)
+        finally:
+            self.state.finish_archive_request(
+                work, base_delay=self.settings.archive_retry_delay
+            )
+
+    def _failure_delay(self, work: ArchiveWork, error: Exception) -> float:
+        if work.archive_generation is not None and retryable_error(error):
+            return self.state.record_archive_failure(
+                work,
+                base_delay=self.settings.archive_retry_delay,
+                hint=retry_hint(error, utcnow()),
+                error=_error_text(error),
+                **failure_facts(error),
+            )
+        return retry_delay(
+            self.settings.archive_retry_delay,
+            work.job.attempts if work.job else work.progress.retry_attempts + 1,
+        )
+
+    def _process(self, work: ArchiveWork) -> None:
         stage = work.job.kind if work.job else work.progress.status
         try:
             self.stop_controller.check()
@@ -442,10 +465,7 @@ class ArchiveProcessor:
                     last_error=_error_text(error),
                     failure_phase="archive_access",
                     **failure_facts(error),
-                    retry_after=retry_delay(
-                        self.settings.archive_retry_delay,
-                        work.progress.retry_attempts + 1,
-                    ),
+                    retry_after=self._failure_delay(work, error),
                     retry_attempts=work.progress.retry_attempts + 1,
                 )
         except (
@@ -464,10 +484,7 @@ class ArchiveProcessor:
                     last_error=_error_text(error),
                 )
         except Exception as error:
-            delay = retry_delay(
-                self.settings.archive_retry_delay,
-                work.job.attempts if work.job else work.progress.retry_attempts + 1,
-            )
+            delay = self._failure_delay(work, error)
             logger.warning(
                 "Video {} phase {} attempt {} will retry in {:.0f}s: {}",
                 work.video.id,
@@ -667,9 +684,7 @@ class ArchiveProcessor:
                 work,
                 status="upload" if known_failure else "reconcile_upload",
                 error=_error_text(error),
-                delay=retry_delay(
-                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
-                ),
+                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
                 **failure_facts(error),
             )
@@ -683,9 +698,7 @@ class ArchiveProcessor:
                 work,
                 status="reconcile_upload",
                 error=_error_text(error),
-                delay=retry_delay(
-                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
-                ),
+                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
             )
             return
@@ -704,9 +717,7 @@ class ArchiveProcessor:
                 work,
                 status="upload",
                 error=_error_text(error),
-                delay=retry_delay(
-                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
-                ),
+                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
                 **failure_facts(error),
             )
@@ -779,6 +790,9 @@ class ArchiveProcessor:
                 ready_at=utcnow(),
                 failure_phase=None,
                 last_error=None,
+                error_kind=None,
+                error_status=None,
+                error_phase=None,
             )
             self.state.update_job(work, status="passed")
         elif inspection.state == "conflict":
@@ -815,9 +829,9 @@ class ArchiveProcessor:
             work,
             status="waiting",
             error=detail,
-            retry_after=retry_delay(
-                self.settings.archive_retry_delay, work.job.attempts
-            ),
+            retry_after=self._failure_delay(work, error)
+            if error
+            else retry_delay(self.settings.archive_retry_delay, work.job.attempts),
             **(failure_facts(error) if error else {}),
         )
 

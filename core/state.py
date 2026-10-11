@@ -29,6 +29,7 @@ from sqlmodel import (
 )
 
 from core.archive_errors import legacy_bad_login
+from core.archive_retry import MAX_PROBE_DELAY, ArchiveServiceState, retryable_record
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
 from core.staging import completed_download_size, download_reservation, inventory_inputs
 from core.youtube_errors import is_access_error
@@ -172,6 +173,7 @@ class ArchiveProgress(SQLModel, table=True):
     error_kind: str | None = None
     error_status: int | None = None
     error_phase: str | None = None
+    archive_generation: int | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -300,6 +302,8 @@ class ArchiveWork:
     video: Video
     channel: Channel
     job: ArchiveJob | None = None
+    archive_generation: int | None = None
+    archive_probe_token: str | None = None
 
 
 class StateStore:
@@ -750,6 +754,7 @@ class StateStore:
                 progress.claimed_at = None
                 progress.maintenance_token = None
                 progress.reserved_bytes = 0
+                progress.archive_generation = None
                 progress.retry_at = None
                 progress.updated_at = utcnow()
                 session.add(progress)
@@ -801,6 +806,11 @@ class StateStore:
                 report.status = "pending"
                 report.retry_at = None
                 session.add(report)
+            gate = session.get(ArchiveServiceState, 1)
+            if gate is not None:
+                self._clear_archive_probe(gate)
+                gate.generation += 1
+                session.add(gate)
             session.commit()
         interrupted = len(deliveries) + len(archive_rows) + len(reports)
         if interrupted:
@@ -814,6 +824,228 @@ class StateStore:
             )
         else:
             logger.debug("No interrupted workflow claims required recovery")
+
+    @staticmethod
+    def _archive_due(record: Any, now: datetime) -> bool:
+        return record.retry_at is None or _as_utc(record.retry_at) <= _as_utc(now)
+
+    @staticmethod
+    def _clear_archive_probe(gate: ArchiveServiceState) -> None:
+        gate.probe_token = gate.probe_video_id = gate.probe_kind = None
+        gate.probe_claimed_at = None
+
+    def _archive_gate(self, session: Session, now: datetime) -> ArchiveServiceState:
+        gate = session.get(ArchiveServiceState, 1)
+        if gate is None:
+            gate = ArchiveServiceState()
+            # Legacy per-item delays must not postpone the first recovery probe.
+            pending = session.exec(
+                select(ArchiveProgress).where(
+                    col(ArchiveProgress.status).in_(("upload", "reconcile_upload")),
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                )
+            ).all()
+            jobs = session.exec(
+                select(ArchiveJob).where(
+                    ArchiveJob.kind == "recovery",
+                    col(ArchiveJob.status).in_(("pending", "waiting", "expired")),
+                )
+            ).all()
+            if any(retryable_record(row) for row in [*pending, *jobs]):
+                gate.failures = 1
+                gate.retry_at = gate.first_failure_at = now
+            session.add(gate)
+            session.flush()
+        return gate
+
+    def _archive_admission(
+        self, session: Session, now: datetime, lane: str
+    ) -> ArchiveServiceState | None:
+        gate = self._archive_gate(session, now)
+        if gate.failures == 0:
+            return gate
+        if gate.probe_token or not self._archive_due(gate, now):
+            return None
+        if gate.probe_video_id:
+            progress = session.get(ArchiveProgress, gate.probe_video_id)
+            if (
+                progress is None
+                or progress.status != "upload"
+                or progress.media_uploaded_at
+            ):
+                self._clear_archive_probe(gate)
+                session.add(gate)
+            elif lane != "upload":
+                return None
+        if lane == "recovery":
+            uploads = session.exec(
+                select(ArchiveProgress).where(
+                    ArchiveProgress.status == "upload",
+                    col(ArchiveProgress.claimed_at).is_(None),
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                    col(ArchiveProgress.maintenance_token).is_(None),
+                )
+            ).all()
+            if any(
+                self._archive_due(row, now) or retryable_record(row) for row in uploads
+            ):
+                return None
+        return gate
+
+    @staticmethod
+    def _claim_archive_probe(
+        session: Session,
+        gate: ArchiveServiceState | None,
+        video_id: str,
+        kind: str,
+        now: datetime,
+    ) -> str | None:
+        if gate is None or gate.failures == 0:
+            return None
+        token = str(uuid4())
+        gate.probe_token, gate.probe_video_id, gate.probe_kind = token, video_id, kind
+        gate.probe_claimed_at = gate.last_probe_at = now
+        session.add(gate)
+        return token
+
+    def record_archive_failure(
+        self,
+        work: ArchiveWork,
+        *,
+        base_delay: float,
+        hint: float,
+        error: str,
+        error_kind: str | None,
+        error_status: int | None,
+        error_phase: str | None,
+    ) -> float:
+        now = utcnow()
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            progress = session.get(ArchiveProgress, work.video.id)
+            if progress is None or progress.operation_id != work.progress.operation_id:
+                raise RuntimeError("Archive failure belongs to a different operation")
+            if progress.media_uploaded_at is not None:
+                return 0
+            if work.job:
+                job = session.get(ArchiveJob, (work.video.id, work.job.kind))
+                if job is None or job.claim_token != work.job.claim_token:
+                    return 0
+            elif (
+                work.archive_generation is not None
+                and progress.archive_generation != work.archive_generation
+            ):
+                return 0
+            gate = self._archive_gate(session, now)
+            hinted = now + timedelta(seconds=hint)
+            if work.archive_generation != gate.generation:
+                # In-flight peers cannot extend an outage or reset its probes.
+                # A longer explicit Retry-After still takes precedence.
+                if hint and (gate.retry_at is None or _as_utc(gate.retry_at) < hinted):
+                    gate.retry_at = hinted
+                    gate.generation += 1
+                    self._clear_archive_probe(gate)
+                    session.add(gate)
+                    session.commit()
+                return (
+                    max(0.0, (_as_utc(gate.retry_at) - now).total_seconds())
+                    if gate.retry_at
+                    else 0
+                )
+            gate.failures += 1
+            gate.generation += 1
+            gate.first_failure_at = gate.first_failure_at or now
+            delay = max(
+                hint, min(MAX_PROBE_DELAY, retry_delay(base_delay, gate.failures))
+            )
+            gate.retry_at = now + timedelta(seconds=delay)
+            gate.error_kind, gate.error_status, gate.error_phase = (
+                error_kind,
+                error_status,
+                error_phase,
+            )
+            gate.last_error = error
+            self._clear_archive_probe(gate)
+            session.add(gate)
+            session.commit()
+            return delay
+
+    def _release_archive_deferrals(self, session: Session) -> None:
+        rows = session.exec(
+            select(ArchiveProgress).where(
+                col(ArchiveProgress.status).in_(("upload", "reconcile_upload")),
+                col(ArchiveProgress.claimed_at).is_(None),
+                col(ArchiveProgress.media_uploaded_at).is_(None),
+            )
+        ).all()
+        deferred = {row.video_id for row in rows if retryable_record(row)}
+        for row in rows:
+            if row.video_id in deferred:
+                row.retry_at = None
+                session.add(row)
+        jobs = session.exec(
+            select(ArchiveJob).where(
+                ArchiveJob.kind == "recovery",
+                col(ArchiveJob.status).in_(("pending", "waiting", "expired")),
+                col(ArchiveJob.claim_token).is_(None),
+            )
+        ).all()
+        for job in jobs:
+            if (
+                retryable_record(job)
+                or job.error_kind is None
+                and job.video_id in deferred
+            ):
+                job.retry_at = None
+                session.add(job)
+
+    def finish_archive_request(self, work: ArchiveWork, *, base_delay: float) -> None:
+        if work.archive_generation is None:
+            return
+        now = utcnow()
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            gate = session.get(ArchiveServiceState, 1)
+            progress = session.get(ArchiveProgress, work.video.id)
+            if (
+                gate is None
+                or progress is None
+                or progress.operation_id != work.progress.operation_id
+                or work.archive_generation != gate.generation
+            ):
+                return
+            if work.archive_probe_token is None:
+                if gate.failures == 0 and progress.media_uploaded_at:
+                    gate.last_success_at = now
+                    session.add(gate)
+                    session.commit()
+                return
+            if gate.probe_token != work.archive_probe_token:
+                return
+            if progress.media_uploaded_at:
+                gate.failures = 0
+                gate.generation += 1
+                gate.retry_at = gate.first_failure_at = None
+                gate.error_kind = gate.error_phase = gate.last_error = None
+                gate.error_status = None
+                gate.last_success_at = now
+                self._clear_archive_probe(gate)
+                self._release_archive_deferrals(session)
+            elif work.job and progress.status == "upload":
+                # A metadata read is not a successful write probe. Hand its
+                # identified original to one upload worker while peers wait.
+                gate.probe_token = gate.probe_claimed_at = None
+                gate.probe_kind = "upload"
+                gate.retry_at = now
+            else:
+                self._clear_archive_probe(gate)
+                gate.retry_at = (
+                    now + timedelta(seconds=min(MAX_PROBE_DELAY, max(1.0, base_delay)))
+                    if progress.status == "reconcile_upload"
+                    else now
+                )
+            session.add(gate)
+            session.commit()
 
     def refresh_youtube_access(self, cookie_generation: str) -> int:
         """Make failures from an earlier cookie session due without touching claims."""
@@ -836,6 +1068,100 @@ class StateStore:
             session.commit()
             return len(rows)
 
+    def _archive_service_health(
+        self,
+        gate: ArchiveServiceState | None,
+        rows: list[tuple[ArchiveProgress, Video]],
+        jobs: list[ArchiveJob],
+        current: datetime,
+        started_at: datetime,
+        stall_timeout: float,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        alerts: list[dict[str, Any]] = []
+        if gate is None:
+            self._eligible_since.pop("archive:probe", None)
+            return None, alerts
+        status = (
+            "available"
+            if gate.failures == 0
+            else "probing"
+            if gate.probe_token
+            else "cooldown"
+            if not self._archive_due(gate, current)
+            else "probe ready"
+        )
+        snapshot = {
+            "status": status,
+            "failure_count": gate.failures,
+            "next_retry_at": _as_utc(gate.retry_at).isoformat()
+            if gate.retry_at
+            else None,
+            "last_success_at": _as_utc(gate.last_success_at).isoformat()
+            if gate.last_success_at
+            else None,
+            "last_probe_at": _as_utc(gate.last_probe_at).isoformat()
+            if gate.last_probe_at
+            else None,
+            "probe_kind": gate.probe_kind,
+            "probe_video_id": gate.probe_video_id,
+            "error_kind": gate.error_kind,
+            "error_status": gate.error_status,
+            "error_phase": gate.error_phase,
+        }
+        by_id = {row.video_id: row for row, _ in rows}
+        pending = any(
+            row.status == "upload"
+            and not row.claimed_at
+            and not row.maintenance_token
+            and row.media_uploaded_at is None
+            and (self._archive_due(row, current) or retryable_record(row))
+            for row, _ in rows
+        ) or any(
+            job.kind == "recovery"
+            and job.status in {"pending", "waiting", "expired"}
+            and not job.claim_token
+            and job.video_id in by_id
+            and by_id[job.video_id].media_uploaded_at is None
+            and (
+                self._archive_due(job, current)
+                or retryable_record(job)
+                or job.error_kind is None
+                and retryable_record(by_id[job.video_id])
+            )
+            for job in jobs
+        )
+        if status == "probe ready" and pending:
+            self._eligible_since.setdefault("archive:probe", current)
+            if (
+                current
+                - max(
+                    self._eligible_since["archive:probe"],
+                    _as_utc(started_at) + timedelta(seconds=120),
+                    _as_utc(gate.last_probe_at or started_at),
+                )
+            ).total_seconds() > stall_timeout:
+                alerts.append(
+                    {
+                        "key": "archive:probe-stall",
+                        "severity": "error",
+                        "message": "Archive retry probe was not dispatched",
+                        "details": snapshot,
+                    }
+                )
+        else:
+            self._eligible_since.pop("archive:probe", None)
+        if gate.failures:
+            age = (current - _as_utc(gate.first_failure_at or current)).total_seconds()
+            alerts.append(
+                {
+                    "key": "archive:service",
+                    "severity": "error" if age > stall_timeout else "warning",
+                    "message": "Archive service failures; retries are coordinated",
+                    "details": snapshot,
+                }
+            )
+        return snapshot, alerts
+
     def claim_archive(
         self,
         *,
@@ -851,6 +1177,7 @@ class StateStore:
         dispatch_class: str | None = None,
         pause_fresh_downloads: bool = False,
         youtube_cookie_generation: str | None = None,
+        archive_retry_base: float | None = None,
     ) -> ArchiveWork | None:
         """Atomically claim due transfer work within its reserved worker lane."""
         current = now or utcnow()
@@ -886,13 +1213,35 @@ class StateStore:
         )
         with self._write_lock, Session(self.engine) as session:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            gate = (
+                self._archive_admission(session, current, "upload")
+                if lane == "upload" and archive_retry_base is not None
+                else None
+            )
+            if lane == "upload" and archive_retry_base is not None and gate is None:
+                session.commit()
+                return None
+            probe = gate is not None and gate.failures > 0
             if lane == "download":
-                staged = session.exec(
-                    select(func.count(col(ArchiveProgress.video_id))).where(
+                staged_rows = session.exec(
+                    select(ArchiveProgress).where(
                         col(ArchiveProgress.media_uploaded_at).is_(None),
                         ArchiveProgress.status == "upload",
+                        col(ArchiveProgress.retry_at).is_(None)
+                        | (col(ArchiveProgress.retry_at) <= current),
                     )
-                ).one()
+                ).all()
+                service_gate = (
+                    session.get(ArchiveServiceState, 1)
+                    if archive_retry_base is not None
+                    else None
+                )
+                staged = sum(
+                    service_gate is None
+                    or service_gate.failures == 0
+                    or not retryable_record(row)
+                    for row in staged_rows
+                )
                 active = session.exec(
                     select(func.count(col(ArchiveProgress.video_id))).where(
                         ArchiveProgress.status == "download",
@@ -946,10 +1295,13 @@ class StateStore:
                     col(ArchiveProgress.media_uploaded_at).is_(None),
                     col(ArchiveProgress.claimed_at).is_(None),
                     col(ArchiveProgress.maintenance_token).is_(None),
-                    col(ArchiveProgress.retry_at).is_(None)
-                    | (col(ArchiveProgress.retry_at) <= current),
                 )
             )
+            if not probe:
+                statement = statement.where(
+                    col(ArchiveProgress.retry_at).is_(None)
+                    | (col(ArchiveProgress.retry_at) <= current)
+                )
             if lane == "metadata":
                 statement = statement.where(
                     col(Video.notification_candidate).in_(metadata_classes)
@@ -958,13 +1310,25 @@ class StateStore:
             statement = statement.order_by(*queue_order)
             rows = (
                 list(session.exec(statement).all())
-                if lane == "download"
+                if lane == "download" or probe
                 else (
                     [row]
                     if (row := session.exec(statement).first()) is not None
                     else []
                 )
             )
+            if probe:
+                assert gate is not None
+                rows = [
+                    row
+                    for row in rows
+                    if (self._archive_due(row[0], current) or retryable_record(row[0]))
+                    and (
+                        gate.probe_video_id is None
+                        or row[0].video_id == gate.probe_video_id
+                    )
+                ]
+                rows.sort(key=lambda row: row[0].media_size or float("inf"))
             selected = None
             inventories = {
                 progress.video_id: inventory_inputs(
@@ -1090,6 +1454,11 @@ class StateStore:
             progress.claimed_at = current
             progress.attempts += 1
             progress.updated_at = current
+            generation = gate.generation if gate is not None else None
+            progress.archive_generation = generation
+            probe_token = self._claim_archive_probe(
+                session, gate, progress.video_id, "upload", current
+            )
             session.add(progress)
             session.commit()
             for item in (progress, video, channel):
@@ -1101,7 +1470,13 @@ class StateStore:
                 video.id,
                 progress.status,
             )
-            return ArchiveWork(progress=progress, video=video, channel=channel)
+            return ArchiveWork(
+                progress=progress,
+                video=video,
+                channel=channel,
+                archive_generation=generation,
+                archive_probe_token=probe_token,
+            )
 
     def staging_rows(self) -> list[ArchiveProgress]:
         """Read detached operation facts for inventory and narrow maintenance."""
@@ -1196,15 +1571,29 @@ class StateStore:
             )
 
     def claim_background(
-        self, kind: str, *, now: datetime | None = None, max_attempts: int = 12
+        self,
+        kind: str,
+        *,
+        now: datetime | None = None,
+        max_attempts: int = 12,
+        archive_retry_base: float | None = None,
     ) -> ArchiveWork | None:
         """Claim background work; required upload recovery has no expiry budget."""
         current = now or utcnow()
         with self._write_lock, Session(self.engine) as session:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            gate = (
+                self._archive_admission(session, current, "recovery")
+                if kind == "recovery" and archive_retry_base is not None
+                else None
+            )
+            if kind == "recovery" and archive_retry_base is not None and gate is None:
+                session.commit()
+                return None
+            probe = gate is not None and gate.failures > 0
+            statement = select(ArchiveJob)
             jobs = session.exec(
-                select(ArchiveJob)
-                .where(
+                statement.where(
                     ArchiveJob.kind == kind,
                     col(ArchiveJob.status).in_(
                         ("pending", "waiting", "expired")
@@ -1212,12 +1601,20 @@ class StateStore:
                         else ("pending", "waiting")
                     ),
                     col(ArchiveJob.claim_token).is_(None),
-                    col(ArchiveJob.retry_at).is_(None)
-                    | (col(ArchiveJob.retry_at) <= current),
-                )
-                .order_by(col(ArchiveJob.updated_at), col(ArchiveJob.video_id))
+                ).order_by(col(ArchiveJob.updated_at), col(ArchiveJob.video_id))
             ).all()
+            if probe:
+                sizes = dict(
+                    session.exec(
+                        select(ArchiveProgress.video_id, ArchiveProgress.media_size)
+                    ).all()
+                )
+                jobs = sorted(
+                    jobs, key=lambda job: sizes.get(job.video_id) or float("inf")
+                )
             for job in jobs:
+                if not probe and not self._archive_due(job, current):
+                    continue
                 if kind not in {"cleanup", "recovery"} and (
                     job.attempts >= max_attempts
                     or (
@@ -1229,6 +1626,13 @@ class StateStore:
                     continue
                 progress = session.get(ArchiveProgress, job.video_id)
                 assert progress is not None
+                if probe and not (
+                    self._archive_due(job, current)
+                    or retryable_record(job)
+                    or job.error_kind is None
+                    and retryable_record(progress)
+                ):
+                    continue
                 if kind == "recovery" and progress.media_uploaded_at is not None:
                     job.status = "passed"
                     session.add(job)
@@ -1243,12 +1647,23 @@ class StateStore:
                 job.claim_token = str(uuid4())
                 job.claimed_at = current
                 job.attempts += 1
+                probe_token = self._claim_archive_probe(
+                    session, gate, job.video_id, kind, current
+                )
+                generation = gate.generation if gate is not None else None
                 session.add(job)
                 session.commit()
                 for item in (job, progress, video, channel):
                     session.refresh(item)
                     session.expunge(item)
-                return ArchiveWork(progress, video, channel, job)
+                return ArchiveWork(
+                    progress,
+                    video,
+                    channel,
+                    job,
+                    archive_generation=generation,
+                    archive_probe_token=probe_token,
+                )
             session.commit()
             return None
 
@@ -1384,6 +1799,11 @@ class StateStore:
             if progress is None or progress.operation_id != work.progress.operation_id:
                 raise RuntimeError("transfer belongs to a different Saga operation")
             if progress.media_uploaded_at is not None:
+                return
+            if (
+                work.archive_generation is not None
+                and progress.archive_generation != work.archive_generation
+            ):
                 return
             progress.status = status
             progress.claimed_at = None
@@ -1809,6 +2229,7 @@ class StateStore:
                     )
                 ).all()
             )
+            gate = session.get(ArchiveServiceState, 1) if include_archive else None
             # Polls can commit during these reads. Observe time after fetching
             # their timestamps so a newly completed poll cannot have a negative age.
             current = now or utcnow()
@@ -1828,7 +2249,28 @@ class StateStore:
                 download_reason=self.download_pause_reason,
                 lane_progress=self.lane_progress,
                 youtube_cookie_generation=youtube_cookie_generation,
+                archive_pause_reason=(
+                    "Archive retry probe in progress"
+                    if gate and gate.failures and gate.probe_token
+                    else "Archive service cooldown"
+                    if gate and gate.failures and not self._archive_due(gate, current)
+                    else "Archive retry probe required"
+                    if gate and gate.failures
+                    else None
+                ),
             )
+            service_state, service_alerts = self._archive_service_health(
+                gate,
+                rows,
+                jobs,
+                current,
+                started_at or self.health_started_at,
+                stall_timeout,
+            )
+            health["archive_service"] = service_state
+            health["alerts"].extend(service_alerts)
+            if any(alert["key"] == "archive:probe-stall" for alert in service_alerts):
+                health["healthy"] = False
             polling: dict[str, Any] = {}
             for channel_id, interval in intervals.items():
                 stamp = poll_stamps.get(channel_id)
@@ -2096,7 +2538,7 @@ class StateStore:
                 "ALTER TABLE reportcheckpoint ADD COLUMN schedule VARCHAR NOT NULL "
                 "DEFAULT ''"
             )
-        for model in (ArchiveProgress, ArchiveJob, Report):
+        for model in (ArchiveProgress, ArchiveJob, ArchiveServiceState, Report):
             table = cast(Any, model).__table__
             existing = {column["name"] for column in schema.get_columns(table.name)}
             for column in table.columns:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import ExitStack
+from datetime import datetime
 from typing import Any, cast
 from urllib.parse import quote, urlsplit
 
@@ -19,6 +20,7 @@ from archivist import (
 )
 from archivist.core._http import (
     ResponseLike,
+    parse_retry_after,
     raise_for_common_status,
     response_mapping,
     response_text,
@@ -49,6 +51,7 @@ class TransportArchiveClient(InternetArchiveClient):
 
     _request_phase: str | None = None
     _request_status: int | None = None
+    _request_retry_after: float | datetime | None = None
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if isinstance(exc, ServiceError):
@@ -62,13 +65,19 @@ class TransportArchiveClient(InternetArchiveClient):
         )
         if cause.status_code is None:
             cause.status_code = self._request_status
+        if getattr(cause, "retry_after", None) is None:
+            cast(Any, cause).retry_after = self._request_retry_after
 
     def _request(self, method: str, url: str, **kwargs: Any) -> Any:
         self._request_phase = request_phase(method, url)
         self._request_status = None
+        self._request_retry_after = None
         try:
             response = super()._request(method, url, **kwargs)
             self._request_status = response.status_code
+            self._request_retry_after = parse_retry_after(
+                getattr(response, "headers", {})
+            )[0]
             if url in {_common.CSRF_URL, _common.LOGIN_URL}:
                 self._validate_login_response(response, url)
             return response
@@ -79,9 +88,13 @@ class TransportArchiveClient(InternetArchiveClient):
     def _recovery_request(self, method: str, url: str, key: Any, **kwargs: Any) -> Any:
         self._request_phase = request_phase(method, url)
         self._request_status = None
+        self._request_retry_after = None
         try:
             response = super()._recovery_request(method, url, key, **kwargs)
             self._request_status = response.status_code
+            self._request_retry_after = parse_retry_after(
+                getattr(response, "headers", {})
+            )[0]
             return response
         except ServiceError as error:
             self._annotate_failure(error)

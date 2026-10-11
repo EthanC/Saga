@@ -6,6 +6,7 @@ from archivist import (
     AuthenticationError,
     InternetArchiveUploadError,
     NetworkError,
+    RateLimitError,
     ServiceError,
 )
 
@@ -21,6 +22,8 @@ def failure_facts(error: Exception) -> dict[str, Any]:
     kind = (
         "network"
         if isinstance(cause, NetworkError)
+        else "rate_limit"
+        if isinstance(cause, RateLimitError)
         else "permission"
         if isinstance(cause, AuthenticationError)
         and status == 403

@@ -547,6 +547,7 @@ class SagaService:
                 work = self.state.claim_archive(
                     prefer_recent=claim_count % 4 != 3,
                     lane=lane,
+                    archive_retry_base=self.settings.archive_retry_delay,
                     youtube_cookie_generation=self._youtube_cookie_generation,
                     buffer=self.settings.upload_ready_buffer,
                     free_bytes=shutil.disk_usage(self.settings.download_root).free
@@ -568,7 +569,9 @@ class SagaService:
                 )
             else:
                 work = self.state.claim_background(
-                    lane, max_attempts=self.settings.background_max_attempts
+                    lane,
+                    max_attempts=self.settings.background_max_attempts,
+                    archive_retry_base=self.settings.archive_retry_delay,
                 )
             if work is None:
                 async with self._work_changed:

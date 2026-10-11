@@ -24,6 +24,7 @@ def build_pipeline_health(
     download_reason: str | None,
     lane_progress: dict[str, datetime],
     youtube_cookie_generation: str | None = None,
+    archive_pause_reason: str | None = None,
 ) -> dict[str, Any]:
     current = _as_utc(now)
     grace_end = _as_utc(started_at) + timedelta(seconds=STARTUP_GRACE)
@@ -91,6 +92,8 @@ def build_pipeline_health(
             ]
             if all(blocked):
                 reason = "; ".join(sorted(set(str(value) for value in blocked)))
+        if lane == "upload" and candidates and archive_pause_reason:
+            reason = archive_pause_reason
         waiting = bool(due) and len(active) < capacities[lane] and not reason
         if waiting:
             eligible_since.setdefault(lane, current)
@@ -284,7 +287,12 @@ def build_pipeline_health(
         ]
         oldest = min((_as_utc(job.updated_at) for job in due), default=None)
         dispatch_key = f"{kind}:dispatch"
-        waiting = required and bool(due) and not any(job.claim_token for job in work)
+        waiting = (
+            required
+            and bool(due)
+            and not any(job.claim_token for job in work)
+            and not (kind == "recovery" and archive_pause_reason)
+        )
         if waiting:
             eligible_since.setdefault(dispatch_key, current)
         else:
@@ -302,6 +310,8 @@ def build_pipeline_health(
             if stalled_jobs
             else "operator review required"
             if failed
+            else archive_pause_reason
+            if kind == "recovery" and work and archive_pause_reason
             else "awaiting worker dispatch"
             if dispatch_stall or waiting
             else "worker occupied"
