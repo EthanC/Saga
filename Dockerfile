@@ -17,8 +17,8 @@ FROM python:3.14-alpine
 RUN apk add --no-cache ffmpeg libstdc++ su-exec \
     && addgroup -g 1000 saga \
     && adduser -D -H -u 1000 -G saga saga \
-    && mkdir -p /app /config /data \
-    && chown -R saga:saga /app /config /data
+    && mkdir -p /app /config /data /home/saga/.cache/deno \
+    && chown -R saga:saga /app /config /data /home/saga
 
 COPY --from=deno /bin/deno /opt/deno/bin/deno
 COPY --from=deno /usr/local/lib/ld-linux* /usr/local/lib/
@@ -36,6 +36,9 @@ COPY --chown=saga:saga core /app/core
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV PATH="/app/.venv/bin:$PATH" \
+    HOME=/home/saga \
+    XDG_CACHE_HOME=/home/saga/.cache \
+    DENO_DIR=/home/saga/.cache/deno \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PUID=1000 \

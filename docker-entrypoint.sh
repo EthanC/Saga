@@ -8,5 +8,5 @@ case "$PUID:$PGID" in
         ;;
 esac
 
-chown -R "$PUID:$PGID" /data
+chown -R "$PUID:$PGID" /data /home/saga
 exec su-exec "$PUID:$PGID" "$@"

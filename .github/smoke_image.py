@@ -11,6 +11,7 @@ import niquests
 import requests
 import urllib3
 import urllib3_future
+from smoke_cache import main as verify_cache
 from yt_dlp.networking import _requests
 
 from core.config import load_settings, load_youtube_configs
@@ -35,6 +36,7 @@ class FixtureYouTube(YouTubeClient):
 
 async def main() -> None:
     assert vars(os)["getuid"]() == 1000
+    verify_cache()
     assert vars(requests.packages)["urllib3"] is urllib3
     assert _requests.urllib3 is urllib3
     assert niquests.packages.urllib3 is urllib3_future

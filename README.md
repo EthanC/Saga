@@ -44,6 +44,8 @@ docker compose up -d
 
 Keep `stop_grace_period` longer than `SAGA_SHUTDOWN_TIMEOUT`, which defaults to 90 seconds.
 
+The image provides a writable home and yt-dlp/Deno caches under `/home/saga`. The entrypoint assigns cache ownership to the configured `PUID` and `PGID`; no cache volume or environment override is required.
+
 ### Health checks
 
 The container probe reads a small health snapshot without importing the downloader or database libraries. Saga publishes it every 30 seconds, using a dedicated thread for health queries. Missing snapshots, snapshots older than two minutes, stale channel polling, and stalled transfers fail the probe.

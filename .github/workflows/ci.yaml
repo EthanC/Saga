@@ -73,4 +73,5 @@ jobs:
       - name: Smoke test image namespaces and unprivileged startup
         if: github.event_name == 'push'
         run: |
-          docker run --rm --user 1000:1000 --entrypoint python -e PYTHONPATH=/app -v "$PWD/.github/smoke_image.py:/smoke_image.py:ro" "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}" /smoke_image.py
+          docker run --rm --user 1000:1000 --entrypoint python -e PYTHONPATH=/app -v "$PWD/.github:/smoke:ro" "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}" /smoke/smoke_image.py
+          docker run --rm -e PUID=1234 -e PGID=2345 -e PYTHONPATH=/app -v "$PWD/.github:/smoke:ro" "ghcr.io/${GITHUB_REPOSITORY,,}@${{ steps.build.outputs.digest }}" python /smoke/smoke_cache.py
