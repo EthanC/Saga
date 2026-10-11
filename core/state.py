@@ -658,7 +658,9 @@ class StateStore:
                     col(ArchiveProgress.media_uploaded_at).is_(None),
                 )
             ).all():
-                if progress.last_error in {
+                if (progress.last_error or "").startswith(
+                    "AuthenticationError:"
+                ) or progress.last_error in {
                     f"InvalidOptionError: {field} cannot contain controls or surrogates"
                     for field in ("title", "description", "subjects", "creator")
                 }:
@@ -719,6 +721,17 @@ class StateStore:
                     job.last_error = "process stopped before webpage receipt was saved"
                 job.claim_token = None
                 job.claimed_at = None
+                session.add(job)
+            for job in session.exec(
+                select(ArchiveJob).where(
+                    ArchiveJob.kind == "recovery",
+                    ArchiveJob.status == "failed",
+                    col(ArchiveJob.last_error).like("AuthenticationError:%"),
+                )
+            ).all():
+                job.status = "waiting"
+                job.retry_at = None
+                job.deadline_at = None
                 session.add(job)
             # Older releases expired recovery checks while retaining the media.
             # Rebuild missing jobs as well; recovery is required for preservation.

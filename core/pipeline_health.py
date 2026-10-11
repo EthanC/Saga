@@ -318,24 +318,50 @@ def build_pipeline_health(
         and row.status in {"metadata", "download"}
         and row.media_uploaded_at is None
     ]
-    if access_failures:
-        eligible_since.setdefault("youtube:access", current)
-    else:
-        eligible_since.pop("youtube:access", None)
-    access_stall = (
-        bool(access_failures)
-        and (current - max(eligible_since["youtube:access"], grace_end)).total_seconds()
-        > stall_timeout
-    )
-    if access_stall:
-        alerts.append(
-            {
-                "key": "youtube:access",
-                "severity": "error",
-                "message": "YouTube access failures persist; refresh account cookies",
-                "details": {"count": len(access_failures)},
-            }
-        )
+    archive_failures = {
+        row.video_id
+        for row, _ in rows
+        if row.media_uploaded_at is None
+        and row.status in {"upload", "reconcile_upload"}
+        and "AuthenticationError:" in (row.last_error or "")
+    } | {
+        job.video_id
+        for job in jobs
+        if job.kind == "recovery"
+        and job.status != "passed"
+        and "AuthenticationError:" in (job.last_error or "")
+    }
+    access_stall = False
+    for key, message, count in (
+        (
+            "youtube:access",
+            "YouTube access failures persist; refresh account cookies",
+            len(access_failures),
+        ),
+        (
+            "archive:access",
+            "Internet Archive access failures persist; check account credentials",
+            len(archive_failures),
+        ),
+    ):
+        if count:
+            eligible_since.setdefault(key, current)
+        else:
+            eligible_since.pop(key, None)
+        if (
+            count
+            and (current - max(eligible_since[key], grace_end)).total_seconds()
+            > stall_timeout
+        ):
+            access_stall = True
+            alerts.append(
+                {
+                    "key": key,
+                    "severity": "error",
+                    "message": message,
+                    "details": {"count": count},
+                }
+            )
     recent_work = [
         (row, video)
         for row, video in rows

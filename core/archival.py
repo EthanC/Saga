@@ -430,10 +430,24 @@ class ArchiveProcessor:
                 failure_phase=stage,
                 last_error=_error_text(error),
             )
+        except AuthenticationError as error:
+            if work.job:
+                self._defer_job(work, _error_text(error))
+            else:
+                self.state.update_archive(
+                    work.video.id,
+                    release=True,
+                    last_error=_error_text(error),
+                    failure_phase="archive_access",
+                    retry_after=retry_delay(
+                        self.settings.archive_retry_delay,
+                        work.progress.retry_attempts + 1,
+                    ),
+                    retry_attempts=work.progress.retry_attempts + 1,
+                )
         except (
             LocalMediaChangedError,
             RecoveryConflictError,
-            AuthenticationError,
             InvalidOptionError,
         ) as error:
             if work.job:
@@ -668,7 +682,7 @@ class ArchiveProcessor:
             # Both upload APIs wrap service failures once a mutation starts.
             # Retry transient preflight failures without waiting for a remote item.
             if not (
-                isinstance(error, (NetworkError, RateLimitError))
+                isinstance(error, (NetworkError, RateLimitError, AuthenticationError))
                 or error.status_code is not None
                 and (error.status_code in {408, 425, 429} or error.status_code >= 500)
             ):
@@ -1096,7 +1110,13 @@ def _iso_date(upload_date: str) -> str:
 
 
 def _error_text(error: Exception) -> str:
-    return redact_diagnostics(f"{type(error).__name__}: {error}")[:2000]
+    detail = f"{type(error).__name__}: {error}"
+    if isinstance(error, InternetArchiveUploadError):
+        cause = error.cause
+        detail += f"; {type(cause).__name__}: {cause}"
+        if cause.status_code is not None:
+            detail += f" (HTTP {cause.status_code})"
+    return redact_diagnostics(detail)[:2000]
 
 
 def _upload_text(value: str, *, multiline: bool = False) -> str:

@@ -109,6 +109,8 @@ Upload recovery keeps retrying with backoff, including recovery jobs expired by 
 
 Upload display text drops control and surrogate characters rejected by the Internet Archive. Startup requeues uploads rejected for those characters by older releases, without changing their item identifier, operation ID, or media.
 
+Internet Archive authentication failures also retry with backoff. Startup restores uploads and recovery checks abandoned for authentication by older releases. Persistent failures emit an ERROR asking for account credentials to be checked. Upload errors retain their underlying service error and HTTP status for diagnosis.
+
 ### Storage budget
 
 Set `SAGA_MAX_DATA_BYTES` to limit the data-directory space available for downloads and temporary merge output. For a 250 GB budget:
