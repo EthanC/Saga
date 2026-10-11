@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from core.logging import redact_diagnostics
 from core.storage import data_usage
 
@@ -155,8 +157,46 @@ def inventory_inputs(
         )
 
 
+def resume_format_selector(
+    directory: Path, operation_id: str, video_id: str
+) -> str | None:
+    """Prefer validated cached video/audio formats before selecting fresh inputs."""
+    inventory = inventory_inputs(directory, operation_id, video_id)
+    if inventory.finding or not inventory.files:
+        return None
+    manifest = _document(directory / "inputs.json")
+    formats = manifest["formats"]
+    if len(formats) != 2 or any(
+        not re.fullmatch(r"[\w-]+", key) or not isinstance(value, dict)
+        for key, value in formats.items()
+    ):
+        return None
+    video = [
+        key
+        for key, value in formats.items()
+        if value.get("vcodec") not in {None, "none"}
+        and value.get("acodec") in {None, "none"}
+    ]
+    audio = [
+        key
+        for key, value in formats.items()
+        if value.get("acodec") not in {None, "none"}
+        and value.get("vcodec") in {None, "none"}
+    ]
+    return (
+        f"{video[0]}+{audio[0]}/bestvideo+bestaudio"
+        if len(video) == len(audio) == 1
+        else None
+    )
+
+
 def prepare_inputs(
-    directory: Path, operation_id: str, video_id: str, selected: list[dict[str, Any]]
+    directory: Path,
+    operation_id: str,
+    video_id: str,
+    selected: list[dict[str, Any]],
+    *,
+    allow_reselection: bool = False,
 ) -> PartialInventory:
     """Record format identity and adopt legacy input/sidecar sets idempotently."""
     if directory.name != operation_id or directory.is_symlink():
@@ -181,14 +221,36 @@ def prepare_inputs(
             existing = _document(manifest_path)
         except (OSError, ValueError) as error:
             raise StagingIdentityError("invalid input manifest") from error
-        if existing != manifest and (
-            existing.get("operation_id") != operation_id
-            or existing.get("video_id") != video_id
-            or any(INPUT_PATTERN.fullmatch(path.name) for path in directory.iterdir())
-        ):
-            raise StagingIdentityError(
-                "selected formats changed; retained previous inputs"
-            )
+        if existing != manifest:
+            if (
+                existing.get("operation_id") != operation_id
+                or existing.get("video_id") != video_id
+            ):
+                raise StagingIdentityError(
+                    "selected formats changed; retained previous inputs"
+                )
+            if any(INPUT_PATTERN.fullmatch(path.name) for path in directory.iterdir()):
+                inventory = inventory_inputs(directory, operation_id, video_id)
+                media = directory / "media.mkv"
+                if (
+                    not allow_reselection
+                    or inventory.finding
+                    or media.exists()
+                    or media.is_symlink()
+                ):
+                    raise StagingIdentityError(
+                        "selected formats changed; retained previous inputs"
+                    )
+                # Only the active download may discard its validated selected
+                # inputs. Keep the old manifest until deletion finishes so an
+                # interrupted reset can safely resume or repeat on the next try.
+                for path in inventory.files:
+                    path.unlink(missing_ok=True)
+                logger.info(
+                    "Video {} changed formats; reset {} bytes of owned inputs",
+                    video_id,
+                    inventory.partial_bytes,
+                )
     moves: list[tuple[Path, Path]] = []
     for path in directory.iterdir():
         match = INPUT_PATTERN.fullmatch(path.name)

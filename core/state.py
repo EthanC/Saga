@@ -685,6 +685,20 @@ class StateStore:
                     progress.retry_attempts = 0
                     progress.updated_at = utcnow()
                     session.add(progress)
+            for progress in session.exec(
+                select(ArchiveProgress).where(
+                    ArchiveProgress.status == "download",
+                    ArchiveProgress.last_error
+                    == (
+                        "StagingIdentityError: selected formats changed; "
+                        "retained previous inputs"
+                    ),
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                )
+            ).all():
+                progress.retry_at = None
+                progress.retry_attempts = 0
+                session.add(progress)
             archive_rows = session.exec(
                 select(ArchiveProgress).where(
                     col(ArchiveProgress.claimed_at).is_not(None)

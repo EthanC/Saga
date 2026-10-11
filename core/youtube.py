@@ -30,6 +30,7 @@ from core.staging import (
     download_reservation,
     inventory_inputs,
     prepare_inputs,
+    resume_format_selector,
 )
 from core.state import DiscoveredVideo, ResolvedChannel
 from core.workers import run_managed
@@ -401,6 +402,10 @@ class YouTubeClient:
                 "outtmpl": {"default": str(directory / "merging.%(ext)s")},
             }
         )
+        if operation_id:
+            resume = resume_format_selector(directory, operation_id, video_id)
+            if resume:
+                options["format"] = resume
         downloader_type: type[Any] = YoutubeDL
         if self.download_limiter.enabled:
             options.update(
@@ -422,7 +427,9 @@ class YouTubeClient:
                 if info.get("id") != video_id:
                     raise RuntimeError("selected video does not match operation")
                 selected = info.get("requested_formats") or [info]
-                inventory = prepare_inputs(directory, operation_id, video_id, selected)
+                inventory = prepare_inputs(
+                    directory, operation_id, video_id, selected, allow_reselection=True
+                )
                 for path in inventory.files:
                     if (
                         path.name.startswith("merging.")

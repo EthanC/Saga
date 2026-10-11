@@ -109,6 +109,8 @@ Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encodin
 
 Saga retries failed transfers, resumes interrupted downloads, and pauses new downloads when disk space is low. Livestreams wait until a replay is available. See `data/transfers.json` for transfer progress, queue status, and staging space.
 
+Retries prefer the video/audio formats recorded for validated cached inputs. If those formats disappear or their descriptors change, the claimed download resets only its owned, validated inputs and downloads the new selection. Completed originals and ambiguous inputs remain protected. Startup reschedules format-change failures left by older releases.
+
 Upload recovery keeps retrying with backoff, including recovery jobs expired by older releases. Empty item responses trigger a guarded create-only retry; existing items still require matching Saga provenance before file recovery. Local originals remain until upload acknowledgement is saved. Attempt and deadline limits apply to optional background work, not upload recovery.
 
 Startup restores the entire expired recovery backlog and removes legacy recovery deadlines before workers start. It preserves attempt history, pending retry backoff, and ownership conflicts requiring review.
