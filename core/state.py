@@ -28,6 +28,7 @@ from sqlmodel import (
     select,
 )
 
+from core.archive_errors import legacy_bad_login
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
 from core.staging import completed_download_size, download_reservation, inventory_inputs
 from core.youtube_errors import is_access_error
@@ -168,6 +169,9 @@ class ArchiveProgress(SQLModel, table=True):
     cleaned_at: datetime | None = None
     last_error: str | None = None
     updated_at: datetime = Field(default_factory=utcnow)
+    error_kind: str | None = None
+    error_status: int | None = None
+    error_phase: str | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -183,6 +187,9 @@ class ArchiveJob(SQLModel, table=True):
     claimed_at: datetime | None = None
     last_error: str | None = None
     updated_at: datetime = Field(default_factory=utcnow)
+    error_kind: str | None = None
+    error_status: int | None = None
+    error_phase: str | None = None
 
 
 class WorkerTiming(SQLModel, table=True):
@@ -652,6 +659,32 @@ class StateStore:
                 delivery.status = "pending"
                 delivery.retry_at = None
                 session.add(delivery)
+            for model in (ArchiveProgress, ArchiveJob):
+                for row in session.exec(
+                    select(model).where(
+                        col(model.error_kind).is_(None),
+                        col(model.last_error).is_not(None),
+                    )
+                ).all():
+                    if legacy_bad_login(row.last_error):
+                        row.error_kind = "service"
+                        row.error_status = 400
+                        row.error_phase = "login"
+                        row.last_error = (
+                            "InvalidServiceResponseError: unexpected Archive login "
+                            "response (HTTP 400; phase=login)"
+                        )
+                        if (
+                            isinstance(row, ArchiveProgress)
+                            and row.status == "operator_action"
+                            and row.failure_phase == "upload"
+                            and row.media_uploaded_at is None
+                        ):
+                            row.status = "upload"
+                            row.retry_at = None
+                        elif isinstance(row, ArchiveJob) and row.status == "failed":
+                            row.status = "waiting"
+                        session.add(row)
             for progress in session.exec(
                 select(ArchiveProgress).where(
                     ArchiveProgress.status == "operator_action",
@@ -1243,6 +1276,9 @@ class StateStore:
         status: str,
         retry_after: float | None = None,
         error: str | None = None,
+        error_kind: str | None = None,
+        error_status: int | None = None,
+        error_phase: str | None = None,
         **facts: Any,
     ) -> None:
         """Commit background facts only for the current independent claim."""
@@ -1271,6 +1307,11 @@ class StateStore:
                 setattr(progress, name, value)
             job.status = status
             job.last_error = error
+            job.error_kind, job.error_status, job.error_phase = (
+                error_kind,
+                error_status,
+                error_phase,
+            )
             job.updated_at = utcnow()
             if status != "submitting":
                 job.claim_token = None
@@ -1315,6 +1356,7 @@ class StateStore:
             progress.retry_at = None
             progress.reserved_bytes = 0
             progress.last_error = None
+            progress.error_kind = progress.error_status = progress.error_phase = None
             progress.failure_phase = None
             progress.updated_at = utcnow()
             session.add(progress)
@@ -1332,6 +1374,9 @@ class StateStore:
         error: str,
         delay: float,
         deadline: float,
+        error_kind: str | None = None,
+        error_status: int | None = None,
+        error_phase: str | None = None,
     ) -> None:
         """Release failed or uncertain transfers and give checks their own queue."""
         with self._write_lock, Session(self.engine) as session:
@@ -1344,6 +1389,11 @@ class StateStore:
             progress.claimed_at = None
             progress.retry_at = utcnow() + timedelta(seconds=delay)
             progress.last_error = error
+            progress.error_kind, progress.error_status, progress.error_phase = (
+                error_kind,
+                error_status,
+                error_phase,
+            )
             progress.failure_phase = "initial_upload"
             progress.retry_attempts += 1
             progress.updated_at = utcnow()
@@ -2046,7 +2096,7 @@ class StateStore:
                 "ALTER TABLE reportcheckpoint ADD COLUMN schedule VARCHAR NOT NULL "
                 "DEFAULT ''"
             )
-        for model in (ArchiveProgress, Report):
+        for model in (ArchiveProgress, ArchiveJob, Report):
             table = cast(Any, model).__table__
             existing = {column["name"] for column in schema.get_columns(table.name)}
             for column in table.columns:

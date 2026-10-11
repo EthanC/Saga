@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 from typing import Any
 
+from core.archive_errors import is_authentication_failure
 from core.state import ArchiveJob, ArchiveProgress, Video, _as_utc
 
 STARTUP_GRACE = 120
@@ -372,13 +373,24 @@ def build_pipeline_health(
         for row, _ in rows
         if row.media_uploaded_at is None
         and row.status in {"upload", "reconcile_upload"}
-        and "AuthenticationError:" in (row.last_error or "")
+        and is_authentication_failure(row.error_kind, row.last_error)
     } | {
         job.video_id
         for job in jobs
         if job.kind == "recovery"
         and job.status != "passed"
-        and "AuthenticationError:" in (job.last_error or "")
+        and is_authentication_failure(job.error_kind, job.last_error)
+    }
+    permission_failures = {
+        row.video_id
+        for row, _ in rows
+        if row.media_uploaded_at is None and row.error_kind == "permission"
+    } | {
+        job.video_id
+        for job in jobs
+        if job.kind == "recovery"
+        and job.status != "passed"
+        and job.error_kind == "permission"
     }
     for key, message, count in (
         (
@@ -390,6 +402,11 @@ def build_pipeline_health(
             "archive:access",
             "Internet Archive access failures persist; check account credentials",
             len(archive_failures),
+        ),
+        (
+            "archive:permission",
+            "Internet Archive denied item access; review item permissions",
+            len(permission_failures),
         ),
     ):
         if count:

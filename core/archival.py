@@ -37,6 +37,7 @@ from archivist import (
 from loguru import logger
 from niquests import Session
 
+from core.archive_errors import failure_cause, failure_facts
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import Settings
 from core.logging import redact_diagnostics
@@ -433,13 +434,14 @@ class ArchiveProcessor:
             )
         except AuthenticationError as error:
             if work.job:
-                self._defer_job(work, _error_text(error))
+                self._defer_job(work, _error_text(error), error=error)
             else:
                 self.state.update_archive(
                     work.video.id,
                     release=True,
                     last_error=_error_text(error),
                     failure_phase="archive_access",
+                    **failure_facts(error),
                     retry_after=retry_delay(
                         self.settings.archive_retry_delay,
                         work.progress.retry_attempts + 1,
@@ -476,7 +478,11 @@ class ArchiveProcessor:
             )
             if work.job:
                 self.state.update_job(
-                    work, status="waiting", retry_after=delay, error=_error_text(error)
+                    work,
+                    status="waiting",
+                    retry_after=delay,
+                    error=_error_text(error),
+                    **failure_facts(error),
                 )
             elif stage == "upload" and work.progress.status == "uploading":
                 self.state.defer_transfer(
@@ -485,6 +491,7 @@ class ArchiveProcessor:
                     error=_error_text(error),
                     delay=delay,
                     deadline=self.settings.background_deadline,
+                    **failure_facts(error),
                 )
             else:
                 self.state.update_archive(
@@ -619,6 +626,9 @@ class ArchiveProcessor:
             transfer_progress_at=utcnow(),
             failure_phase=None,
             last_error=None,
+            error_kind=None,
+            error_status=None,
+            error_phase=None,
         )
         work.progress.status = "uploading"
         work.progress.transfer_bytes = 0
@@ -661,6 +671,7 @@ class ArchiveProcessor:
                     self.settings.archive_retry_delay, work.progress.retry_attempts + 1
                 ),
                 deadline=self.settings.background_deadline,
+                **failure_facts(error),
             )
             return
         except InvalidOptionError as error:
@@ -684,6 +695,7 @@ class ArchiveProcessor:
             # Retry transient preflight failures without waiting for a remote item.
             if not (
                 isinstance(error, (NetworkError, RateLimitError, AuthenticationError))
+                or getattr(error, "request_phase", None) in {"csrf", "login"}
                 or error.status_code is not None
                 and (error.status_code in {408, 425, 429} or error.status_code >= 500)
             ):
@@ -696,6 +708,7 @@ class ArchiveProcessor:
                     self.settings.archive_retry_delay, work.progress.retry_attempts + 1
                 ),
                 deadline=self.settings.background_deadline,
+                **failure_facts(error),
             )
             return
         if not self._acknowledged(work, result):
@@ -794,7 +807,9 @@ class ArchiveProcessor:
         else:
             self._defer_job(work, inspection.detail)
 
-    def _defer_job(self, work: ArchiveWork, detail: str | None) -> None:
+    def _defer_job(
+        self, work: ArchiveWork, detail: str | None, *, error: Exception | None = None
+    ) -> None:
         assert work.job is not None
         self.state.update_job(
             work,
@@ -803,6 +818,7 @@ class ArchiveProcessor:
             retry_after=retry_delay(
                 self.settings.archive_retry_delay, work.job.attempts
             ),
+            **(failure_facts(error) if error else {}),
         )
 
     def _webpage(self, work: ArchiveWork) -> None:
@@ -1112,11 +1128,18 @@ def _iso_date(upload_date: str) -> str:
 
 def _error_text(error: Exception) -> str:
     detail = f"{type(error).__name__}: {error}"
-    if isinstance(error, InternetArchiveUploadError):
-        cause = error.cause
+    cause = failure_cause(error)
+    if cause is not error:
         detail += f"; {type(cause).__name__}: {cause}"
+    if isinstance(cause, ServiceError):
+        context: list[str] = []
         if cause.status_code is not None:
-            detail += f" (HTTP {cause.status_code})"
+            context.append(f"HTTP {cause.status_code}")
+        phase = getattr(cause, "request_phase", None)
+        if phase:
+            context.append(f"phase={phase}")
+        if context:
+            detail += " (" + "; ".join(context) + ")"
     return redact_diagnostics(detail)[:2000]
 
 
