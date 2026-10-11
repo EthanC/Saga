@@ -28,6 +28,19 @@ def build_pipeline_health(
     alerts: list[dict[str, Any]] = []
     lanes: dict[str, Any] = {}
     recent: dict[str, Any] = {}
+    transfer_progress = max(
+        (
+            _as_utc(stamp)
+            for row, _ in rows
+            for amount, stamp in (
+                (row.download_bytes + row.merge_bytes, row.download_progress_at),
+                (row.transfer_bytes, row.transfer_progress_at),
+                (1, row.media_uploaded_at),
+            )
+            if amount > 0 and stamp is not None
+        ),
+        default=grace_end,
+    )
     for lane in ("metadata", "download", "upload"):
         candidates = [
             (row, video)
@@ -86,6 +99,28 @@ def build_pipeline_health(
             and (current - max(eligible_since[lane], grace_end)).total_seconds()
             > stall_timeout
         )
+        storage_blocked = (
+            lane == "download"
+            and bool(due)
+            and reason
+            in {
+                "disk budget full",
+                "data budget full",
+                "protected partials exceed retention target",
+            }
+        )
+        blocked_key = f"{lane}:storage"
+        if storage_blocked:
+            eligible_since.setdefault(blocked_key, current)
+        else:
+            eligible_since.pop(blocked_key, None)
+        storage_stall = (
+            storage_blocked
+            and (
+                current - max(eligible_since[blocked_key], grace_end, transfer_progress)
+            ).total_seconds()
+            > stall_timeout
+        )
         activity: list[dict[str, Any]] = []
         stalled: list[str] = []
         for row, _ in active:
@@ -121,12 +156,12 @@ def build_pipeline_health(
             )
         status = (
             "unhealthy"
-            if stalled or idle_stall
+            if stalled or idle_stall or storage_stall
             else "degraded"
             if reason and candidates
             else "healthy"
         )
-        if stalled or idle_stall:
+        if stalled or idle_stall or storage_stall:
             alerts.append(
                 {
                     "key": f"{lane}:stall",
@@ -135,6 +170,7 @@ def build_pipeline_health(
                     "details": {
                         "active_without_progress": stalled,
                         "due_queue_count": len(due),
+                        "waiting_reason": reason,
                     },
                 }
             )
@@ -227,8 +263,23 @@ def build_pipeline_health(
             and (not job.retry_at or _as_utc(job.retry_at) <= current)
         ]
         oldest = min((_as_utc(job.updated_at) for job in due), default=None)
+        required = kind in {"recovery", "cleanup"}
+        dispatch_key = f"{kind}:dispatch"
+        waiting = required and bool(due) and not any(job.claim_token for job in work)
+        if waiting:
+            eligible_since.setdefault(dispatch_key, current)
+        else:
+            eligible_since.pop(dispatch_key, None)
+        dispatch_stall = (
+            waiting
+            and (current - max(eligible_since[dispatch_key], grace_end)).total_seconds()
+            > stall_timeout
+        )
+        unhealthy = (
+            required and current >= grace_end and (bool(failed) or dispatch_stall)
+        )
         lanes[kind] = {
-            "status": "degraded" if failed else "healthy",
+            "status": "unhealthy" if unhealthy else "degraded" if failed else "healthy",
             "active_count": sum(bool(job.claim_token) for job in work),
             "due_queue_count": len(due),
             "oldest_due_age_seconds": max(0, (current - oldest).total_seconds())
@@ -237,7 +288,11 @@ def build_pipeline_health(
             "last_progress_at": max(
                 (_as_utc(job.updated_at).isoformat() for job in work), default=None
             ),
-            "waiting_reason": "operator review required" if failed else None,
+            "waiting_reason": "operator review required"
+            if failed
+            else "awaiting worker dispatch"
+            if dispatch_stall
+            else None,
             "failed_or_expired": [
                 {
                     "video_id": job.video_id,
@@ -247,15 +302,40 @@ def build_pipeline_health(
                 for job in failed
             ],
         }
-        if failed:
+        if failed or dispatch_stall:
             alerts.append(
                 {
                     "key": f"{kind}:outcome",
-                    "severity": "warning",
-                    "message": f"{kind} jobs require operator review",
-                    "details": {"count": len(failed)},
+                    "severity": "error" if unhealthy else "warning",
+                    "message": f"{kind} jobs failed or stalled",
+                    "details": {"count": len(failed), "due_queue_count": len(due)},
                 }
             )
+    access_failures = [
+        row
+        for row, _ in rows
+        if row.failure_phase == "youtube_access"
+        and row.status in {"metadata", "download"}
+        and row.media_uploaded_at is None
+    ]
+    if access_failures:
+        eligible_since.setdefault("youtube:access", current)
+    else:
+        eligible_since.pop("youtube:access", None)
+    access_stall = (
+        bool(access_failures)
+        and (current - max(eligible_since["youtube:access"], grace_end)).total_seconds()
+        > stall_timeout
+    )
+    if access_stall:
+        alerts.append(
+            {
+                "key": "youtube:access",
+                "severity": "error",
+                "message": "YouTube access failures persist; refresh account cookies",
+                "details": {"count": len(access_failures)},
+            }
+        )
     recent_work = [
         (row, video)
         for row, video in rows
@@ -289,9 +369,10 @@ def build_pipeline_health(
     return {
         "version": 2,
         "generated_at": current.isoformat(),
-        "healthy": all(
+        "healthy": not access_stall
+        and all(
             lanes[lane]["status"] != "unhealthy"
-            for lane in ("metadata", "download", "upload")
+            for lane in ("metadata", "download", "upload", "recovery", "cleanup")
         ),
         "startup_grace": current < grace_end,
         "lanes": lanes,

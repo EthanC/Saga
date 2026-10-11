@@ -60,7 +60,7 @@ def test_old_ready_work_gets_grace_then_a_new_dispatch_window(tmp_path: Path) ->
         "protected partials exceed retention target",
     ],
 )
-def test_expected_download_wait_is_degraded_not_a_restart_trigger(
+def test_download_backpressure_only_fails_health_when_storage_stops_progress(
     tmp_path: Path, reason: str
 ) -> None:
     state, _, now = queue(tmp_path, "download", recent=True)
@@ -71,7 +71,7 @@ def test_expected_download_wait_is_degraded_not_a_restart_trigger(
     assert any(alert["key"] == "download:recent-age" for alert in health["alerts"])
     assert state.transfer_health(stall_timeout=30, now=now + timedelta(hours=1))[
         "healthy"
-    ]
+    ] == (reason == "upload-ready buffer full")
     state.close()
 
 
@@ -212,7 +212,7 @@ def test_background_outcomes_leave_upload_capacity_independent(
         )
         session.commit()
     health = state.transfer_health(stall_timeout=900, now=now)
-    assert health["healthy"]
+    assert health["healthy"] == (kind != "recovery")
     assert bool(health["lanes"][kind]["failed_or_expired"]) == (kind != "cleanup")
     state.close()
 
