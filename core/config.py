@@ -127,7 +127,7 @@ class Settings:
     report_discord_webhook_url: str | None = None
     report_schedule: str = "0 0 * * *"
     report_finalization_grace: float = 300.0
-    partial_retention_mode: str = "observe"
+    partial_retention_mode: str = "auto"
     partial_max_bytes: int = 100_000_000_000
     partial_min_age: float = 86_400.0
     shutdown_timeout: float = 90.0
@@ -306,9 +306,9 @@ def load_settings(project_root: Path) -> Settings:
     report_finalization_grace = _positive_env_float(
         env, "SAGA_REPORT_FINALIZATION_GRACE", 300.0
     )
-    partial_retention_mode = env.str("SAGA_PARTIAL_RETENTION_MODE", "observe")
-    if partial_retention_mode not in {"observe", "enforce"}:
-        raise ValueError("SAGA_PARTIAL_RETENTION_MODE must be observe or enforce")
+    partial_retention_mode = env.str("SAGA_PARTIAL_RETENTION_MODE", "auto")
+    if partial_retention_mode not in {"auto", "observe", "enforce"}:
+        raise ValueError("SAGA_PARTIAL_RETENTION_MODE must be auto, observe or enforce")
     shutdown_timeout = _positive_env_float(env, "SAGA_SHUTDOWN_TIMEOUT", 90)
     if shutdown_timeout < 10:
         raise ValueError("SAGA_SHUTDOWN_TIMEOUT must allow at least 10 seconds")

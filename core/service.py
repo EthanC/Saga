@@ -551,8 +551,9 @@ class SagaService:
                     unknown_download_bytes=self.settings.unknown_download_bytes,
                     download_root=self.settings.download_root,
                     pause_fresh_downloads=self.settings.partial_retention_mode
-                    == "enforce"
-                    and bool(self._partial_health.get("waiting_reason")),
+                    != "observe"
+                    and self._partial_health.get("waiting_reason")
+                    == "protected partials exceed retention target",
                     dispatch_class=("recent", "resume", "recent", "backfill")[
                         claim_count % 4
                     ]

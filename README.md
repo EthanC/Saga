@@ -117,6 +117,8 @@ The default is `0` (disabled). Saga counts regular-file sizes under `SAGA_DATA_P
 
 `SAGA_MINIMUM_FREE_BYTES` independently reserves free space on the underlying filesystem. It is not subtracted from the 250 GB data budget. `SAGA_PARTIAL_MAX_BYTES` remains a separate cleanup target for eligible inactive partials.
 
+Partial retention defaults to `auto`. Saga reclaims validated inactive inputs, including partials for unavailable videos, when their retention target is exceeded or queued downloads need storage headroom. It removes unavailable-video inputs first, then the oldest retryable inputs, after `SAGA_PARTIAL_MIN_AGE` (one day by default). Completed originals, active operations, unknown directories, and invalid manifests remain protected. `observe` reports without deleting; `enforce` also reclaims inputs. Cleanup decisions and remaining storage pressure appear in `data/transfers.json`.
+
 This is an application-level transfer budget, not a filesystem quota. Database and backup writes continue, and writes between checks or underestimated merge output can exceed the configured value. Files outside `SAGA_DATA_PATH`, symlink targets, and filesystem allocation overhead are not counted.
 
 ## Webpage Capture

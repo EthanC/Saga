@@ -202,7 +202,7 @@ def test_invalid_retention_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("SAGA_PARTIAL_RETENTION_MODE", "delete-all")
-    with pytest.raises(ValueError, match="observe or enforce"):
+    with pytest.raises(ValueError, match="auto, observe or enforce"):
         load_settings(tmp_path)
 
 

@@ -1018,7 +1018,7 @@ class StateStore:
             if (
                 row is None
                 or row.operation_id != operation_id
-                or row.status != "download"
+                or row.status not in {"download", "unavailable"}
                 or row.claimed_at
                 or row.maintenance_token
                 or row.media_uploaded_at
@@ -1043,9 +1043,11 @@ class StateStore:
             row.maintenance_token = None
             row.claimed_at = None
             row.reserved_bytes = 0
-            row.last_error = error
+            if row.status != "unavailable":
+                row.last_error = error
             if error.startswith("partial inputs evicted"):
-                row.failure_phase = "partial_evicted"
+                if row.status != "unavailable":
+                    row.failure_phase = "partial_evicted"
                 row.download_bytes = 0
                 row.download_progress_at = None
                 row.download_phase = None

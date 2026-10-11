@@ -2,6 +2,7 @@
 
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from core.logging import redact_diagnostics
+from core.storage import data_usage
 
 INPUT_PATTERN = re.compile(
     r"(?:media|merging)\.f([\w-]+)\.([a-z0-9]+)(?:\.part(?:-Frag\d+)?)?(?:\.ytdl)?$"
@@ -226,10 +228,11 @@ def maintain_partials(
     youtube: Any = None,
     controller: Any = None,
 ) -> dict[str, Any]:
-    """Observe or reclaim only owned inactive retryable inputs above the target."""
+    """Reclaim owned inactive inputs for retention or download storage headroom."""
     current = time.time() if now is None else now
     rows = state.staging_rows()
     root = settings.download_root.resolve()
+    pressure = _reclaim_needed(rows, settings, current)
     known: set[str] = set()
     candidates: list[tuple[Any, PartialInventory, float]] = []
     findings: list[dict[str, Any]] = []
@@ -314,7 +317,7 @@ def maintain_partials(
         if inventory.finding:
             findings.append({"video_id": row.video_id, "reason": inventory.finding})
         if (
-            row.status != "download"
+            row.status not in {"download", "unavailable"}
             or row.claimed_at
             or row.media_uploaded_at
             or row.download_completed_at
@@ -335,23 +338,29 @@ def maintain_partials(
             findings.append(
                 {"operation_id": directory.name, "reason": "unknown staging entry"}
             )
-    candidates.sort(key=lambda item: (-item[2], item[0].video_id))
+    candidates.sort(
+        key=lambda item: (item[0].status != "unavailable", -item[2], item[0].video_id)
+    )
     decisions: list[dict[str, Any]] = []
     remaining = inactive
+    reclaimed = 0
     for row, inventory, age in candidates:
-        if remaining <= settings.partial_max_bytes:
+        if remaining <= settings.partial_max_bytes and reclaimed >= pressure:
             break
         decision = {
             "operation_id": row.operation_id,
             "video_id": row.video_id,
             "bytes": inventory.partial_bytes,
             "age_seconds": age,
-            "reason": "inactive partial target exceeded",
+            "reason": "download storage headroom required"
+            if reclaimed < pressure
+            else "inactive partial target exceeded",
             "action": "observe",
         }
         decisions.append(decision)
         if settings.partial_retention_mode == "observe":
             remaining -= inventory.partial_bytes
+            reclaimed += inventory.partial_bytes
             continue
         token = state.claim_partial_maintenance(row.video_id, row.operation_id)
         if token is None:
@@ -371,6 +380,7 @@ def maintain_partials(
             for path in refreshed.files:
                 path.unlink(missing_ok=True)
             remaining -= refreshed.partial_bytes
+            reclaimed += refreshed.partial_bytes
             error = (
                 "partial inputs evicted by retention policy; fresh download eligible"
             )
@@ -384,9 +394,59 @@ def maintain_partials(
         "mode": settings.partial_retention_mode,
         "inactive_bytes": inactive,
         "target_bytes": settings.partial_max_bytes,
+        "pressure_bytes": pressure,
+        "reclaimed_bytes": reclaimed
+        if settings.partial_retention_mode != "observe"
+        else 0,
         "decisions": decisions,
         "findings": findings,
         "waiting_reason": "protected partials exceed retention target"
         if remaining > settings.partial_max_bytes
+        else "protected staging prevents storage recovery"
+        if reclaimed < pressure
         else None,
     }
+
+
+def _reclaim_needed(rows: list[Any], settings: Any, current: float) -> int:
+    """Make room for the smallest due download without evicting an original."""
+    reservations: list[int] = []
+    for row in rows:
+        if (
+            row.status != "download"
+            or row.claimed_at
+            or row.maintenance_token
+            or row.media_uploaded_at
+            or row.retry_at
+            and row.retry_at.replace(tzinfo=UTC).timestamp() > current
+        ):
+            continue
+        directory = Path(row.working_directory)
+        if (
+            row.operation_id
+            and completed_download_size(directory, row.operation_id, row.video_id)
+            is not None
+        ):
+            continue
+        # Reserve a fresh download, since reclamation can remove reusable inputs.
+        try:
+            contract = json.loads(row.frozen_metadata or "{}")
+            expected = row.download_estimated_bytes or contract.get("estimated_bytes")
+            expected = max(expected or settings.unknown_download_bytes, 1)
+        except ValueError, TypeError, AttributeError:
+            expected = settings.unknown_download_bytes
+        reservations.append(download_reservation(expected))
+    if not reservations:
+        return 0
+    required = min(reservations) + sum(row.reserved_bytes for row in rows)
+    needed = max(
+        settings.minimum_free_bytes
+        + required
+        - shutil.disk_usage(settings.download_root).free,
+        0,
+    )
+    if settings.max_data_bytes:
+        needed = max(
+            needed, data_usage(settings.data_path) + required - settings.max_data_bytes
+        )
+    return needed
