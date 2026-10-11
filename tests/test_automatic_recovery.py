@@ -11,7 +11,7 @@ from archivist import (
 from sqlmodel import Session
 
 from core.archival import ArchiveProcessor, Inspection, inspect_item
-from core.state import ArchiveJob, StateStore, utcnow
+from core.state import ArchiveJob, StateStore, _as_utc, utcnow
 from core.youtube import YouTubeClient
 from tests.test_archival import FakeGateway, run_job, saved, seed_upload, settings
 
@@ -37,6 +37,10 @@ def test_expired_production_recovery_resumes_and_releases_storage(
     store.close()
     store = StateStore(tmp_path / "saga.sqlite")
     store.reset_interrupted_claims()
+    with Session(store.engine) as session:
+        job = session.get(ArchiveJob, (video_id, "recovery"))
+        assert job is not None and job.status == "waiting" and job.deadline_at is None
+        assert job.attempts == 12 and job.last_error == "item metadata is unresolved"
     gateway = FakeGateway()
     gateway.inspection = inspect_item(InternetArchiveItem(frozen.identifier), frozen, 4)
     assert gateway.inspection.state == "absent"
@@ -82,6 +86,60 @@ def test_pending_recovery_keeps_retrying_with_backoff_without_restart(
             )
     assert media.exists() and gateway.upload_calls == 0
     assert saved(store, video_id).status == "reconcile_upload"
+    store.close()
+
+
+def test_startup_restores_entire_backlog_before_any_worker_claim(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    now = utcnow()
+    statuses = ("expired", "pending", "waiting", "passed", "failed", "missing")
+    for index, status in enumerate(statuses):
+        video_id, _, _ = seed_upload(store, tmp_path, f"Recover{index:04}")
+        store.update_archive(video_id, status="reconcile_upload")
+        if status == "missing":
+            continue
+        with Session(store.engine) as session:
+            session.add(
+                ArchiveJob(
+                    video_id=video_id,
+                    kind="recovery",
+                    status=status,
+                    attempts=11,
+                    deadline_at=now - timedelta(days=3),
+                    retry_at=now + timedelta(hours=1),
+                    last_error="ownership conflict"
+                    if status == "failed"
+                    else "item metadata is unresolved",
+                )
+            )
+            session.commit()
+    completed, _, _ = seed_upload(store, tmp_path, "Completed12")
+    store.update_archive(completed, status="complete", media_uploaded_at=now)
+    with Session(store.engine) as session:
+        session.add(ArchiveJob(video_id=completed, kind="recovery", status="passed"))
+        session.commit()
+    store.close()
+    store = StateStore(tmp_path / "saga.sqlite")
+    store.reset_interrupted_claims()
+    store.reset_interrupted_claims()  # A second startup must not reset retry backoff.
+    with Session(store.engine) as session:
+        for index, status in enumerate(statuses):
+            job = session.get(ArchiveJob, (f"Recover{index:04}", "recovery"))
+            assert job is not None and job.claim_token is None
+            if status == "failed":
+                assert job.status == "failed" and job.last_error == "ownership conflict"
+            else:
+                assert job.status in {"pending", "waiting"} and job.deadline_at is None
+                assert job.attempts == (0 if status == "missing" else 11)
+                assert (_as_utc(job.retry_at) if job.retry_at else None) == (
+                    now + timedelta(hours=1)
+                    if status in {"pending", "waiting"}
+                    else None
+                )
+        job = session.get(ArchiveJob, (completed, "recovery"))
+        assert job is not None and job.status == "passed"
     store.close()
 
 

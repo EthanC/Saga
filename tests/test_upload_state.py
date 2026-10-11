@@ -59,7 +59,7 @@ def test_restart_reactivates_completed_recovery_after_new_transfer(
         job = session.get(ArchiveJob, (video_id, "recovery"))
         assert job is not None and job.status == "pending" and job.attempts == 0
         assert job.claim_token is None and job.claimed_at is None
-        assert job.deadline_at == now + timedelta(seconds=120)
+        assert job.deadline_at is None
     gateway.inspection = Inspection(evidence)
     processor = ArchiveProcessor(settings(tmp_path), store, YouTubeClient(), gateway)
     run_job(store, processor, "recovery", max_attempts=1)

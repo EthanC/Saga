@@ -706,12 +706,7 @@ class StateStore:
                 progress.updated_at = utcnow()
                 session.add(progress)
                 if progress.status == "reconcile_upload":
-                    self._restart_recovery_job(
-                        session,
-                        progress.video_id,
-                        delay=0,
-                        deadline=background_deadline,
-                    )
+                    self._restart_recovery_job(session, progress.video_id, delay=0)
             jobs = session.exec(
                 select(ArchiveJob).where(col(ArchiveJob.claim_token).is_not(None))
             ).all()
@@ -742,6 +737,15 @@ class StateStore:
                 )
             ).all():
                 self._queue_job(session, progress.video_id, "recovery")
+                session.flush()
+                job = session.get(ArchiveJob, (progress.video_id, "recovery"))
+                assert job is not None
+                if job.status in {"expired", "passed"}:
+                    job.status = "waiting"
+                    job.retry_at = None
+                if job.status in {"pending", "waiting"}:
+                    job.deadline_at = None
+                    session.add(job)
             reports = session.exec(
                 select(Report).where(Report.status == "sending")
             ).all()
@@ -1094,7 +1098,7 @@ class StateStore:
                     video_id=video_id,
                     kind=kind,
                     deadline_at=utcnow() + timedelta(seconds=deadline)
-                    if deadline
+                    if deadline and kind != "recovery"
                     else None,
                 )
             )
@@ -1157,10 +1161,8 @@ class StateStore:
             return None
 
     @staticmethod
-    def _restart_recovery_job(
-        session: Session, video_id: str, *, delay: float, deadline: float
-    ) -> None:
-        """Give a newly uncertain transfer its own recovery budget and claim."""
+    def _restart_recovery_job(session: Session, video_id: str, *, delay: float) -> None:
+        """Reset recovery for a newly uncertain transfer without an expiry deadline."""
         job = session.get(ArchiveJob, (video_id, "recovery"))
         if job is None:
             job = ArchiveJob(video_id=video_id, kind="recovery")
@@ -1168,7 +1170,7 @@ class StateStore:
         job.status = "pending"
         job.attempts = 0
         job.retry_at = now + timedelta(seconds=delay)
-        job.deadline_at = now + timedelta(seconds=deadline)
+        job.deadline_at = None
         job.claim_token = None
         job.claimed_at = None
         job.last_error = None
@@ -1288,9 +1290,7 @@ class StateStore:
             progress.updated_at = utcnow()
             session.add(progress)
             if status == "reconcile_upload":
-                self._restart_recovery_job(
-                    session, work.video.id, delay=delay, deadline=deadline
-                )
+                self._restart_recovery_job(session, work.video.id, delay=delay)
             session.commit()
 
     def queue_webpage_only(self, video_id: str, *, deadline: float) -> None:

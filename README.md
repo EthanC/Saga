@@ -107,6 +107,8 @@ Saga retries failed transfers, resumes interrupted downloads, and pauses new dow
 
 Upload recovery keeps retrying with backoff, including recovery jobs expired by older releases. Empty item responses trigger a guarded create-only retry; existing items still require matching Saga provenance before file recovery. Local originals remain until upload acknowledgement is saved. Attempt and deadline limits apply to optional background work, not upload recovery.
 
+Startup restores the entire expired recovery backlog and removes legacy recovery deadlines before workers start. It preserves attempt history, pending retry backoff, and ownership conflicts requiring review.
+
 Upload display text drops control and surrogate characters rejected by the Internet Archive. Startup requeues uploads rejected for those characters by older releases, without changing their item identifier, operation ID, or media.
 
 Internet Archive authentication failures also retry with backoff. Startup restores uploads and recovery checks abandoned for authentication by older releases. Persistent failures emit an ERROR asking for account credentials to be checked. Upload errors retain their underlying service error and HTTP status for diagnosis.
