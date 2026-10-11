@@ -339,6 +339,51 @@ def test_alert_transitions_reminders_and_recovery_are_bounded(
     state.close()
 
 
+def test_severity_only_changes_log_immediately_without_reminder_spam(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = StateStore(tmp_path / "saga.sqlite")
+    saga = SagaService(settings(tmp_path), (), state, YouTubeClient())
+    events: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "logger",
+        SimpleNamespace(
+            error=lambda *args: events.append("error"),
+            warning=lambda *args: events.append("warning"),
+            info=lambda *args: events.append("recovered"),
+        ),
+    )
+    now = [0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: now[0])
+    alert = {
+        "key": "recovery:outcome",
+        "severity": "warning",
+        "message": "recovery jobs failed or stalled",
+        "details": {"count": 369},
+    }
+    saga._emit_health_alerts([alert])
+    now[0] = 30
+    saga._emit_health_alerts([dict(alert, details={"count": 368})])
+    assert events == ["warning"]
+    now[0] = 60
+    saga._emit_health_alerts([dict(alert, severity="error")])
+    assert events == ["warning", "error"]
+    now[0] = 61
+    saga._emit_health_alerts([dict(alert, severity="error")])
+    now[0] = 90
+    saga._emit_health_alerts([alert])
+    now[0] = 989
+    saga._emit_health_alerts([alert])
+    assert events == ["warning", "error", "warning"]
+    now[0] = 990
+    saga._emit_health_alerts([alert])
+    saga._emit_health_alerts([])
+    saga._emit_health_alerts([])
+    assert events == ["warning", "error", "warning", "warning", "recovered"]
+    state.close()
+
+
 def test_interrupted_health_publication_keeps_previous_document(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

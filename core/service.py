@@ -84,7 +84,7 @@ class SagaService:
         self._partial_health: dict[str, Any] = {}
         self.started_at = utcnow()
         self._channel_intervals: dict[str, float] = {}
-        self._health_alerts: dict[str, tuple[str, float]] = {}
+        self._health_alerts: dict[str, tuple[str, str, float]] = {}
         self._initializing = False
         self._startup_progress = time.monotonic()
         self._publication_started: float | None = None
@@ -693,14 +693,20 @@ class SagaService:
         for alert in alerts:
             key = alert["key"]
             message = alert["message"]
+            severity = alert["severity"]
             previous = self._health_alerts.get(key)
-            if previous is None or previous[0] != message or now - previous[1] >= 900:
-                log = logger.error if alert["severity"] == "error" else logger.warning
+            if (
+                previous is None
+                or previous[0] != message
+                or previous[1] != severity
+                or now - previous[2] >= 900
+            ):
+                log = logger.error if severity == "error" else logger.warning
                 log("{}: {}", message, alert["details"])
-                self._health_alerts[key] = (message, now)
+                self._health_alerts[key] = (message, severity, now)
         for key in tuple(self._health_alerts):
             if key not in active:
-                message, _ = self._health_alerts.pop(key)
+                message, _, _ = self._health_alerts.pop(key)
                 logger.info("Pipeline condition recovered: {}", message)
 
     async def _partial_maintenance_loop(self) -> None:

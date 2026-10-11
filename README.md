@@ -52,6 +52,8 @@ Startup reports progress while resolving channels and establishing notification 
 
 The probe measures worker liveness. Active recovery, remote-service retry backoff, rejected credentials, storage limits, and jobs requiring operator review are degraded conditions, not restart triggers. Prolonged storage or authentication failures and required-job failures emit ERROR alerts while retries continue. Undispatched due work or an active worker without progress beyond `SAGA_TRANSFER_STALL_TIMEOUT` fails the probe. Optional validation and webpage outcomes remain warnings.
 
+Alerts log immediately when their message or severity changes. Unchanged conditions repeat every 15 minutes, and clearing a condition logs its recovery once.
+
 ## Python
 
 Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then install the dependencies:
