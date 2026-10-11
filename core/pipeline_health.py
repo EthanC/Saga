@@ -22,6 +22,7 @@ def build_pipeline_health(
     metadata_reasons: dict[str, str | None],
     download_reason: str | None,
     lane_progress: dict[str, datetime],
+    youtube_cookie_generation: str | None = None,
 ) -> dict[str, Any]:
     current = _as_utc(now)
     grace_end = _as_utc(started_at) + timedelta(seconds=STARTUP_GRACE)
@@ -351,12 +352,20 @@ def build_pipeline_health(
                     },
                 }
             )
-    access_failures = [
+    access_history = [
         row
         for row, _ in rows
         if row.failure_phase == "youtube_access"
         and row.status in {"metadata", "download"}
         and row.media_uploaded_at is None
+    ]
+    access_failures = [
+        row
+        for row in access_history
+        if (
+            youtube_cookie_generation is None
+            or row.youtube_access_generation == youtube_cookie_generation
+        )
     ]
     archive_failures = {
         row.video_id
@@ -442,4 +451,8 @@ def build_pipeline_health(
         "recent": recent,
         "oldest_recent": oldest_recent,
         "alerts": alerts,
+        "youtube_access": {
+            "current_failures": len(access_failures),
+            "awaiting_recheck": len(access_history) - len(access_failures),
+        },
     }

@@ -148,6 +148,8 @@ Cookies are needed only for account-restricted videos. Follow yt-dlp's [cookie e
 
 Age checks, sign-in requirements, and bot challenges retry with backoff instead of marking videos permanently unavailable. On startup, Saga also requeues access failures marked unavailable by older releases, retaining their operation and partial inputs.
 
+Saga checks for cookie changes every 30 seconds and reschedules failures from earlier sessions. Metadata rechecks get priority even when the normal metadata buffer is full; download space and upload-buffer limits still apply. Authentication alerts count only failures observed with the current session. Older failures awaiting another attempt are listed separately under `youtube_access.awaiting_recheck` in `data/transfers.json`.
+
 When cookies are configured, add [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) and the corresponding Saga dependency to `compose.yaml`:
 
 ```yaml

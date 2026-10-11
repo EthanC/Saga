@@ -33,6 +33,7 @@ from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore, utcnow
 from core.storage import data_usage, remaining_data_bytes
 from core.youtube import YouTubeClient
+from core.youtube_errors import cookie_fingerprint
 
 STARTUP_STALL_TIMEOUT = 300
 
@@ -91,6 +92,7 @@ class SagaService:
         self._poll_slots = asyncio.Semaphore(2)
         self._history_slots = asyncio.Semaphore(1)
         self._staging_bytes: int | None = None
+        self._youtube_cookie_generation: str | None = None
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
@@ -137,6 +139,9 @@ class SagaService:
                             name="backup-scheduler",
                         )
                     if self.archival is not None:
+                        workers.create_task(
+                            self._cookie_watch_loop(), name="cookie-watch"
+                        )
                         for lane, count in (
                             ("upload", self.settings.upload_workers),
                             ("download", self.settings.download_workers),
@@ -542,6 +547,7 @@ class SagaService:
                 work = self.state.claim_archive(
                     prefer_recent=claim_count % 4 != 3,
                     lane=lane,
+                    youtube_cookie_generation=self._youtube_cookie_generation,
                     buffer=self.settings.upload_ready_buffer,
                     free_bytes=shutil.disk_usage(self.settings.download_root).free
                     if lane == "download"
@@ -645,6 +651,7 @@ class SagaService:
             download_workers=self.settings.download_workers,
             channel_intervals=self._channel_intervals,
             include_archive=self.archival is not None,
+            youtube_cookie_generation=self._cookie_generation(),
         )
         publication_started = self._publication_started
         if publication_started is not None and (
@@ -708,6 +715,32 @@ class SagaService:
             if key not in active:
                 message, _, _ = self._health_alerts.pop(key)
                 logger.info("Pipeline condition recovered: {}", message)
+
+    def _cookie_generation(self) -> str:
+        path = self.settings.youtube_cookies_path
+        return cookie_fingerprint(path.read_text(encoding="utf-8") if path else None)
+
+    async def _cookie_watch_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                generation = await asyncio.to_thread(self._cookie_generation)
+                self._youtube_cookie_generation = generation
+                count = await asyncio.to_thread(
+                    self.state.refresh_youtube_access, generation
+                )
+                if count:
+                    logger.info(
+                        "Scheduled {} earlier YouTube access failures for recheck",
+                        count,
+                    )
+                    async with self._work_changed:
+                        self._work_changed.notify_all()
+            except OSError as error:
+                logger.warning(
+                    "YouTube cookie watcher could not read the session ({})",
+                    type(error).__name__,
+                )
+            await self._wait(30)
 
     async def _partial_maintenance_loop(self) -> None:
         while not self.stop.is_set():

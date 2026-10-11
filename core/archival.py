@@ -416,6 +416,7 @@ class ArchiveProcessor:
                 work.video.id,
                 release=True,
                 failure_phase="youtube_access",
+                youtube_access_generation=error.cookie_generation,
                 last_error=_error_text(error),
                 retry_after=retry_delay(
                     self.settings.archive_retry_delay, work.progress.retry_attempts + 1

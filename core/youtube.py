@@ -33,7 +33,7 @@ from core.staging import (
 )
 from core.state import DiscoveredVideo, ResolvedChannel
 from core.workers import run_managed
-from core.youtube_errors import VideoAccessError, is_access_error
+from core.youtube_errors import VideoAccessError, cookie_fingerprint, is_access_error
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
 CONTENT_TABS: tuple[tuple[ContentType, str], ...] = (
@@ -223,6 +223,7 @@ class YouTubeClient:
         logger.debug("Fetching full metadata for video {}", video_id)
         options = self._options()
         options.update({"noplaylist": True})
+        generation = _cookie_generation(options)
         try:
             with _limited_downloader(
                 YoutubeDL, self.download_limiter, self.stop_controller
@@ -231,7 +232,9 @@ class YouTubeClient:
                     f"https://www.youtube.com/watch?v={video_id}", download=False
                 )
         except DownloadError as error:
-            raise _classify_download_error(error) from error
+            raise _classify_download_error(
+                error, cookie_generation=generation
+            ) from error
         if not isinstance(info, dict):
             raise RuntimeError(f"yt-dlp returned no metadata for {video_id}")
         metadata = _full_metadata(info, video_id)
@@ -331,6 +334,7 @@ class YouTubeClient:
 
         options = self._options()
         streams: dict[str, tuple[int, int]] = {}
+        generation = _cookie_generation(options)
 
         def guard(event: dict[str, Any]) -> None:
             self.stop_controller.check()
@@ -451,7 +455,9 @@ class YouTubeClient:
                     [f"https://www.youtube.com/watch?v={video_id}"]
                 )
         except DownloadError as error:
-            raise _classify_download_error(error) from error
+            raise _classify_download_error(
+                error, cookie_generation=generation
+            ) from error
         if result != 0:
             raise RuntimeError(f"yt-dlp exited with status {result} for {video_id}")
         if not merging.is_file() or merging.stat().st_size == 0:
@@ -478,6 +484,7 @@ class YouTubeClient:
             "noplaylist": True,
             "format": "bestvideo+bestaudio",
         }
+        generation = _cookie_generation(options)
         try:
             with _limited_downloader(
                 YoutubeDL, self.download_limiter, self.stop_controller
@@ -486,7 +493,9 @@ class YouTubeClient:
                     f"https://www.youtube.com/watch?v={video_id}", download=False
                 )
         except DownloadError as error:
-            raise _classify_download_error(error) from error
+            raise _classify_download_error(
+                error, cookie_generation=generation
+            ) from error
         if not isinstance(info, dict) or info.get("id") != video_id:
             raise StagingIdentityError(
                 "selected video does not match partial operation"
@@ -892,10 +901,19 @@ def _required_text(
     return value.strip()
 
 
-def _classify_download_error(error: DownloadError) -> RuntimeError:
+def _cookie_generation(options: dict[str, Any]) -> str:
+    cookies = options.get("cookiefile")
+    return cookie_fingerprint(cookies.getvalue() if cookies is not None else None)
+
+
+def _classify_download_error(
+    error: DownloadError, *, cookie_generation: str | None = None
+) -> RuntimeError:
     detail = redact_diagnostics(str(error))
     if is_access_error(detail):
-        return VideoAccessError(detail)
+        result = VideoAccessError(detail)
+        result.cookie_generation = cookie_generation
+        return result
     unavailable_markers = (
         "private video",
         "video unavailable",

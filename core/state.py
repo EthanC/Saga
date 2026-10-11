@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import case, event, func, inspect, text
+from sqlalchemy import case, event, false, func, inspect, text
 from sqlmodel import (
     Field,
     Session,
@@ -161,6 +161,7 @@ class ArchiveProgress(SQLModel, table=True):
     media_verified_at: datetime | None = None
     recovery_result: str | None = None
     failure_phase: str | None = None
+    youtube_access_generation: str | None = None
     wayback_job_id: str | None = None
     webpage_status: str | None = None
     ziggy_receipt: str | None = None
@@ -767,6 +768,27 @@ class StateStore:
         else:
             logger.debug("No interrupted workflow claims required recovery")
 
+    def refresh_youtube_access(self, cookie_generation: str) -> int:
+        """Make failures from an earlier cookie session due without touching claims."""
+        with self._write_lock, Session(self.engine) as session:
+            rows = session.exec(
+                select(ArchiveProgress).where(
+                    col(ArchiveProgress.status).in_(("metadata", "download")),
+                    ArchiveProgress.failure_phase == "youtube_access",
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                    col(ArchiveProgress.claimed_at).is_(None),
+                    col(ArchiveProgress.maintenance_token).is_(None),
+                    col(ArchiveProgress.retry_at).is_not(None),
+                    col(ArchiveProgress.youtube_access_generation).is_(None)
+                    | (ArchiveProgress.youtube_access_generation != cookie_generation),
+                )
+            ).all()
+            for row in rows:
+                row.retry_at = None
+                session.add(row)
+            session.commit()
+            return len(rows)
+
     def claim_archive(
         self,
         *,
@@ -781,6 +803,7 @@ class StateStore:
         download_root: Path | None = None,
         dispatch_class: str | None = None,
         pause_fresh_downloads: bool = False,
+        youtube_cookie_generation: str | None = None,
     ) -> ArchiveWork | None:
         """Atomically claim due transfer work within its reserved worker lane."""
         current = now or utcnow()
@@ -790,12 +813,25 @@ class StateStore:
             "metadata": ("metadata",),
             "transfer": ("upload", "download", "metadata"),
         }[lane]
+        access_recheck = (
+            (col(ArchiveProgress.failure_phase) == "youtube_access")
+            & (
+                col(ArchiveProgress.youtube_access_generation).is_(None)
+                | (
+                    ArchiveProgress.youtube_access_generation
+                    != youtube_cookie_generation
+                )
+            )
+            if youtube_cookie_generation is not None
+            else false()
+        )
         queue_order = (
             case(
                 (col(ArchiveProgress.status) == "upload", 0),
                 (col(ArchiveProgress.status) == "download", 1),
                 else_=2,
             ),
+            case((access_recheck, 0), else_=1),
             case((col(ArchiveProgress.failure_phase) == "disk", 1), else_=0),
             case((col(Video.notification_candidate).is_(prefer_recent), 0), else_=1),
             col(ArchiveProgress.updated_at),
@@ -870,6 +906,7 @@ class StateStore:
             if lane == "metadata":
                 statement = statement.where(
                     col(Video.notification_candidate).in_(metadata_classes)
+                    | access_recheck
                 )
             statement = statement.order_by(*queue_order)
             rows = (
@@ -907,7 +944,7 @@ class StateStore:
             }
             if lane == "download" and dispatch_class:
 
-                def priority(row: Any) -> tuple[int, int, datetime, str]:
+                def priority(row: Any) -> tuple[int, int, int, datetime, str]:
                     progress, video, _ = row
                     inventory = inventories.get(video.id)
                     category = (
@@ -927,6 +964,14 @@ class StateStore:
                     ]
                     return (
                         int(completed.get(video.id) is None),
+                        int(
+                            not (
+                                youtube_cookie_generation is not None
+                                and progress.failure_phase == "youtube_access"
+                                and progress.youtube_access_generation
+                                != youtube_cookie_generation
+                            )
+                        ),
                         order.index(category),
                         progress.updated_at,
                         video.id,
@@ -1676,6 +1721,7 @@ class StateStore:
         download_workers: int = 1,
         channel_intervals: dict[str, float] | None = None,
         include_archive: bool = True,
+        youtube_cookie_generation: str | None = None,
     ) -> dict[str, Any]:
         """Measure progress, due age, and backpressure independently across lanes."""
         from core.pipeline_health import build_pipeline_health
@@ -1717,6 +1763,7 @@ class StateStore:
                 metadata_reasons=self.metadata_pause_reasons,
                 download_reason=self.download_pause_reason,
                 lane_progress=self.lane_progress,
+                youtube_cookie_generation=youtube_cookie_generation,
             )
             polling: dict[str, Any] = {}
             for channel_id, interval in intervals.items():
