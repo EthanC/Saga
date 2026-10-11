@@ -688,6 +688,15 @@ class StateStore:
                 job.claim_token = None
                 job.claimed_at = None
                 session.add(job)
+            # Older releases expired recovery checks while retaining the media.
+            # Rebuild missing jobs as well; recovery is required for preservation.
+            for progress in session.exec(
+                select(ArchiveProgress).where(
+                    ArchiveProgress.status == "reconcile_upload",
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                )
+            ).all():
+                self._queue_job(session, progress.video_id, "recovery")
             reports = session.exec(
                 select(Report).where(Report.status == "sending")
             ).all()
@@ -1046,7 +1055,7 @@ class StateStore:
     def claim_background(
         self, kind: str, *, now: datetime | None = None, max_attempts: int = 12
     ) -> ArchiveWork | None:
-        """Claim one bounded background job without acquiring its transfer row."""
+        """Claim background work; required upload recovery has no expiry budget."""
         current = now or utcnow()
         with self._write_lock, Session(self.engine) as session:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -1054,7 +1063,11 @@ class StateStore:
                 select(ArchiveJob)
                 .where(
                     ArchiveJob.kind == kind,
-                    col(ArchiveJob.status).in_(("pending", "waiting")),
+                    col(ArchiveJob.status).in_(
+                        ("pending", "waiting", "expired")
+                        if kind == "recovery"
+                        else ("pending", "waiting")
+                    ),
                     col(ArchiveJob.claim_token).is_(None),
                     col(ArchiveJob.retry_at).is_(None)
                     | (col(ArchiveJob.retry_at) <= current),
@@ -1062,7 +1075,7 @@ class StateStore:
                 .order_by(col(ArchiveJob.updated_at), col(ArchiveJob.video_id))
             ).all()
             for job in jobs:
-                if kind != "cleanup" and (
+                if kind not in {"cleanup", "recovery"} and (
                     job.attempts >= max_attempts
                     or (
                         job.deadline_at and _as_utc(job.deadline_at) <= _as_utc(current)
@@ -1077,6 +1090,9 @@ class StateStore:
                     job.status = "passed"
                     session.add(job)
                     continue
+                if kind == "recovery":
+                    job.status = "waiting"
+                    job.deadline_at = None
                 video = session.get(Video, job.video_id)
                 assert video is not None
                 channel = session.get(Channel, video.channel_id)

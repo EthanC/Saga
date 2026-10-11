@@ -71,17 +71,17 @@ def test_restart_reactivates_completed_recovery_after_new_transfer(
     elif evidence == "missing":
         assert store.claim_archive(lane="upload", prefer_recent=False) is not None
     else:
-        # Restarting a status check must not renew an exhausted attempt budget.
+        # Required recovery continues beyond the old attempt budget and deadline.
         store.reset_interrupted_claims(background_deadline=120)
         assert (
             store.claim_background(
                 "recovery", now=now + timedelta(seconds=10), max_attempts=1
             )
-            is None
+            is not None
         )
         with Session(store.engine) as session:
             job = session.get(ArchiveJob, (video_id, "recovery"))
-            assert job is not None and job.status == "expired"
+            assert job is not None and job.deadline_at is None and job.attempts == 2
     store.close()
 
 

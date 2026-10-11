@@ -628,6 +628,21 @@ class ArchiveProcessor:
                 deadline=self.settings.background_deadline,
             )
             return
+        except InvalidOptionError as error:
+            if str(error) != "Internet Archive item identifier is unavailable":
+                raise
+            # A create-only retry can lose a race with delayed item creation.
+            # Inspect provenance again instead of abandoning its local original.
+            self.state.defer_transfer(
+                work,
+                status="reconcile_upload",
+                error=_error_text(error),
+                delay=retry_delay(
+                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
+                ),
+                deadline=self.settings.background_deadline,
+            )
+            return
         except ServiceError as error:
             self.stop_controller.check()
             # Both upload APIs wrap service failures once a mutation starts.
@@ -707,12 +722,12 @@ class ArchiveProcessor:
                 deadline=self.settings.background_deadline,
             )
             self.state.update_job(work, status="passed")
-        elif inspection.state == "missing":
+        elif inspection.state in {"missing", "absent"}:
             self.state.update_archive(
                 work.video.id,
                 status="upload",
                 release=True,
-                upload_mode="recover",
+                upload_mode="create" if inspection.state == "absent" else "recover",
                 ready_at=utcnow(),
                 failure_phase=None,
                 last_error=None,
@@ -920,6 +935,20 @@ def inspect_item(
     if item.identifier != metadata.identifier:
         return Inspection("conflict", "wrong item identifier")
     if not item.metadata:
+        if (
+            not item.files
+            and not item.tasks
+            and not item.server_unavailable
+            and not item.has_redrow
+            and not item.is_dark
+            and not item.nodownload
+            and item.extended_error_code is None
+            and item.unavailable_reason is None
+            and item.availability is InternetArchiveItemAvailability.UNCERTAIN
+        ):
+            # An empty response is not permission to overwrite an item. Retrying
+            # the client's create-only upload performs availability and S3 guards.
+            return Inspection("absent", "empty item response; retry guarded creation")
         return Inspection("pending", "item metadata is unresolved")
     if any(
         not _metadata_matches(item.metadata, name, expected)
