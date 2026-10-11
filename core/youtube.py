@@ -33,6 +33,7 @@ from core.staging import (
 )
 from core.state import DiscoveredVideo, ResolvedChannel
 from core.workers import run_managed
+from core.youtube_errors import VideoAccessError, is_access_error
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
 CONTENT_TABS: tuple[tuple[ContentType, str], ...] = (
@@ -893,13 +894,13 @@ def _required_text(
 
 def _classify_download_error(error: DownloadError) -> RuntimeError:
     detail = redact_diagnostics(str(error))
+    if is_access_error(detail):
+        return VideoAccessError(detail)
     unavailable_markers = (
         "private video",
         "video unavailable",
         "this video is unavailable",
         "has been removed",
-        "members-only",
-        "sign in to confirm your age",
     )
     if any(marker in detail.casefold() for marker in unavailable_markers):
         return VideoUnavailableError(detail)

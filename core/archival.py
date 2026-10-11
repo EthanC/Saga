@@ -52,6 +52,7 @@ from core.youtube import (
     VideoUnavailableError,
     YouTubeClient,
 )
+from core.youtube_errors import VideoAccessError
 
 MAX_IDENTIFIER_LENGTH = 100
 
@@ -402,6 +403,17 @@ class ArchiveProcessor:
                     last_error=_error_text(error),
                     failure_phase="shutdown",
                 )
+        except VideoAccessError as error:
+            self.state.update_archive(
+                work.video.id,
+                release=True,
+                failure_phase="youtube_access",
+                last_error=_error_text(error),
+                retry_after=retry_delay(
+                    self.settings.archive_retry_delay, work.progress.retry_attempts + 1
+                ),
+                retry_attempts=work.progress.retry_attempts + 1,
+            )
         except VideoUnavailableError as error:
             self.state.update_archive(
                 work.video.id,

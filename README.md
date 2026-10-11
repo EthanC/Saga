@@ -132,7 +132,9 @@ Ziggy's listener has no authentication and should remain on a trusted network.
 
 ## YouTube Authentication
 
-Cookies are needed only for account-restricted videos. Follow yt-dlp's [cookie export guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) and save the file as `config/cookies.txt`. Saga loads it automatically; use `YOUTUBE_COOKIES_PATH` for another location. Keep the file private and restart Saga after replacing it.
+Cookies are needed only for account-restricted videos. Follow yt-dlp's [cookie export guide](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) and save the file as `config/cookies.txt`. Saga loads it automatically; use `YOUTUBE_COOKIES_PATH` for another location. Each extraction reads the cookie file again, so replacing it takes effect on subsequent attempts without a restart.
+
+Age checks, sign-in requirements, and bot challenges retry with backoff instead of marking videos permanently unavailable. On startup, Saga also requeues access failures marked unavailable by older releases, retaining their operation and partial inputs.
 
 When cookies are configured, add [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) and the corresponding Saga dependency to `compose.yaml`:
 

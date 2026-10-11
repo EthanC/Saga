@@ -30,6 +30,7 @@ from sqlmodel import (
 
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
 from core.staging import completed_download_size, download_reservation, inventory_inputs
+from core.youtube_errors import is_access_error
 
 
 def utcnow() -> datetime:
@@ -650,6 +651,21 @@ class StateStore:
                 delivery.status = "pending"
                 delivery.retry_at = None
                 session.add(delivery)
+            for progress in session.exec(
+                select(ArchiveProgress).where(
+                    ArchiveProgress.status == "unavailable",
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                )
+            ).all():
+                if is_access_error(progress.last_error or ""):
+                    progress.status = (
+                        "download" if progress.frozen_metadata else "metadata"
+                    )
+                    progress.failure_phase = "youtube_access"
+                    progress.retry_at = None
+                    progress.retry_attempts = 0
+                    progress.updated_at = utcnow()
+                    session.add(progress)
             archive_rows = session.exec(
                 select(ArchiveProgress).where(
                     col(ArchiveProgress.claimed_at).is_not(None)
