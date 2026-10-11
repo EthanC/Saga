@@ -107,6 +107,8 @@ Saga retries failed transfers, resumes interrupted downloads, and pauses new dow
 
 Upload recovery keeps retrying with backoff, including recovery jobs expired by older releases. Empty item responses trigger a guarded create-only retry; existing items still require matching Saga provenance before file recovery. Local originals remain until upload acknowledgement is saved. Attempt and deadline limits apply to optional background work, not upload recovery.
 
+Upload display text drops control and surrogate characters rejected by the Internet Archive. Startup requeues uploads rejected for those characters by older releases, without changing their item identifier, operation ID, or media.
+
 ### Storage budget
 
 Set `SAGA_MAX_DATA_BYTES` to limit the data-directory space available for downloads and temporary merge output. For a 250 GB budget:

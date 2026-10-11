@@ -74,7 +74,7 @@ class FrozenArchiveMetadata:
     estimated_bytes: int | None
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=False, sort_keys=True)
+        return json.dumps(asdict(self), sort_keys=True)
 
     @classmethod
     def from_json(cls, value: str) -> FrozenArchiveMetadata:
@@ -195,10 +195,18 @@ class ArchiveGateway:
             return self._managed("upload", (metadata, media_path), {}, progress)
         options = InternetArchiveUploadOptions(
             identifier=metadata.identifier,
-            title=metadata.title,
-            description=metadata.description,
-            subjects=list(metadata.subjects),
-            creator=metadata.creator,
+            title=_upload_text(metadata.title) or metadata.identifier,
+            description=_upload_text(metadata.description, multiline=True)
+            or metadata.source_url,
+            subjects=list(
+                dict.fromkeys(
+                    value
+                    for subject in metadata.subjects
+                    if (value := _upload_text(subject))
+                )
+            )
+            or ["youtube"],
+            creator=_upload_text(metadata.creator) or metadata.channel_username,
             date=date.fromisoformat(metadata.upload_date),
             collection="opensource_movies",
             media_type="movies",
@@ -1089,3 +1097,14 @@ def _iso_date(upload_date: str) -> str:
 
 def _error_text(error: Exception) -> str:
     return redact_diagnostics(f"{type(error).__name__}: {error}")[:2000]
+
+
+def _upload_text(value: str, *, multiline: bool = False) -> str:
+    """Remove rejected control/surrogate characters from YouTube display text."""
+    return "".join(
+        character
+        for character in value
+        if unicodedata.category(character) not in {"Cc", "Cs"}
+        or multiline
+        and character in "\r\n\t"
+    ).strip()

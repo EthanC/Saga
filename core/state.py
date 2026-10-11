@@ -653,6 +653,22 @@ class StateStore:
                 session.add(delivery)
             for progress in session.exec(
                 select(ArchiveProgress).where(
+                    ArchiveProgress.status == "operator_action",
+                    ArchiveProgress.failure_phase == "upload",
+                    col(ArchiveProgress.media_uploaded_at).is_(None),
+                )
+            ).all():
+                if progress.last_error in {
+                    f"InvalidOptionError: {field} cannot contain controls or surrogates"
+                    for field in ("title", "description", "subjects", "creator")
+                }:
+                    progress.status = "upload"
+                    progress.retry_at = None
+                    progress.retry_attempts = 0
+                    progress.updated_at = utcnow()
+                    session.add(progress)
+            for progress in session.exec(
+                select(ArchiveProgress).where(
                     ArchiveProgress.status == "unavailable",
                     col(ArchiveProgress.media_uploaded_at).is_(None),
                 )
