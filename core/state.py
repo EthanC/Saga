@@ -39,6 +39,8 @@ from core.archive_errors import (
 from core.archive_retry import (
     INCIDENT_REMINDER_DELAY,
     MAX_PROBE_DELAY,
+    MIN_WRITE_INTERVAL,
+    THROTTLE_PROBATION,
     ArchiveServiceState,
     retryable_record,
 )
@@ -884,7 +886,17 @@ class StateStore:
         self, session: Session, now: datetime, lane: str
     ) -> ArchiveServiceState | None:
         gate = self._archive_gate(session, now)
-        if gate.failures == 0:
+        if (
+            gate.failures == 0
+            and gate.probation_until is not None
+            and _as_utc(gate.probation_until) <= now
+            and not gate.probe_token
+            and not gate.probe_video_id
+        ):
+            gate.probation_until = gate.retry_at = None
+            gate.write_interval_seconds = 0
+            session.add(gate)
+        if not self._archive_paced(gate):
             return gate
         if gate.probe_token or not self._archive_due(gate, now):
             return None
@@ -915,6 +927,10 @@ class StateStore:
         return gate
 
     @staticmethod
+    def _archive_paced(gate: ArchiveServiceState) -> bool:
+        return gate.failures > 0 or gate.probation_until is not None
+
+    @staticmethod
     def _claim_archive_probe(
         session: Session,
         gate: ArchiveServiceState | None,
@@ -922,7 +938,7 @@ class StateStore:
         kind: str,
         now: datetime,
     ) -> str | None:
-        if gate is None or gate.failures == 0:
+        if gate is None or not StateStore._archive_paced(gate):
             return None
         token = str(uuid4())
         gate.probe_token, gate.probe_video_id, gate.probe_kind = token, video_id, kind
@@ -985,8 +1001,16 @@ class StateStore:
             gate.failures += 1
             gate.generation += 1
             gate.first_failure_at = gate.first_failure_at or now
+            if error_kind == "rate_limit":
+                gate.write_interval_seconds = min(
+                    MAX_PROBE_DELAY,
+                    max(MIN_WRITE_INTERVAL, gate.write_interval_seconds * 2),
+                )
+                gate.probation_until = now + timedelta(seconds=THROTTLE_PROBATION)
             delay = max(
-                hint, min(MAX_PROBE_DELAY, retry_delay(base_delay, gate.failures))
+                hint,
+                gate.write_interval_seconds,
+                min(MAX_PROBE_DELAY, retry_delay(base_delay, gate.failures)),
             )
             gate.retry_at = now + timedelta(seconds=delay)
             gate.error_kind, gate.error_status, gate.error_phase = (
@@ -1060,6 +1084,7 @@ class StateStore:
             if gate.probe_token != work.archive_probe_token:
                 return
             if progress.media_uploaded_at:
+                was_failing = gate.failures > 0
                 if gate.incident_escalated_at:
                     gate.recovery_event = json.dumps(
                         {
@@ -1075,6 +1100,12 @@ class StateStore:
                 gate.error_status = None
                 apply_diagnostics(gate)
                 gate.last_success_at = now
+                if gate.probation_until is not None:
+                    if was_failing:
+                        gate.probation_until = now + timedelta(
+                            seconds=THROTTLE_PROBATION
+                        )
+                    gate.retry_at = now + timedelta(seconds=gate.write_interval_seconds)
                 self._clear_archive_probe(gate)
                 self._release_archive_deferrals(session)
             elif work.job and progress.status == "upload":
@@ -1129,16 +1160,20 @@ class StateStore:
             return None, alerts
         status = (
             "available"
-            if gate.failures == 0
+            if not self._archive_paced(gate)
             else "probing"
             if gate.probe_token
-            else "cooldown"
+            else ("probation" if gate.failures == 0 else "cooldown")
             if not self._archive_due(gate, current)
             else "probe ready"
         )
         snapshot: dict[str, Any] = {
             "status": status,
             "failure_count": gate.failures,
+            "probation_until": _as_utc(gate.probation_until).isoformat()
+            if gate.probation_until
+            else None,
+            "write_interval_seconds": gate.write_interval_seconds,
             "next_retry_at": _as_utc(gate.retry_at).isoformat()
             if gate.retry_at
             else None,
@@ -1376,7 +1411,7 @@ class StateStore:
             if lane == "upload" and archive_retry_base is not None and gate is None:
                 session.commit()
                 return None
-            probe = gate is not None and gate.failures > 0
+            probe = gate is not None and self._archive_paced(gate)
             if lane == "download":
                 staged_rows = session.exec(
                     select(ArchiveProgress).where(
@@ -1393,7 +1428,7 @@ class StateStore:
                 )
                 staged = sum(
                     service_gate is None
-                    or service_gate.failures == 0
+                    or not self._archive_paced(service_gate)
                     or not retryable_record(row)
                     for row in staged_rows
                 )
@@ -1745,7 +1780,7 @@ class StateStore:
             if kind == "recovery" and archive_retry_base is not None and gate is None:
                 session.commit()
                 return None
-            probe = gate is not None and gate.failures > 0
+            probe = gate is not None and self._archive_paced(gate)
             statement = select(ArchiveJob)
             jobs = session.exec(
                 statement.where(
@@ -2442,11 +2477,13 @@ class StateStore:
                 youtube_cookie_generation=youtube_cookie_generation,
                 archive_pause_reason=(
                     "Archive retry probe in progress"
-                    if gate and gate.failures and gate.probe_token
+                    if gate and self._archive_paced(gate) and gate.probe_token
                     else "Archive service cooldown"
-                    if gate and gate.failures and not self._archive_due(gate, current)
+                    if gate
+                    and self._archive_paced(gate)
+                    and not self._archive_due(gate, current)
                     else "Archive retry probe required"
-                    if gate and gate.failures
+                    if gate and self._archive_paced(gate)
                     else None
                 ),
             )

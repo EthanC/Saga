@@ -11,6 +11,8 @@ from core.archive_errors import failure_cause, failure_facts
 
 MAX_PROBE_DELAY = 900.0
 INCIDENT_REMINDER_DELAY = 3600.0
+THROTTLE_PROBATION = 1800.0
+MIN_WRITE_INTERVAL = 60.0
 
 
 class ArchiveServiceState(SQLModel, table=True):
@@ -39,6 +41,8 @@ class ArchiveServiceState(SQLModel, table=True):
     incident_last_notified_at: datetime | None = None
     recovery_event: str | None = None
     recovery_notified_at: datetime | None = None
+    probation_until: datetime | None = None
+    write_interval_seconds: float = 0.0
 
 
 def retryable_fields(
