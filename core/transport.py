@@ -61,7 +61,9 @@ class TransportArchiveClient(InternetArchiveClient):
     def _annotate_failure(self, error: ServiceError) -> None:
         cause = cast(ServiceError, failure_cause(error))
         cast(Any, cause).request_phase = (
-            getattr(cause, "request_phase", None) or self._request_phase
+            self._request_phase
+            if getattr(cause, "request_phase", None) in {None, "request"}
+            else cause.request_phase
         )
         if cause.status_code is None:
             cause.status_code = self._request_status

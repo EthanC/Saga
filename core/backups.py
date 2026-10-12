@@ -9,7 +9,7 @@ from contextlib import closing, suppress
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from cronsim import CronSim
 from loguru import logger
@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from core.config import BackupSettings
 
 _TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
+
+
+class _BackupOptions(TypedDict, total=False):
+    stop_controller: StopController
 
 
 def next_backup_run(schedule: str, timezone: tzinfo, now: datetime) -> datetime:
@@ -43,13 +47,12 @@ async def create_backup(
     stop_controller: StopController | None = None,
 ) -> Path:
     """Create, verify, publish, and retain an online SQLite snapshot."""
+    options: _BackupOptions = (
+        {"stop_controller": stop_controller} if stop_controller else {}
+    )
     worker = asyncio.create_task(
         asyncio.to_thread(
-            _create_backup_sync,
-            database,
-            directory,
-            retention_count,
-            **({"stop_controller": stop_controller} if stop_controller else {}),
+            _create_backup_sync, database, directory, retention_count, **options
         )
     )
     try:

@@ -1606,7 +1606,10 @@ class StateStore:
             if probe:
                 sizes = dict(
                     session.exec(
-                        select(ArchiveProgress.video_id, ArchiveProgress.media_size)
+                        select(
+                            col(ArchiveProgress.video_id),
+                            col(ArchiveProgress.media_size),
+                        )
                     ).all()
                 )
                 jobs = sorted(

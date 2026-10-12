@@ -4,7 +4,7 @@
 
 Saga archives YouTube channels with the Internet Archive and posts new uploads to Discord.
 
-[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.15+](https://img.shields.io/badge/Python-3.15%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Build](https://img.shields.io/github/actions/workflow/status/EthanC/Saga/ci.yaml?branch=main&style=flat-square&label=build)](https://github.com/EthanC/Saga/actions/workflows/ci.yaml)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?style=flat-square)](https://github.com/EthanC/Saga/actions/workflows/ci.yaml)
 
@@ -58,7 +58,7 @@ Alerts log immediately when their message or severity changes. Unchanged conditi
 
 ## Python
 
-Install Python 3.14+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then install the dependencies:
+Install Python 3.15+, [`uv`](https://docs.astral.sh/uv/), ffmpeg, and Deno, then install the dependencies:
 
 ```console
 uv sync
@@ -170,7 +170,7 @@ services:
         condition: service_healthy
 
   saga-pot:
-    image: brainicism/bgutil-ytdlp-pot-provider:2.0.0
+    image: brainicism/bgutil-ytdlp-pot-provider:2.0.2
     init: true
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]

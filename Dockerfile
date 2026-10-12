@@ -1,18 +1,26 @@
-FROM denoland/deno:alpine-2.5.2 AS deno
+FROM denoland/deno:alpine-2.9.7 AS deno
 
-FROM ghcr.io/astral-sh/uv:0.12.19 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.0 AS uv
 
-FROM python:3.14-alpine AS builder
+FROM alpine:3.24 AS python
+
+COPY --from=uv /uv /usr/local/bin/uv
+RUN uv python install --install-dir /opt/python 3.15.0 \
+    && ln -s "$(UV_PYTHON_INSTALL_DIR=/opt/python uv python find --managed-python 3.15.0)" /usr/local/bin/python
+
+FROM python AS builder
 
 RUN apk add --no-cache build-base
-COPY --from=uv /uv /usr/local/bin/uv
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project --no-cache \
     && .venv/bin/python -c "import urllib3, urllib3_future, requests, niquests; from yt_dlp.networking import _requests; assert requests.packages.urllib3 is urllib3; assert _requests.urllib3 is urllib3; assert niquests.packages.urllib3 is urllib3_future; assert urllib3.__file__ != urllib3_future.__file__"
 
-FROM python:3.14-alpine
+FROM alpine:3.24
+
+COPY --from=python /opt/python /opt/python
+COPY --from=python /usr/local/bin/python /usr/local/bin/python
 
 RUN apk add --no-cache ffmpeg libstdc++ su-exec \
     && addgroup -g 1000 saga \
@@ -21,15 +29,14 @@ RUN apk add --no-cache ffmpeg libstdc++ su-exec \
     && chown -R saga:saga /app /config /data /home/saga
 
 COPY --from=deno /bin/deno /opt/deno/bin/deno
-COPY --from=deno /usr/local/lib/ld-linux* /usr/local/lib/
-COPY --from=deno /usr/local/lib /opt/deno/lib
+COPY --from=deno /usr/local/lib/glibc /opt/deno/lib
 COPY --chmod=755 docker-deno.sh /usr/local/bin/deno
 RUN case "$(apk --print-arch)" in \
         x86_64) loader=/lib64/ld-linux-x86-64.so.2 ;; \
         aarch64) loader=/lib/ld-linux-aarch64.so.1 ;; \
     esac \
     && mkdir -p "$(dirname "$loader")" \
-    && ln -s "/usr/local/lib/$(basename "$loader")" "$loader"
+    && ln -s "/opt/deno/lib/$(basename "$loader")" "$loader"
 COPY --from=builder --chown=saga:saga /app/.venv /app/.venv
 COPY --chown=saga:saga saga.py README.md LICENSE /app/
 COPY --chown=saga:saga core /app/core
