@@ -1,12 +1,11 @@
-"""Transport-only recovery extension for the pinned Archivist 1.3.0 client."""
+"""Transport-only recovery extension for the pinned Archivist 1.4.0 client."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import ExitStack
-from datetime import datetime
-from typing import Any, cast
-from urllib.parse import quote, urlsplit
+from typing import cast
+from urllib.parse import quote
 
 from archivist import (
     InternetArchiveClient,
@@ -18,16 +17,8 @@ from archivist import (
     InvalidServiceResponseError,
     ServiceError,
 )
-from archivist.core._http import (
-    ResponseLike,
-    parse_retry_after,
-    raise_for_common_status,
-    response_mapping,
-    response_text,
-)
-from archivist.services.internet_archive import _common, _items, _recovery
-
-from core.archive_errors import failure_cause
+from archivist.core._http import ResponseLike, response_mapping, response_text
+from archivist.services.internet_archive import _common, _diagnostics, _items, _recovery
 
 
 class RecoveryDeferredError(RuntimeError):
@@ -49,104 +40,7 @@ class TransportArchiveClient(InternetArchiveClient):
         super().__enter__()
         return self
 
-    _request_phase: str | None = None
-    _request_status: int | None = None
-    _request_retry_after: float | datetime | None = None
-
-    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
-        if isinstance(exc, ServiceError):
-            self._annotate_failure(exc)
-        super().__exit__(exc_type, exc, traceback)
-
-    def _annotate_failure(self, error: ServiceError) -> None:
-        cause = cast(ServiceError, failure_cause(error))
-        cast(Any, cause).request_phase = (
-            self._request_phase
-            if getattr(cause, "request_phase", None) in {None, "request"}
-            else cause.request_phase
-        )
-        if cause.status_code is None:
-            cause.status_code = self._request_status
-        if getattr(cause, "retry_after", None) is None:
-            cast(Any, cause).retry_after = self._request_retry_after
-
-    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
-        self._request_phase = request_phase(method, url)
-        self._request_status = None
-        self._request_retry_after = None
-        try:
-            response = super()._request(method, url, **kwargs)
-            self._request_status = response.status_code
-            self._request_retry_after = parse_retry_after(
-                getattr(response, "headers", {})
-            )[0]
-            if url in {_common.CSRF_URL, _common.LOGIN_URL}:
-                self._validate_login_response(response, url)
-            return response
-        except ServiceError as error:
-            self._annotate_failure(error)
-            raise
-
-    def _recovery_request(self, method: str, url: str, key: Any, **kwargs: Any) -> Any:
-        self._request_phase = request_phase(method, url)
-        self._request_status = None
-        self._request_retry_after = None
-        try:
-            response = super()._recovery_request(method, url, key, **kwargs)
-            self._request_status = response.status_code
-            self._request_retry_after = parse_retry_after(
-                getattr(response, "headers", {})
-            )[0]
-            return response
-        except ServiceError as error:
-            self._annotate_failure(error)
-            raise
-
-    def login(self) -> None:
-        try:
-            super().login()
-        except ServiceError as error:
-            self._annotate_failure(error)
-            raise
-
-    def _validate_login_response(self, response: Any, url: str) -> None:
-        # Archivist 1.3.0 labels every login HTTP 400 as bad credentials. Require
-        # the login API's explicit rejection, rather than a proxy/server HTML page.
-        if url != _common.LOGIN_URL or response.status_code != 400:
-            raise_for_common_status(
-                response,
-                service=_common.SERVICE,
-                authentication_statuses=(
-                    frozenset() if url == _common.CSRF_URL else frozenset({401, 403})
-                ),
-            )
-        try:
-            data = response_mapping(response, service=_common.SERVICE)
-        except InvalidServiceResponseError:
-            raise InvalidServiceResponseError(
-                "Internet Archive auth endpoint returned an unexpected response",
-                service=_common.SERVICE,
-                status_code=response.status_code,
-            ) from None
-        if url == _common.LOGIN_URL:
-            valid = (
-                data.get("success") is False
-                if response.status_code == 400
-                else isinstance(data.get("success"), bool)
-            )
-        else:
-            value = data.get("value")
-            token = value.get("token") if isinstance(value, Mapping) else None
-            valid = (
-                data.get("success") is True and isinstance(token, str) and bool(token)
-            )
-        if not valid:
-            raise InvalidServiceResponseError(
-                "Internet Archive auth endpoint returned an unexpected response",
-                service=_common.SERVICE,
-                status_code=response.status_code,
-            )
-
+    @_diagnostics.diagnostic_operation
     def add_file_transport(
         self,
         identifier: str,
@@ -259,25 +153,3 @@ class TransportArchiveClient(InternetArchiveClient):
                     ),
                 ),
             )
-
-
-def request_phase(method: str, url: str) -> str:
-    if url == _common.CSRF_URL:
-        return "csrf"
-    if url == _common.LOGIN_URL:
-        return "login"
-    if url == _items.UPLOAD_URL:
-        return "upload-key"
-    if url == _items.UPLOAD_API_URL:
-        return "identifier-check"
-    if url.startswith(_recovery.METADATA_URL + "/"):
-        return "item-metadata"
-    if url == _common.USER_INFO_URL:
-        return "identity"
-    if method == "PUT" and url.startswith(_items.S3_URL + "/"):
-        return (
-            "item-create"
-            if len(urlsplit(url).path.strip("/").split("/")) == 1
-            else "file-upload"
-        )
-    return "request"

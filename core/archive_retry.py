@@ -4,11 +4,13 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from archivist.core._http import parse_retry_after
 from sqlmodel import Field, SQLModel
 
 from core.archive_errors import failure_cause, failure_facts
 
 MAX_PROBE_DELAY = 900.0
+INCIDENT_REMINDER_DELAY = 3600.0
 
 
 class ArchiveServiceState(SQLModel, table=True):
@@ -26,7 +28,17 @@ class ArchiveServiceState(SQLModel, table=True):
     error_kind: str | None = None
     error_status: int | None = None
     error_phase: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error_request_id: str | None = None
+    error_headers: str | None = None
     last_error: str | None = None
+    incident_id: str | None = None
+    incident_notified_category: str | None = None
+    incident_escalated_at: datetime | None = None
+    incident_last_notified_at: datetime | None = None
+    recovery_event: str | None = None
+    recovery_notified_at: datetime | None = None
 
 
 def retryable_fields(
@@ -63,6 +75,13 @@ def retryable_record(record: Any) -> bool:
 
 def retry_hint(error: Exception, now: datetime) -> float:
     value = getattr(failure_cause(error), "retry_after", None)
+    if value is None:
+        value = parse_retry_after(
+            {
+                "retry-after": getattr(failure_cause(error), "retry_after_raw", None)
+                or ""
+            }
+        )[0]
     if isinstance(value, datetime):
         return max(
             0.0,

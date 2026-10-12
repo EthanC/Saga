@@ -31,7 +31,9 @@ HEADER_PATTERN = re.compile(
 SECRET_NAMES = (
     r"po[ _-]?token|integrity[_-]?token|websafeFallbackToken|"
     r"access[_-]?token|refresh[_-]?token|token|password|s3accesskey|s3secretkey|"
-    r"authorization|proxy[_-]?authorization|cookies?|set[_-]?cookie"
+    r"authorization|proxy[_-]?authorization|cookies?|set[_-]?cookie|passwd|"
+    r"secret(?:[_ -]?key)?|access[_ -]?key|logged-in-(?:sig|user)|"
+    r"x-amz-(?:credential|signature|security-token)|signature"
 )
 SECRET_PREFIX = rf"[\"']?\b(?:{SECRET_NAMES})[\"']?\s*[:=]\s*"
 TOKEN_PATTERN = re.compile(
@@ -90,11 +92,17 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
     if settings.log_discord_webhook_url is not None:
         logger.add(
             _SafeDiscordSink(settings.log_discord_webhook_url),
-            level=settings.log_discord_level,
+            level=0,
             backtrace=False,
             diagnose=False,
             enqueue=True,
-            filter=lambda record: not record["extra"].get("downloader_diagnostic"),
+            filter=lambda record: (
+                not record["extra"].get("downloader_diagnostic")
+                and (
+                    record["level"].no >= logger.level(settings.log_discord_level).no
+                    or record["extra"].get("archive_incident_recovery", False)
+                )
+            ),
         )
         logger.info(
             "Discord log forwarding enabled at {} and above", settings.log_discord_level
@@ -136,7 +144,13 @@ def redact_diagnostics(value: str) -> str:
     value = URL_PATTERN.sub(safe_url, value)
     value = _redact_structured_tokens(value)
     value = HEADER_PATTERN.sub("<redacted header>", value)
-    return TOKEN_PATTERN.sub(r"\1<redacted>", value)
+    value = TOKEN_PATTERN.sub(r"\1<redacted>", value)
+    return re.sub(
+        r"\b(?:LOW|Basic|Bearer)\s+[^\s,;]+",
+        "<redacted credential>",
+        value,
+        flags=re.IGNORECASE,
+    )
 
 
 def _redact_structured_tokens(value: str) -> str:

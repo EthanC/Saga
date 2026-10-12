@@ -49,6 +49,39 @@ class FakeLogger:
         self.messages.append((message, values))
 
 
+def test_archive_recovery_reaches_error_discord_sink_as_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console = StringIO()
+    discord: list[logging.LogRecord] = []
+    monkeypatch.setattr(logging_config, "stdout", console)
+    monkeypatch.setattr(logging_config, "_STOP_CONTROLLER", None)
+    monkeypatch.setattr(
+        logging_config,
+        "DiscordSink",
+        lambda _: type(
+            "Sink", (), {"emit": lambda self, record: discord.append(record)}
+        )(),
+    )
+    logging_config.configure_logging(LoggingSettings("INFO", "fixture", "ERROR"))
+    logger.info("unrelated info")
+    logger.warning("unrelated warning")
+    logger.error("Archive service unavailable")
+    logger.bind(archive_incident_recovery=True).info(
+        "Archive recovered; request_id=fixture Bearer credential-secret"
+    )
+    logger.bind(downloader_diagnostic=True, archive_incident_recovery=True).info(
+        "downloader"
+    )
+    logger.complete()
+    assert [record.levelno for record in discord] == [logging.ERROR, logging.INFO]
+    assert "Archive recovered" in discord[1].getMessage()
+    assert "credential-secret" not in discord[1].getMessage()
+    assert "credential-secret" not in console.getvalue()
+    assert "unrelated info" in console.getvalue()
+    logger.remove()
+
+
 def test_configure_logging_adds_console_only_without_webhook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -89,7 +122,7 @@ def test_configure_logging_adds_warning_discord_sink(
 
     assert sink_calls == [(url, False)]
     assert len(fake.sinks) == 2
-    assert fake.sinks[1][1]["level"] == "WARNING"
+    assert fake.sinks[1][1]["level"] == 0
 
 
 def test_load_logging_settings_ignores_unrelated_invalid_environment(

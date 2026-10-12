@@ -28,9 +28,22 @@ from sqlmodel import (
     select,
 )
 
-from core.archive_errors import legacy_bad_login
-from core.archive_retry import MAX_PROBE_DELAY, ArchiveServiceState, retryable_record
+from core.archive_errors import (
+    DIAGNOSTIC_FIELDS,
+    apply_diagnostics,
+    diagnostic_fields,
+    diagnostic_snapshot,
+    incident_category,
+    legacy_bad_login,
+)
+from core.archive_retry import (
+    INCIDENT_REMINDER_DELAY,
+    MAX_PROBE_DELAY,
+    ArchiveServiceState,
+    retryable_record,
+)
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
+from core.logging import redact_diagnostics
 from core.staging import completed_download_size, download_reservation, inventory_inputs
 from core.youtube_errors import is_access_error
 
@@ -174,6 +187,10 @@ class ArchiveProgress(SQLModel, table=True):
     error_status: int | None = None
     error_phase: str | None = None
     archive_generation: int | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error_request_id: str | None = None
+    error_headers: str | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -192,6 +209,10 @@ class ArchiveJob(SQLModel, table=True):
     error_kind: str | None = None
     error_status: int | None = None
     error_phase: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error_request_id: str | None = None
+    error_headers: str | None = None
 
 
 class WorkerTiming(SQLModel, table=True):
@@ -854,6 +875,7 @@ class StateStore:
             if any(retryable_record(row) for row in [*pending, *jobs]):
                 gate.failures = 1
                 gate.retry_at = gate.first_failure_at = now
+                gate.incident_id = str(uuid4())
             session.add(gate)
             session.flush()
         return gate
@@ -918,6 +940,10 @@ class StateStore:
         error_kind: str | None,
         error_status: int | None,
         error_phase: str | None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        error_request_id: str | None = None,
+        error_headers: str | None = None,
     ) -> float:
         now = utcnow()
         with self._write_lock, Session(self.engine) as session:
@@ -952,6 +978,10 @@ class StateStore:
                     if gate.retry_at
                     else 0
                 )
+            if gate.failures == 0:
+                gate.incident_id = str(uuid4())
+                gate.incident_notified_category = None
+                gate.incident_escalated_at = gate.incident_last_notified_at = None
             gate.failures += 1
             gate.generation += 1
             gate.first_failure_at = gate.first_failure_at or now
@@ -964,7 +994,14 @@ class StateStore:
                 error_status,
                 error_phase,
             )
-            gate.last_error = error
+            gate.last_error = redact_diagnostics(error)[:2000]
+            apply_diagnostics(
+                gate,
+                error_code=error_code,
+                error_message=error_message,
+                error_request_id=error_request_id,
+                error_headers=error_headers,
+            )
             self._clear_archive_probe(gate)
             session.add(gate)
             session.commit()
@@ -1023,11 +1060,20 @@ class StateStore:
             if gate.probe_token != work.archive_probe_token:
                 return
             if progress.media_uploaded_at:
+                if gate.incident_escalated_at:
+                    gate.recovery_event = json.dumps(
+                        {
+                            "incident_id": gate.incident_id,
+                            "incident_category": gate.incident_notified_category,
+                            "recovered_at": now.isoformat(),
+                        }
+                    )
                 gate.failures = 0
                 gate.generation += 1
                 gate.retry_at = gate.first_failure_at = None
                 gate.error_kind = gate.error_phase = gate.last_error = None
                 gate.error_status = None
+                apply_diagnostics(gate)
                 gate.last_success_at = now
                 self._clear_archive_probe(gate)
                 self._release_archive_deferrals(session)
@@ -1090,7 +1136,7 @@ class StateStore:
             if not self._archive_due(gate, current)
             else "probe ready"
         )
-        snapshot = {
+        snapshot: dict[str, Any] = {
             "status": status,
             "failure_count": gate.failures,
             "next_retry_at": _as_utc(gate.retry_at).isoformat()
@@ -1107,6 +1153,27 @@ class StateStore:
             "error_kind": gate.error_kind,
             "error_status": gate.error_status,
             "error_phase": gate.error_phase,
+            "reason": gate.error_code or "unknown",
+            **diagnostic_snapshot(gate),
+            "incident_id": gate.incident_id,
+            "incident_age_seconds": max(
+                0.0, (current - _as_utc(gate.first_failure_at)).total_seconds()
+            )
+            if gate.first_failure_at
+            else None,
+            "incident_escalated_at": _as_utc(gate.incident_escalated_at).isoformat()
+            if gate.incident_escalated_at
+            else None,
+            "incident_last_notified_at": _as_utc(
+                gate.incident_last_notified_at
+            ).isoformat()
+            if gate.incident_last_notified_at
+            else None,
+            "incident_notified_category": gate.incident_notified_category,
+            "recovery_pending": gate.recovery_event is not None,
+            "recovery_notified_at": _as_utc(gate.recovery_notified_at).isoformat()
+            if gate.recovery_notified_at
+            else None,
         }
         by_id = {row.video_id: row for row, _ in rows}
         pending = any(
@@ -1155,12 +1222,100 @@ class StateStore:
             alerts.append(
                 {
                     "key": "archive:service",
-                    "severity": "error" if age > stall_timeout else "warning",
-                    "message": "Archive service failures; retries are coordinated",
+                    "severity": "error"
+                    if age > stall_timeout
+                    or gate.error_kind in {"authentication", "permission"}
+                    or gate.incident_escalated_at is not None
+                    else "warning",
+                    "message": _archive_incident_message(snapshot["incident_category"]),
                     "details": snapshot,
                 }
             )
         return snapshot, alerts
+
+    def archive_service_notifications(
+        self, *, stall_timeout: float, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Reserve incident events durably before forwarding them to log sinks."""
+        current = now or utcnow()
+        events: list[dict[str, Any]] = []
+        with self._write_lock, Session(self.engine) as session:
+            gate = session.get(ArchiveServiceState, 1)
+            if gate is None:
+                return events
+            if gate.recovery_event:
+                events.append(
+                    {
+                        "severity": "info",
+                        "recovery": True,
+                        "message": (
+                            "Archive service recovered; automatic preservation resumed"
+                        ),
+                        "details": json.loads(gate.recovery_event),
+                    }
+                )
+                gate.recovery_event = None
+                gate.recovery_notified_at = current
+            if gate.failures:
+                gate.incident_id = gate.incident_id or str(uuid4())
+                category = incident_category(gate.error_kind, gate.error_code)
+                age = max(
+                    0.0,
+                    (
+                        current - _as_utc(gate.first_failure_at or current)
+                    ).total_seconds(),
+                )
+                escalated = gate.incident_escalated_at is not None
+                actionable = category in {"authentication", "item-specific"}
+                error = escalated or age > stall_timeout or actionable
+                notify = (
+                    gate.incident_last_notified_at is None
+                    or error
+                    and not escalated
+                    or category != gate.incident_notified_category
+                    and (
+                        actionable
+                        or gate.incident_notified_category
+                        in {"authentication", "item-specific"}
+                    )
+                    or escalated
+                    and (
+                        current - _as_utc(gate.incident_last_notified_at)
+                    ).total_seconds()
+                    >= INCIDENT_REMINDER_DELAY
+                )
+                if notify:
+                    starting = gate.incident_last_notified_at is None
+                    gate.incident_notified_category = category
+                    gate.incident_last_notified_at = current
+                    if error and not escalated:
+                        gate.incident_escalated_at = current
+                    events.append(
+                        {
+                            "severity": "error" if error else "warning",
+                            "message": _archive_incident_message(category),
+                            "details": {
+                                "incident_id": gate.incident_id,
+                                "incident_age_seconds": age,
+                                "failure_count": gate.failures,
+                                "next_retry_at": _as_utc(gate.retry_at).isoformat()
+                                if gate.retry_at
+                                else None,
+                                "error_kind": gate.error_kind,
+                                "error_status": gate.error_status,
+                                "error_phase": gate.error_phase,
+                                "reason": gate.error_code or "unknown",
+                                **diagnostic_snapshot(gate),
+                            },
+                        }
+                    )
+                    if starting and error:
+                        events.insert(
+                            len(events) - 1, {**events[-1], "severity": "warning"}
+                        )
+            session.add(gate)
+            session.commit()
+        return events
 
     def claim_archive(
         self,
@@ -1697,6 +1852,10 @@ class StateStore:
         error_kind: str | None = None,
         error_status: int | None = None,
         error_phase: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        error_request_id: str | None = None,
+        error_headers: str | None = None,
         **facts: Any,
     ) -> None:
         """Commit background facts only for the current independent claim."""
@@ -1724,7 +1883,16 @@ class StateStore:
                     raise ValueError(f"invalid background fact {name}")
                 setattr(progress, name, value)
             job.status = status
-            job.last_error = error
+            job.last_error = (
+                redact_diagnostics(error)[:2000] if error is not None else None
+            )
+            apply_diagnostics(
+                job,
+                error_code=error_code,
+                error_message=error_message,
+                error_request_id=error_request_id,
+                error_headers=error_headers,
+            )
             job.error_kind, job.error_status, job.error_phase = (
                 error_kind,
                 error_status,
@@ -1775,6 +1943,7 @@ class StateStore:
             progress.reserved_bytes = 0
             progress.last_error = None
             progress.error_kind = progress.error_status = progress.error_phase = None
+            apply_diagnostics(progress)
             progress.failure_phase = None
             progress.updated_at = utcnow()
             session.add(progress)
@@ -1795,6 +1964,10 @@ class StateStore:
         error_kind: str | None = None,
         error_status: int | None = None,
         error_phase: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        error_request_id: str | None = None,
+        error_headers: str | None = None,
     ) -> None:
         """Release failed or uncertain transfers and give checks their own queue."""
         with self._write_lock, Session(self.engine) as session:
@@ -1811,7 +1984,14 @@ class StateStore:
             progress.status = status
             progress.claimed_at = None
             progress.retry_at = utcnow() + timedelta(seconds=delay)
-            progress.last_error = error
+            progress.last_error = redact_diagnostics(error)[:2000]
+            apply_diagnostics(
+                progress,
+                error_code=error_code,
+                error_message=error_message,
+                error_request_id=error_request_id,
+                error_headers=error_headers,
+            )
             progress.error_kind, progress.error_status, progress.error_phase = (
                 error_kind,
                 error_status,
@@ -1918,6 +2098,14 @@ class StateStore:
             raise ValueError(f"Unknown archive fields: {sorted(unknown)}")
         if retry_after is not None and retry_after < 0:
             raise ValueError("retry_after must be non-negative")
+
+        diagnostics = {
+            name: values[name] for name in DIAGNOSTIC_FIELDS if name in values
+        }
+        if diagnostics:
+            values.update(diagnostic_fields(**diagnostics))
+        if values.get("last_error") is not None:
+            values["last_error"] = redact_diagnostics(values["last_error"])[:2000]
 
         with self._write_lock, Session(self.engine) as session:
             progress = session.get(ArchiveProgress, video_id)
@@ -2271,7 +2459,42 @@ class StateStore:
                 stall_timeout,
             )
             health["archive_service"] = service_state
+            if gate and gate.failures:
+                health["alerts"] = [
+                    alert
+                    for alert in health["alerts"]
+                    if alert["key"] != "archive:access"
+                    and not (
+                        alert["key"] == "archive:permission"
+                        and gate.error_kind == "permission"
+                    )
+                ]
             health["alerts"].extend(service_alerts)
+            health["archive_diagnostics"] = {
+                "transfers": [
+                    {
+                        "video_id": row.video_id,
+                        "error_kind": row.error_kind,
+                        "error_status": row.error_status,
+                        "error_phase": row.error_phase,
+                        **diagnostic_snapshot(row),
+                    }
+                    for row, _ in rows
+                    if row.last_error
+                ],
+                "jobs": [
+                    {
+                        "video_id": job.video_id,
+                        "kind": job.kind,
+                        "error_kind": job.error_kind,
+                        "error_status": job.error_status,
+                        "error_phase": job.error_phase,
+                        **diagnostic_snapshot(job),
+                    }
+                    for job in jobs
+                    if job.last_error
+                ],
+            }
             if any(alert["key"] == "archive:probe-stall" for alert in service_alerts):
                 health["healthy"] = False
             polling: dict[str, Any] = {}
@@ -2647,6 +2870,18 @@ def retry_delay(base: float, attempts: int) -> float:
     return min(
         21_600.0, base * 2 ** min(max(attempts - 1, 0), 12) * random.uniform(0.8, 1.2)
     )
+
+
+def _archive_incident_message(category: str) -> str:
+    return {
+        "transient": "Archive service unavailable; retries are coordinated",
+        "throttled": "Archive throttled requests; retries honor the server delay",
+        "authentication": "Archive rejected authentication; check account credentials",
+        "item-specific": "Archive denied item access; review item permissions",
+        "unclassified": (
+            "Archive failure reason is unclassified; retries are coordinated"
+        ),
+    }[category]
 
 
 def webhook_key(url: str) -> str:

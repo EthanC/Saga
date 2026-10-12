@@ -383,7 +383,11 @@ class ArchiveProcessor:
             )
 
     def _failure_delay(self, work: ArchiveWork, error: Exception) -> float:
-        if work.archive_generation is not None and retryable_error(error):
+        if work.archive_generation is not None and (
+            retryable_error(error)
+            or work.archive_probe_token is not None
+            and failure_facts(error)["error_kind"] == "permission"
+        ):
             return self.state.record_archive_failure(
                 work,
                 base_delay=self.settings.archive_retry_delay,
@@ -391,9 +395,12 @@ class ArchiveProcessor:
                 error=_error_text(error),
                 **failure_facts(error),
             )
-        return retry_delay(
-            self.settings.archive_retry_delay,
-            work.job.attempts if work.job else work.progress.retry_attempts + 1,
+        return max(
+            retry_hint(error, utcnow()),
+            retry_delay(
+                self.settings.archive_retry_delay,
+                work.job.attempts if work.job else work.progress.retry_attempts + 1,
+            ),
         )
 
     def _process(self, work: ArchiveWork) -> None:
@@ -482,10 +489,16 @@ class ArchiveProcessor:
                     release=True,
                     failure_phase=stage,
                     last_error=_error_text(error),
+                    **failure_facts(error),
                 )
         except Exception as error:
             delay = self._failure_delay(work, error)
-            logger.warning(
+            log = (
+                logger.debug
+                if work.archive_generation is not None and retryable_error(error)
+                else logger.warning
+            )
+            log(
                 "Video {} phase {} attempt {} will retry in {:.0f}s: {}",
                 work.video.id,
                 stage,
@@ -520,6 +533,7 @@ class ArchiveProcessor:
                     if isinstance(error, DiskSpaceError)
                     else stage,
                     last_error=_error_text(error),
+                    **failure_facts(error),
                 )
 
     def _metadata(self, work: ArchiveWork) -> None:
@@ -1152,8 +1166,13 @@ def _error_text(error: Exception) -> str:
         phase = getattr(cause, "request_phase", None)
         if phase:
             context.append(f"phase={phase}")
-        if context:
-            detail += " (" + "; ".join(context) + ")"
+        facts = failure_facts(error)
+        context.append(f"reason={facts['error_code'] or 'unknown'}")
+        if facts["error_message"]:
+            context.append(f"message={facts['error_message']}")
+        if facts["error_request_id"]:
+            context.append(f"request_id={facts['error_request_id']}")
+        detail += " (" + "; ".join(context) + ")"
     return redact_diagnostics(detail)[:2000]
 
 

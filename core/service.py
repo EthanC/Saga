@@ -698,10 +698,22 @@ class SagaService:
         return health
 
     def _emit_health_alerts(self, alerts: list[dict[str, Any]]) -> None:
+        for event in self.state.archive_service_notifications(
+            stall_timeout=self.settings.transfer_stall_timeout
+        ):
+            if event.get("recovery"):
+                logger.bind(archive_incident_recovery=True).info(
+                    "{}: {}", event["message"], event["details"]
+                )
+            else:
+                log = logger.error if event["severity"] == "error" else logger.warning
+                log("{}: {}", event["message"], event["details"])
         now = time.monotonic()
         active = {alert["key"] for alert in alerts}
         for alert in alerts:
             key = alert["key"]
+            if key == "archive:service":
+                continue
             message = alert["message"]
             severity = alert["severity"]
             previous = self._health_alerts.get(key)

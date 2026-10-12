@@ -54,7 +54,28 @@ Startup reports progress while resolving channels and establishing notification 
 
 The probe measures worker liveness. Active recovery, remote-service retry backoff, rejected credentials, storage limits, and jobs requiring operator review are degraded conditions, not restart triggers. Prolonged storage or authentication failures and required-job failures emit ERROR alerts while retries continue. Undispatched due work or an active worker without progress beyond `SAGA_TRANSFER_STALL_TIMEOUT` fails the probe. Optional validation and webpage outcomes remain warnings.
 
-Alerts log immediately when their message or severity changes. Unchanged conditions repeat every 15 minutes, and clearing a condition logs its recovery once.
+Archive service cooldowns log once at WARNING. A continuous outage escalates to ERROR after `SAGA_TRANSFER_STALL_TIMEOUT`, with unchanged escalated incidents repeated at most once per hour. Confirmed authentication rejection or item-permission denial alerts immediately. Failure counts, request IDs, request phases, and retry timestamps do not reset the reminder limit. Incident identity, escalation, and reminder timestamps are saved in SQLite, so a restart preserves those limits.
+
+Recovery of an escalated Archive incident logs once at INFO and reaches the Discord log webhook even with `LOG_DISCORD_LEVEL=ERROR`. Other logs follow their configured threshold. Other pipeline conditions retain their 15-minute reminders and log recovery once.
+
+### Archive diagnostics and retries
+
+Saga uses Archivist 1.4.0 response diagnostics to report Archive/S3 error codes, messages, request IDs, HTTP status, and request phase. `SlowDown` is throttling; explicit credential-rejection evidence produces authentication guidance; item access denials produce item-permission guidance. A generic HTTP 503 does not establish an account quota or password problem. Missing reasons are reported as `unknown`, and unfamiliar codes stay visible with status-based retry handling.
+
+`data/transfers.json` includes the shared circuit's cooldown/probe status, next retry, latest diagnostics, incident category and age, escalation and notification timestamps, and upload/download progress. Its `archive_diagnostics` section contains transfer and background-job errors. `error_kind` is Saga's classification; `error_code`, `error_message`, `error_request_id`, and `error_headers` are response facts. These nullable fields are also saved in the durable queues and shared circuit. Older rows remain readable without fabricated response facts.
+
+Diagnostic text is redacted and bounded: codes and request IDs to 256 characters, messages to 1,024, and each diagnostic header to 256. Only `content-type`, `retry-after`, and `x-amz-request-id` headers are retained. The same representation is used in SQLite, snapshots, console logs, and Discord alerts.
+
+Archive cooldowns are capped at 15 minutes unless an explicit `Retry-After` requires longer. Only one retry probe runs at a time. An acknowledged upload releases shared backoffs; metadata recovery alone does not establish that writes have recovered. Uncertain transfers retain their originals for guarded reconciliation. Downloads can continue within staging, buffer, and disk limits during an outage.
+
+A managed Archive outage is degraded, so it does not trigger an auto-heal restart. A stalled worker or an eligible retry probe left undispatched still fails the health check. Alert timing requires no new environment variables. To deploy an update, pull the rebuilt image and recreate Saga:
+
+```console
+docker compose pull saga
+docker compose up -d --force-recreate saga
+```
+
+Saga adds the diagnostic and incident columns automatically. No credential rotation, cache-volume change, or manual database edit is required.
 
 ## Python
 
