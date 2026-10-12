@@ -101,6 +101,7 @@ def configure_logging(settings: Settings | LoggingSettings) -> None:
                 and (
                     record["level"].no >= logger.level(settings.log_discord_level).no
                     or record["extra"].get("archive_incident_recovery", False)
+                    or record["extra"].get("preservation_outcome_recovery", False)
                 )
             ),
         )

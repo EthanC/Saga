@@ -226,6 +226,15 @@ class WorkerTiming(SQLModel, table=True):
     seconds: float = 0.0
 
 
+class PreservationAlertState(SQLModel, table=True):
+    """Remember which actionable webpage outcomes have already been announced."""
+
+    key: str = Field(primary_key=True)
+    fingerprint: str | None = None
+    notified_at: datetime | None = None
+    outcome_count: int = 0
+
+
 class SchemaMigration(SQLModel, table=True):
     """Record one-time data migrations independently of additive columns."""
 
@@ -1389,6 +1398,40 @@ class StateStore:
             session.commit()
         return events
 
+    def webpage_outcome_notifications(
+        self, alert: dict[str, Any] | None
+    ) -> list[dict[str, Any]]:
+        """Announce a changed failed-job set once, including across restarts."""
+        with self._write_lock, Session(self.engine) as session:
+            record = session.get(PreservationAlertState, "webpage:outcome")
+            if alert is None:
+                if record is None or record.fingerprint is None:
+                    return []
+                record.fingerprint = None
+                record.notified_at = utcnow()
+                session.add(record)
+                session.commit()
+                return [
+                    {
+                        "severity": "info",
+                        "recovery": True,
+                        "message": "Webpage preservation condition cleared",
+                        "details": {"previous_count": record.outcome_count},
+                    }
+                ]
+            fingerprint = alert["incident_fingerprint"]
+            if record is not None and record.fingerprint == fingerprint:
+                return []
+            record = record or PreservationAlertState(key="webpage:outcome")
+            record.fingerprint = fingerprint
+            record.notified_at = utcnow()
+            record.outcome_count = alert["details"]["count"] + len(
+                alert["details"]["active_without_progress"]
+            )
+            session.add(record)
+            session.commit()
+            return [alert]
+
     def claim_archive(
         self,
         *,
@@ -2533,6 +2576,14 @@ class StateStore:
                 stall_timeout,
             )
             health["archive_service"] = service_state
+            outcome = session.get(PreservationAlertState, "webpage:outcome")
+            health["webpage_notification"] = {
+                "active": bool(outcome and outcome.fingerprint),
+                "last_notified_at": _as_utc(outcome.notified_at).isoformat()
+                if outcome and outcome.notified_at
+                else None,
+                "outcome_count": outcome.outcome_count if outcome else 0,
+            }
             if gate and gate.failures:
                 health["alerts"] = [
                     alert

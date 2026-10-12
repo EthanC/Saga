@@ -642,7 +642,8 @@ class SagaService:
                                 "message": "health publisher failed",
                                 "details": {"cause": type(error).__name__},
                             }
-                        ]
+                        ],
+                        snapshot_complete=False,
                     )
                 await self._wait(30)
 
@@ -697,7 +698,20 @@ class SagaService:
             health["partials"] = self._partial_health
         return health
 
-    def _emit_health_alerts(self, alerts: list[dict[str, Any]]) -> None:
+    def _emit_health_alerts(
+        self, alerts: list[dict[str, Any]], *, snapshot_complete: bool = True
+    ) -> None:
+        if snapshot_complete and self.settings.archival_enabled:
+            outcome = next(
+                (alert for alert in alerts if alert["key"] == "webpage:outcome"), None
+            )
+            for event in self.state.webpage_outcome_notifications(outcome):
+                if event.get("recovery"):
+                    logger.bind(preservation_outcome_recovery=True).info(
+                        "{}: {}", event["message"], event["details"]
+                    )
+                else:
+                    logger.error("{}: {}", event["message"], event["details"])
         for event in self.state.archive_service_notifications(
             stall_timeout=self.settings.transfer_stall_timeout
         ):
@@ -712,7 +726,7 @@ class SagaService:
         active = {alert["key"] for alert in alerts}
         for alert in alerts:
             key = alert["key"]
-            if key == "archive:service":
+            if key in {"archive:service", "webpage:outcome"}:
                 continue
             message = alert["message"]
             severity = alert["severity"]

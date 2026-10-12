@@ -96,7 +96,7 @@ def test_actual_background_worker_stalls_still_fail_required_lanes(
     assert health["lanes"][kind]["active_without_progress"] == [video_id]
     assert any(
         a["key"] == f"{kind}:outcome"
-        and a["severity"] == ("error" if required else "warning")
+        and a["severity"] == ("error" if required or kind == "webpage" else "warning")
         for a in health["alerts"]
     )
     store.close()

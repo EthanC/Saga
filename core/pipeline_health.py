@@ -1,9 +1,13 @@
 """Lane health, expected backpressure, and independent preservation-age alerts."""
 
+import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta
+from hashlib import sha256
 from typing import Any
 
 from core.archive_errors import is_authentication_failure
+from core.logging import redact_diagnostics
 from core.state import ArchiveJob, ArchiveProgress, Video, _as_utc
 
 STARTUP_GRACE = 120
@@ -341,7 +345,9 @@ def build_pipeline_health(
                 {
                     "video_id": job.video_id,
                     "status": job.status,
-                    "reason": job.last_error,
+                    "reason": redact_diagnostics(job.last_error or "deadline expired")[
+                        :256
+                    ],
                 }
                 for job in failed
             ],
@@ -351,7 +357,7 @@ def build_pipeline_health(
                 {
                     "key": f"{kind}:outcome",
                     "severity": "error"
-                    if required and current >= grace_end
+                    if kind == "webpage" or required and current >= grace_end
                     else "warning",
                     "message": f"{kind} jobs failed or stalled",
                     "details": {
@@ -360,7 +366,21 @@ def build_pipeline_health(
                         "active_without_progress": [
                             job.video_id for job in stalled_jobs
                         ],
+                        **(
+                            {"jobs": lanes[kind]["failed_or_expired"][:10]}
+                            if kind == "webpage"
+                            else {}
+                        ),
                     },
+                    **(
+                        {
+                            "incident_fingerprint": _webpage_fingerprint(
+                                failed, stalled_jobs
+                            )
+                        }
+                        if kind == "webpage"
+                        else {}
+                    ),
                 }
             )
     access_history = [
@@ -483,3 +503,17 @@ def build_pipeline_health(
             "awaiting_recheck": len(access_history) - len(access_failures),
         },
     }
+
+
+def _webpage_fingerprint(
+    failed: Sequence[ArchiveJob], stalled: Sequence[ArchiveJob]
+) -> str:
+    outcomes = [
+        (
+            job.video_id,
+            "failed" if job.status == "failed" else "expired",
+            job.error_kind or "unknown",
+        )
+        for job in failed
+    ] + [(job.video_id, "stalled", job.error_kind or "unknown") for job in stalled]
+    return sha256(json.dumps(sorted(outcomes)).encode()).hexdigest()
