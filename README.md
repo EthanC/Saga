@@ -54,9 +54,9 @@ Startup reports progress while resolving channels and establishing notification 
 
 The probe measures worker liveness. Active recovery, remote-service retry backoff, rejected credentials, storage limits, and jobs requiring operator review are degraded conditions, not restart triggers. Prolonged storage or authentication failures and required-job failures emit ERROR alerts while retries continue. Undispatched due work or an active worker without progress beyond `SAGA_TRANSFER_STALL_TIMEOUT` fails the probe. Optional validation and webpage outcomes remain warnings.
 
-Archive service cooldowns log once at WARNING. A continuous outage escalates to ERROR after `SAGA_TRANSFER_STALL_TIMEOUT`, with unchanged escalated incidents repeated at most once per hour. Confirmed authentication rejection or item-permission denial alerts immediately. Failure counts, request IDs, request phases, and retry timestamps do not reset the reminder limit. Incident identity, escalation, and reminder timestamps are saved in SQLite, so a restart preserves those limits.
+Archive service cooldowns log once at WARNING. An outage escalates to ERROR after `SAGA_TRANSFER_STALL_TIMEOUT` without acknowledged uploads or advancing upload bytes. Healthy long transfers suppress service escalations and reminders; stalled workers still fail the health check. Unchanged escalated incidents repeat at most once per hour. Confirmed authentication rejection or item-permission denial alerts immediately, including while another upload is progressing. Failure counts, request IDs, request phases, and retry timestamps do not reset the reminder limit.
 
-Recovery of an escalated Archive incident logs once at INFO and reaches the Discord log webhook even with `LOG_DISCORD_LEVEL=ERROR`. Other logs follow their configured threshold. Other pipeline conditions retain their 15-minute reminders and log recovery once.
+An acknowledged probe begins a 30-minute recovery-observation window. A new failure during that window continues the same notification incident and reminder budget. Only sustained recovery closes it. Identity, observation, escalation, and reminder timestamps are saved in SQLite, so a restart preserves those limits. Recovery of an escalated Archive incident logs once at INFO and reaches the Discord log webhook even with `LOG_DISCORD_LEVEL=ERROR`. Other logs follow their configured threshold. Other pipeline conditions retain their 15-minute reminders and log recovery once.
 
 ### Archive diagnostics and retries
 
@@ -65,6 +65,8 @@ Saga uses Archivist 1.4.0 response diagnostics to report Archive/S3 error codes,
 `data/transfers.json` includes the shared circuit's cooldown/probe status, next retry, latest diagnostics, incident category and age, escalation and notification timestamps, and upload/download progress. Its `archive_diagnostics` section contains transfer and background-job errors. `error_kind` is Saga's classification; `error_code`, `error_message`, `error_request_id`, and `error_headers` are response facts. These nullable fields are also saved in the durable queues and shared circuit. Older rows remain readable without fabricated response facts.
 
 Diagnostic text is redacted and bounded: codes and request IDs to 256 characters, messages to 1,024, and each diagnostic header to 256. Only `content-type`, `retry-after`, and `x-amz-request-id` headers are retained. The same representation is used in SQLite, snapshots, console logs, and Discord alerts.
+
+Archive incident diagnostics also show the latest preservation-progress timestamp, time without progress, acknowledged upload count and bytes, active upload bytes, and whether recovery is under observation. `retry_delay_source` distinguishes a server `Retry-After` from locally calculated pacing.
 
 Archive cooldowns are capped at 15 minutes unless an explicit `Retry-After` requires longer. Only one retry probe runs at a time. An acknowledged upload releases shared backoffs; metadata recovery alone does not establish that writes have recovered. Uncertain transfers retain their originals for guarded reconciliation. Downloads can continue within staging, buffer, and disk limits during an outage.
 

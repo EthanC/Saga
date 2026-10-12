@@ -33,10 +33,11 @@ from core.archive_errors import (
     apply_diagnostics,
     diagnostic_fields,
     diagnostic_snapshot,
-    incident_category,
     legacy_bad_login,
 )
+from core.archive_incidents import incident_facts, incident_open
 from core.archive_retry import (
+    INCIDENT_RECOVERY_DELAY,
     INCIDENT_REMINDER_DELAY,
     MAX_PROBE_DELAY,
     MIN_WRITE_INTERVAL,
@@ -878,6 +879,7 @@ class StateStore:
                 gate.failures = 1
                 gate.retry_at = gate.first_failure_at = now
                 gate.incident_id = str(uuid4())
+                gate.incident_started_at = now
             session.add(gate)
             session.flush()
         return gate
@@ -994,10 +996,15 @@ class StateStore:
                     if gate.retry_at
                     else 0
                 )
-            if gate.failures == 0:
+            if gate.incident_started_at is None and gate.first_failure_at is not None:
+                gate.incident_started_at = gate.first_failure_at
+            if not incident_open(gate):
                 gate.incident_id = str(uuid4())
+                gate.incident_started_at = now
+                gate.incident_closed_at = None
                 gate.incident_notified_category = None
                 gate.incident_escalated_at = gate.incident_last_notified_at = None
+            gate.incident_healthy_since = None
             gate.failures += 1
             gate.generation += 1
             gate.first_failure_at = gate.first_failure_at or now
@@ -1085,20 +1092,10 @@ class StateStore:
                 return
             if progress.media_uploaded_at:
                 was_failing = gate.failures > 0
-                if gate.incident_escalated_at:
-                    gate.recovery_event = json.dumps(
-                        {
-                            "incident_id": gate.incident_id,
-                            "incident_category": gate.incident_notified_category,
-                            "recovered_at": now.isoformat(),
-                        }
-                    )
+                gate.incident_healthy_since = gate.incident_healthy_since or now
                 gate.failures = 0
                 gate.generation += 1
                 gate.retry_at = gate.first_failure_at = None
-                gate.error_kind = gate.error_phase = gate.last_error = None
-                gate.error_status = None
-                apply_diagnostics(gate)
                 gate.last_success_at = now
                 if gate.probation_until is not None:
                     if was_failing:
@@ -1209,6 +1206,13 @@ class StateStore:
             "recovery_notified_at": _as_utc(gate.recovery_notified_at).isoformat()
             if gate.recovery_notified_at
             else None,
+            "incident_healthy_since": _as_utc(gate.incident_healthy_since).isoformat()
+            if gate.incident_healthy_since
+            else None,
+            "incident_closed_at": _as_utc(gate.incident_closed_at).isoformat()
+            if gate.incident_closed_at
+            else None,
+            **incident_facts(gate, [row for row, _ in rows], current, stall_timeout),
         }
         by_id = {row.video_id: row for row, _ in rows}
         pending = any(
@@ -1252,16 +1256,11 @@ class StateStore:
                 )
         else:
             self._eligible_since.pop("archive:probe", None)
-        if gate.failures:
-            age = (current - _as_utc(gate.first_failure_at or current)).total_seconds()
+        if gate.failures or incident_open(gate):
             alerts.append(
                 {
                     "key": "archive:service",
-                    "severity": "error"
-                    if age > stall_timeout
-                    or gate.error_kind in {"authentication", "permission"}
-                    or gate.incident_escalated_at is not None
-                    else "warning",
+                    "severity": snapshot["severity"],
                     "message": _archive_incident_message(snapshot["incident_category"]),
                     "details": snapshot,
                 }
@@ -1293,16 +1292,52 @@ class StateStore:
                 gate.recovery_notified_at = current
             if gate.failures:
                 gate.incident_id = gate.incident_id or str(uuid4())
-                category = incident_category(gate.error_kind, gate.error_code)
-                age = max(
-                    0.0,
-                    (
-                        current - _as_utc(gate.first_failure_at or current)
-                    ).total_seconds(),
+                gate.incident_started_at = (
+                    gate.incident_started_at or gate.first_failure_at or current
                 )
+            if (
+                incident_open(gate)
+                and gate.failures == 0
+                and gate.incident_healthy_since is not None
+                and (current - _as_utc(gate.incident_healthy_since)).total_seconds()
+                >= INCIDENT_RECOVERY_DELAY
+            ):
+                gate.incident_closed_at = current
+                if gate.incident_escalated_at is not None:
+                    events.append(
+                        {
+                            "severity": "info",
+                            "recovery": True,
+                            "message": (
+                                "Archive service recovered after "
+                                "sustained healthy writes"
+                            ),
+                            "details": {
+                                "incident_id": gate.incident_id,
+                                "incident_category": gate.incident_notified_category,
+                                "recovered_at": current.isoformat(),
+                            },
+                        }
+                    )
+                    gate.recovery_notified_at = current
+                gate.error_kind = gate.error_phase = gate.last_error = None
+                gate.error_status = None
+                apply_diagnostics(gate)
+            if gate.failures:
+                rows = session.exec(
+                    select(ArchiveProgress).where(
+                        (col(ArchiveProgress.status) == "uploading")
+                        | (
+                            col(ArchiveProgress.media_uploaded_at)
+                            >= gate.incident_started_at
+                        )
+                    )
+                ).all()
+                facts = incident_facts(gate, rows, current, stall_timeout)
+                category = facts["incident_category"]
                 escalated = gate.incident_escalated_at is not None
                 actionable = category in {"authentication", "item-specific"}
-                error = escalated or age > stall_timeout or actionable
+                error = facts["severity"] == "error"
                 notify = (
                     gate.incident_last_notified_at is None
                     or error
@@ -1313,7 +1348,8 @@ class StateStore:
                         or gate.incident_notified_category
                         in {"authentication", "item-specific"}
                     )
-                    or escalated
+                    or error
+                    and escalated
                     and (
                         current - _as_utc(gate.incident_last_notified_at)
                     ).total_seconds()
@@ -1331,7 +1367,7 @@ class StateStore:
                             "message": _archive_incident_message(category),
                             "details": {
                                 "incident_id": gate.incident_id,
-                                "incident_age_seconds": age,
+                                **facts,
                                 "failure_count": gate.failures,
                                 "next_retry_at": _as_utc(gate.retry_at).isoformat()
                                 if gate.retry_at
@@ -2912,7 +2948,7 @@ def retry_delay(base: float, attempts: int) -> float:
 def _archive_incident_message(category: str) -> str:
     return {
         "transient": "Archive service unavailable; retries are coordinated",
-        "throttled": "Archive throttled requests; retries honor the server delay",
+        "throttled": "Archive throttled requests; retries are coordinated",
         "authentication": "Archive rejected authentication; check account credentials",
         "item-specific": "Archive denied item access; review item permissions",
         "unclassified": (

@@ -13,6 +13,7 @@ MAX_PROBE_DELAY = 900.0
 INCIDENT_REMINDER_DELAY = 3600.0
 THROTTLE_PROBATION = 1800.0
 MIN_WRITE_INTERVAL = 60.0
+INCIDENT_RECOVERY_DELAY = 1800.0
 
 
 class ArchiveServiceState(SQLModel, table=True):
@@ -43,6 +44,9 @@ class ArchiveServiceState(SQLModel, table=True):
     recovery_notified_at: datetime | None = None
     probation_until: datetime | None = None
     write_interval_seconds: float = 0.0
+    incident_started_at: datetime | None = None
+    incident_healthy_since: datetime | None = None
+    incident_closed_at: datetime | None = None
 
 
 def retryable_fields(

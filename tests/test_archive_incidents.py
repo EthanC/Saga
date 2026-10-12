@@ -8,7 +8,7 @@ from archivist import ServiceError
 from sqlmodel import Session
 
 from core import service
-from core.archive_retry import ArchiveServiceState
+from core.archive_retry import INCIDENT_RECOVERY_DELAY, ArchiveServiceState
 from core.service import SagaService
 from core.state import StateStore, _as_utc, utcnow
 from core.youtube import YouTubeClient
@@ -113,7 +113,9 @@ def test_actionable_category_changes_are_immediate_but_detail_changes_are_not(
     ):
         mutate(store, error_kind=kind, error_code=code)
         events = store.archive_service_notifications(stall_timeout=3600)
-        assert len(events) == 1 and events[0]["severity"] == "error"
+        assert len(events) == 1 and events[0]["severity"] == (
+            "warning" if kind == "service" else "error"
+        )
         assert events[0]["details"]["incident_category"] == category
         mutate(
             store,
@@ -143,7 +145,15 @@ def test_recovery_is_once_persisted_and_next_outage_has_a_new_identity(
     assert probe is not None
     gateway.upload_error = None
     operation.process(probe)
-    assert gate(store).recovery_event
+    assert gate(store).recovery_event is None
+    assert store.archive_service_notifications(stall_timeout=30) == []
+    assert (
+        store.transfer_health(stall_timeout=30)["archive_service"][
+            "incident_notification_state"
+        ]
+        == "observing"
+    )
+    clock[0] += timedelta(seconds=INCIDENT_RECOVERY_DELAY)
     store.close()
     store = StateStore(path)
     events = store.archive_service_notifications(stall_timeout=30)
@@ -164,7 +174,7 @@ def test_recovery_is_once_persisted_and_next_outage_has_a_new_identity(
     store.close()
 
 
-def test_pending_recovery_survives_a_new_outage_before_notification(
+def test_brief_recovery_does_not_close_incident_or_reset_notification_budget(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
@@ -181,9 +191,9 @@ def test_pending_recovery_survives_a_new_outage_before_notification(
     seed_upload(store, tmp_path, "NextVideo12")
     outage(store, tmp_path, clock[0])
     events = store.archive_service_notifications(stall_timeout=30)
-    assert [event["severity"] for event in events] == ["info", "warning"]
-    assert events[0]["details"]["incident_id"] == old_id
-    assert events[1]["details"]["incident_id"] != old_id
+    assert events == []
+    assert gate(store).incident_id == old_id
+    assert gate(store).incident_healthy_since is None
     store.close()
 
 
@@ -229,6 +239,9 @@ def test_service_uses_durable_policy_and_marks_recovery_for_discord(
     gateway.upload_error = None
     operation.process(probe)
     saga._emit_health_alerts([])
+    assert events == ["warning", "error"]
+    clock[0] += timedelta(seconds=INCIDENT_RECOVERY_DELAY)
+    saga._emit_health_alerts([])
     saga._emit_health_alerts([])
     assert events == ["warning", "error", "info"]
     store.close()
@@ -251,6 +264,115 @@ def test_legacy_incident_gets_identity_without_changing_retry_or_reason(
     assert events[0]["details"]["incident_category"] == "unclassified"
     assert events[0]["details"]["reason"] == "unknown"
     assert retry_at(store) == now + timedelta(hours=2)
+    store.close()
+
+
+def test_long_progressing_upload_suppresses_old_throttle_escalations_and_reminders(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    seed_upload(store, tmp_path)
+    outage(store, tmp_path, clock[0])
+    store.archive_service_notifications(stall_timeout=30)
+    clock[0] = retry_at(store)
+    probe = upload(store, clock[0])
+    assert probe is not None and probe.archive_probe_token
+    large = probe.video.id
+    store.update_archive(large, status="uploading")
+    for seconds in (31, 3600, 7200):
+        clock[0] += timedelta(seconds=seconds)
+        store.update_archive(
+            large, transfer_bytes=seconds, transfer_progress_at=clock[0]
+        )
+        assert store.archive_service_notifications(stall_timeout=30) == []
+        health = store.transfer_health(stall_timeout=30)
+        assert health["healthy"]
+        assert health["archive_service"]["severity"] == "warning"
+        assert health["archive_service"]["active_upload_bytes"] == seconds
+    clock[0] += timedelta(seconds=31)
+    events = store.archive_service_notifications(stall_timeout=30)
+    assert events[0]["severity"] == "error"
+    assert not store.transfer_health(stall_timeout=30)["healthy"]
+    clock[0] += timedelta(hours=1)
+    store.update_archive(large, transfer_bytes=100000, transfer_progress_at=clock[0])
+    assert store.archive_service_notifications(stall_timeout=30) == []
+    mutate(store, error_kind="authentication", error_code="InvalidAccessKeyId")
+    assert (
+        store.archive_service_notifications(stall_timeout=30)[0]["severity"] == "error"
+    )
+    store.close()
+
+
+def test_acknowledged_peer_progress_postpones_service_alarm_without_resetting_identity(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    seed_upload(store, tmp_path)
+    outage(store, tmp_path, clock[0])
+    identity = gate(store).incident_id
+    peer, _, _ = seed_upload(store, tmp_path, "PeerVideo12")
+    clock[0] += timedelta(seconds=60)
+    store.update_archive(
+        peer, status="complete", media_uploaded_at=clock[0], uploaded_bytes=4
+    )
+    events = store.archive_service_notifications(stall_timeout=30)
+    assert [e["severity"] for e in events] == ["warning"]
+    assert events[0]["details"]["acknowledged_uploads"] == 1
+    assert events[0]["details"]["acknowledged_bytes"] == 4
+    assert gate(store).incident_id == identity
+    store.close()
+
+
+def test_legacy_pending_recovery_is_forwarded_once(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    with Session(store.engine) as session:
+        session.add(ArchiveServiceState(recovery_event='{"incident_id":"legacy"}'))
+        session.commit()
+    events = store.archive_service_notifications(stall_timeout=30)
+    assert len(events) == 1 and events[0]["recovery"]
+    assert store.archive_service_notifications(stall_timeout=30) == []
+    store.close()
+
+
+def test_legacy_active_incident_preserves_identity_on_its_next_probe_failure(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    seed_upload(store, tmp_path)
+    with Session(store.engine) as session:
+        session.add(
+            ArchiveServiceState(
+                failures=1,
+                first_failure_at=clock[0],
+                retry_at=clock[0],
+                incident_id="legacy",
+            )
+        )
+        session.commit()
+    outage(store, tmp_path, clock[0])
+    assert gate(store).incident_id == "legacy"
+    assert gate(store).incident_started_at
+    store.close()
+
+
+def test_unescalated_incident_closes_quietly_after_stable_recovery(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    seed_upload(store, tmp_path)
+    operation, gateway = outage(store, tmp_path, clock[0])
+    assert (
+        store.archive_service_notifications(stall_timeout=3600)[0]["severity"]
+        == "warning"
+    )
+    clock[0] = retry_at(store)
+    probe = upload(store, clock[0])
+    assert probe is not None
+    gateway.upload_error = None
+    operation.process(probe)
+    clock[0] += timedelta(seconds=INCIDENT_RECOVERY_DELAY)
+    assert store.archive_service_notifications(stall_timeout=3600) == []
+    assert gate(store).incident_closed_at and gate(store).error_kind is None
     store.close()
 
 
