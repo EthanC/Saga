@@ -24,13 +24,18 @@ async def main(root: Path, endpoint: str) -> None:
     loop = asyncio.get_running_loop()
     patch = pytest.MonkeyPatch()
 
+    async def interrupt_after_request() -> None:
+        while not (root / "request-started").exists():
+            await asyncio.sleep(0.05)
+        signal.raise_signal(signal.SIGTERM)
+
     def service(*args: Any, **kwargs: Any) -> SagaService:
         controller = kwargs["stop_controller"]
 
         class Gateway(FakeGateway):
             def upload(self, *args: Any, **kwargs: Any) -> Any:
                 loop.call_soon_threadsafe(
-                    lambda: loop.call_later(2, signal.raise_signal, signal.SIGTERM)
+                    lambda: asyncio.create_task(interrupt_after_request())
                 )
                 return run_managed(
                     "ziggy",

@@ -221,6 +221,7 @@ def test_real_entrypoint_sigterm_saves_uncertain_upload(tmp_path: Path) -> None:
     class SlowResponse(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             requested.append(self.rfile.read(int(self.headers["Content-Length"])))
+            (tmp_path / "request-started").write_text("received", encoding="utf-8")
             self.send_response(202)
             self.send_header("Content-Length", "100000")
             self.end_headers()
