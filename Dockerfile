@@ -10,7 +10,8 @@ RUN uv python install --install-dir /opt/python 3.15.0 \
 
 FROM python AS builder
 
-RUN apk add --no-cache build-base
+RUN apk add --no-cache build-base clang compiler-rt
+ENV CC=clang CXX=clang++
 
 WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
