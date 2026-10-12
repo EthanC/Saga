@@ -101,6 +101,12 @@ Saga stores its database and temporary downloads in `data`. The first scan archi
 
 Saga reads `.env` and process variables, with process values taking precedence. Set `INTERNET_ARCHIVE_EMAIL` and `INTERNET_ARCHIVE_PASSWORD` to archive media. See [`.env.example`](.env.example) for paths, schedules, logging, rate limits, and other options.
 
+## Webpage submission recovery
+
+Ziggy connection refusal and DNS lookup failures before the POST is sent are retried with durable backoff. A lost or malformed receipt, a read timeout after a response, and a redirected submission remain uncertain and require reconciliation before resubmission. Saga never follows submission redirects, which prevents a later connection failure from being mistaken for an unsent original POST.
+
+A one-time startup migration restores legacy Ziggy jobs only when their saved error exactly identifies a refused connection before submission and no Ziggy or Wayback receipt exists. This includes the refusal records produced by older Saga releases. Other uncertain jobs retain their operator-review state. No manual database edit is required.
+
 ## Database Backups
 
 Saga creates online SQLite snapshots and checks each one with `PRAGMA quick_check`. By default, backups run daily at 7:00 AM in the system timezone, with the latest seven kept in `data/backups`. The schedule, timezone, location, and retention are configurable in `.env`.

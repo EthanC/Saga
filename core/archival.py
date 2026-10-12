@@ -13,7 +13,7 @@ from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Protocol, cast
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from uuid import uuid4
 
 from archivist import (
@@ -47,6 +47,7 @@ from core.shutdown import CooperativeStop, StopController
 from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
+from core.webpage_errors import SubmissionNotSentError, known_connect_failure
 from core.workers import run_managed
 from core.youtube import (
     DiskSpaceError,
@@ -57,6 +58,14 @@ from core.youtube import (
 from core.youtube_errors import VideoAccessError
 
 MAX_IDENTIFIER_LENGTH = 100
+
+
+class _NoSubmissionRedirects(HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+urlopen = build_opener(_NoSubmissionRedirects()).open
 
 
 @dataclass(frozen=True, slots=True)
@@ -907,6 +916,17 @@ class ArchiveProcessor:
                     )
                 except Exception as error:
                     raise AcceptedSubmissionPersistenceError(str(error)) from error
+        except SubmissionNotSentError as error:
+            self.state.update_job(
+                work,
+                status="waiting",
+                webpage_status="pending",
+                error=_error_text(error),
+                **failure_facts(error),
+                retry_after=retry_delay(
+                    self.settings.archive_retry_delay, work.job.attempts
+                ),
+            )
         except (
             NetworkError,
             SubmissionUncertainError,
@@ -1093,14 +1113,29 @@ def submit_ziggy(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        response = urlopen(request, timeout=timeout)
+    except HTTPError as error:
+        if 300 <= error.code < 400:
+            raise SubmissionUncertainError(
+                "Ziggy redirected the submission; acceptance is unknown"
+            ) from error
+        raise SubmissionRejectedError(f"Ziggy rejected the request: {error}") from error
+    except (HTTPException, OSError) as error:
+        if isinstance(error, OSError) and known_connect_failure(error):
+            raise SubmissionNotSentError(
+                "Ziggy connection failed before submission",
+                service="Ziggy",
+                request_phase="webpage-connect",
+                cause_type=type(error).__name__,
+            ) from error
+        raise SubmissionUncertainError(f"Ziggy response was lost: {error}") from error
+    try:
+        with response:
             if response.status != 202:
                 raise SubmissionRejectedError(
                     f"Ziggy returned HTTP {response.status}, expected 202"
                 )
             payload = response.read()
-    except HTTPError as error:
-        raise SubmissionRejectedError(f"Ziggy rejected the request: {error}") from error
     except (HTTPException, OSError) as error:
         raise SubmissionUncertainError(f"Ziggy response was lost: {error}") from error
     try:

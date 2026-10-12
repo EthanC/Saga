@@ -48,6 +48,7 @@ from core.archive_retry import (
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
 from core.logging import redact_diagnostics
 from core.staging import completed_download_size, download_reservation, inventory_inputs
+from core.webpage_errors import legacy_ziggy_not_sent
 from core.youtube_errors import is_access_error
 
 
@@ -2868,6 +2869,7 @@ class StateStore:
             )
         with self._write_lock, Session(self.engine) as session:
             if session.get(SchemaMigration, 2) is not None:
+                self._recover_unsubmitted_ziggy(session)
                 if session.get(SchemaMigration, 3) is None:
                     session.add(SchemaMigration(version=3))
                     session.commit()
@@ -2936,6 +2938,42 @@ class StateStore:
             session.add(SchemaMigration(version=2))
             session.add(SchemaMigration(version=3))
             session.commit()
+            self._recover_unsubmitted_ziggy(session)
+
+    @staticmethod
+    def _recover_unsubmitted_ziggy(session: Session) -> None:
+        """Restore only legacy failures that prove the TCP connection was refused."""
+        if session.get(SchemaMigration, 4) is not None:
+            return
+        for job in session.exec(
+            select(ArchiveJob).where(
+                ArchiveJob.kind == "webpage",
+                ArchiveJob.status == "failed",
+                col(ArchiveJob.claim_token).is_(None),
+            )
+        ).all():
+            progress = session.get(ArchiveProgress, job.video_id)
+            assert progress is not None
+            if (
+                not legacy_ziggy_not_sent(job.last_error)
+                or progress.ziggy_receipt
+                or progress.wayback_job_id
+            ):
+                continue
+            now = utcnow()
+            job.status = "waiting"
+            job.attempts = 0
+            job.retry_at = job.updated_at = now
+            job.deadline_at = now + timedelta(days=1)
+            job.error_kind = "network"
+            job.error_phase = "webpage-connect"
+            job.last_error = (
+                "SubmissionNotSentError: Ziggy connection refused before submission"
+            )
+            progress.webpage_status = "pending"
+            session.add_all((job, progress))
+        session.add(SchemaMigration(version=4))
+        session.commit()
 
 
 def retry_delay(base: float, attempts: int) -> float:
