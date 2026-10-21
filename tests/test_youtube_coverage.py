@@ -124,6 +124,28 @@ def test_scan_history_batches_deduplicates_and_respects_enabled_tabs(
     assert batches == [("aaaaaaaaaaa", "bbbbbbbbbbb"), ("ccccccccccc", "ddddddddddd")]
 
 
+def test_scan_history_flushes_final_partial_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        youtube.YouTubeClient,
+        "_tab_videos",
+        lambda self, channel, tab, content_type, limit: (video("aaaaaaaaaaa"),),
+    )
+    monkeypatch.setattr(
+        youtube.YouTubeClient, "_playlist_videos", lambda self, channel, enabled: ()
+    )
+    batches: list[tuple[str, ...]] = []
+
+    youtube.YouTubeClient().scan_history(
+        CHANNEL,
+        lambda batch: batches.append(tuple(item.id for item in batch)),
+        content_types={"video"},
+    )
+
+    assert batches == [("aaaaaaaaaaa",)]
+
+
 def playlist_downloader(
     monkeypatch: pytest.MonkeyPatch, pages: dict[str, Any]
 ) -> list[str]:
@@ -171,6 +193,7 @@ def test_playlist_videos_find_channel_uploads_missing_from_tabs(
             f"{CHANNEL.url}/playlists": {
                 "entries": [
                     None,
+                    {"url": None},
                     {"url": "https://www.youtube.com/@other"},
                     {"url": playlist_url("PLfirst")},
                     {"url": playlist_url("PLbroken")},
@@ -182,6 +205,7 @@ def test_playlist_videos_find_channel_uploads_missing_from_tabs(
                     entry("unlisted001", title="Unlisted"),
                     entry("foreign0001", channel_id="UCbbbbbbbbbbbbbbbbbbbbbb"),
                     entry("missingchan", channel_id=None),
+                    entry("badid"),
                     entry(
                         "shortvideo1", url="https://www.youtube.com/shorts/shortvideo1"
                     ),
