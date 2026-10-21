@@ -12,7 +12,7 @@ from hashlib import md5, sha1
 from io import StringIO
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from loguru import logger
 from yt_dlp import YoutubeDL
@@ -199,17 +199,25 @@ class YouTubeClient:
         )
         seen: set[str] = set()
         batch: list[DiscoveredVideo] = []
+
+        def add(video: DiscoveredVideo) -> None:
+            if video.id in seen:
+                return
+            seen.add(video.id)
+            batch.append(video)
+            if len(batch) >= batch_size:
+                record_batch(tuple(batch))
+                batch.clear()
+
         for content_type, tab in CONTENT_TABS:
             if content_type not in enabled:
                 continue
             for video in self._tab_videos(channel, tab, content_type, None):
-                if video.id in seen:
-                    continue
-                seen.add(video.id)
-                batch.append(video)
-                if len(batch) >= batch_size:
-                    record_batch(tuple(batch))
-                    batch.clear()
+                add(video)
+        # Playlists can contain unlisted uploads that no channel tab lists.
+        if enabled:
+            for video in self._playlist_videos(channel, enabled):
+                add(video)
         if batch:
             record_batch(tuple(batch))
         logger.debug(
@@ -547,6 +555,71 @@ class YouTubeClient:
         content_type: ContentType,
         limit: int | None,
     ) -> Iterable[DiscoveredVideo]:
+        for entry in self._tab_entries(channel, tab, limit):
+            video = _video(entry, content_type)
+            if video is not None:
+                yield video
+
+    def _tab_entries(
+        self, channel: ResolvedChannel, tab: str, limit: int | None
+    ) -> Iterable[Any]:
+        logger.trace("Reading YouTube {} tab for channel {}", tab, channel.id)
+        try:
+            yield from self._flat_entries(
+                f"{channel.url}/{tab}", f"{tab} tab data for {channel.id}", limit
+            )
+        except DownloadError as error:
+            if f"This channel does not have a {tab} tab" in str(error):
+                logger.debug("Channel {} has no {} tab", channel.id, tab)
+                return
+            raise
+
+    def _playlist_videos(
+        self, channel: ResolvedChannel, enabled: frozenset[ContentType]
+    ) -> Iterable[DiscoveredVideo]:
+        playlists = tuple(
+            dict.fromkeys(
+                playlist_id
+                for entry in self._tab_entries(channel, "playlists", None)
+                if (playlist_id := _playlist_id(entry)) is not None
+            )
+        )
+        logger.debug(
+            "Scanning {} playlist(s) for channel {}", len(playlists), channel.id
+        )
+        for playlist_id in playlists:
+            logger.trace("Reading YouTube playlist {} for {}", playlist_id, channel.id)
+            try:
+                for entry in self._flat_entries(
+                    f"https://www.youtube.com/playlist?list={playlist_id}",
+                    f"playlist data for {playlist_id}",
+                    None,
+                ):
+                    # Playlists may include uploads from other channels.
+                    if not isinstance(entry, dict) or entry.get("channel_id") != (
+                        channel.id
+                    ):
+                        continue
+                    content_type = _playlist_content_type(entry)
+                    if content_type not in enabled:
+                        continue
+                    video = _video(entry, content_type)
+                    if video is not None:
+                        yield video
+            except DownloadError as error:
+                detail = redact_diagnostics(str(error))
+                if is_access_error(detail):
+                    raise
+                logger.warning(
+                    "Skipping unreadable playlist {} for channel {}: {}",
+                    playlist_id,
+                    channel.id,
+                    detail,
+                )
+
+    def _flat_entries(
+        self, url: str, description: str, limit: int | None
+    ) -> Iterable[Any]:
         options = self._options()
         options.update({"extract_flat": True, "lazy_playlist": True})
         options.setdefault("extractor_args", {})["youtube"] = {
@@ -555,28 +628,15 @@ class YouTubeClient:
         if limit is not None:
             options["playlist_items"] = f"1:{limit}"
 
-        logger.trace("Reading YouTube {} tab for channel {}", tab, channel.id)
         with _limited_downloader(
             YoutubeDL, self.download_limiter, self.stop_controller
         )(options) as downloader:
-            try:
-                info: Any = downloader.extract_info(
-                    f"{channel.url}/{tab}", download=False
-                )
-            except DownloadError as error:
-                if f"This channel does not have a {tab} tab" in str(error):
-                    logger.debug("Channel {} has no {} tab", channel.id, tab)
-                    return
-                raise
+            info: Any = downloader.extract_info(url, download=False)
             if not isinstance(info, dict) or info.get("entries") is None:
-                raise RuntimeError(
-                    f"yt-dlp returned no {tab} tab data for {channel.id}"
-                )
+                raise RuntimeError(f"yt-dlp returned no {description}")
             for entry in info["entries"]:
                 self.stop_controller.check()
-                video = _video(entry, content_type)
-                if video is not None:
-                    yield video
+                yield entry
 
     def _options(self) -> dict[str, Any]:
         options: dict[str, Any] = {
@@ -763,6 +823,27 @@ def _video(value: Any, content_type: ContentType = "video") -> DiscoveredVideo |
         published_precise=published_precise,
         content_type=content_type,
     )
+
+
+def _playlist_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    url = value.get("url")
+    if isinstance(url, str):
+        identifiers = parse_qs(urlsplit(url).query).get("list")
+        if identifiers:
+            return identifiers[0]
+    return None
+
+
+def _playlist_content_type(value: dict[str, Any]) -> ContentType:
+    # Playlist entries do not say which channel tab would list them.
+    url = value.get("url")
+    if isinstance(url, str) and "/shorts/" in url:
+        return "short"
+    if value.get("live_status") in {*DEFERRED_LIVE_STATUSES, "was_live"}:
+        return "livestream"
+    return "video"
 
 
 def _published_at(value: dict[str, Any]) -> datetime | None:

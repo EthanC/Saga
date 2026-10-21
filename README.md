@@ -95,7 +95,7 @@ Create `config`, copy the example files to `config/config.toml` and `.env`, then
 uv run python saga.py
 ```
 
-Saga stores its database and temporary downloads in `data`. The first scan archives existing videos without posting them to Discord.
+Saga stores its database and temporary downloads in `data`. The first scan archives existing videos without posting them to Discord. Full history scans also read every playlist on the channel's Playlists tab, so unlisted uploads that appear only in playlists are discovered and archived. Playlist videos from other channels are ignored.
 
 ## Environment Variables
 

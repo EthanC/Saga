@@ -100,7 +100,14 @@ def test_scan_history_batches_deduplicates_and_respects_enabled_tabs(
     ) -> tuple[DiscoveredVideo, ...]:
         return values.get(tab, ())
 
+    def playlists(
+        self: youtube.YouTubeClient, channel: ResolvedChannel, enabled: Any
+    ) -> tuple[DiscoveredVideo, ...]:
+        assert enabled == {"short", "video"}
+        return video("ccccccccccc"), video("ddddddddddd")
+
     monkeypatch.setattr(youtube.YouTubeClient, "_tab_videos", tabs)
+    monkeypatch.setattr(youtube.YouTubeClient, "_playlist_videos", playlists)
     batches: list[tuple[str, ...]] = []
     client = youtube.YouTubeClient()
 
@@ -114,7 +121,126 @@ def test_scan_history_batches_deduplicates_and_respects_enabled_tabs(
         CHANNEL, lambda _: pytest.fail("unexpected batch"), content_types=()
     )
 
-    assert batches == [("aaaaaaaaaaa", "bbbbbbbbbbb"), ("ccccccccccc",)]
+    assert batches == [("aaaaaaaaaaa", "bbbbbbbbbbb"), ("ccccccccccc", "ddddddddddd")]
+
+
+def playlist_downloader(
+    monkeypatch: pytest.MonkeyPatch, pages: dict[str, Any]
+) -> list[str]:
+    requested: list[str] = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options: dict[str, Any]) -> None:
+            assert options["extract_flat"] is True
+
+        def __enter__(self) -> FakeYoutubeDL:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+        def extract_info(self, url: str, *, download: bool) -> Any:
+            requested.append(url)
+            outcome = pages[url]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(youtube, "YoutubeDL", FakeYoutubeDL)
+    return requested
+
+
+def playlist_url(playlist_id: str) -> str:
+    return f"https://www.youtube.com/playlist?list={playlist_id}"
+
+
+def test_playlist_videos_find_channel_uploads_missing_from_tabs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def entry(video_id: str, **changes: Any) -> dict[str, Any]:
+        return {
+            "id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "channel_id": CHANNEL.id,
+            **changes,
+        }
+
+    requested = playlist_downloader(
+        monkeypatch,
+        {
+            f"{CHANNEL.url}/playlists": {
+                "entries": [
+                    None,
+                    {"url": "https://www.youtube.com/@other"},
+                    {"url": playlist_url("PLfirst")},
+                    {"url": playlist_url("PLbroken")},
+                    {"url": playlist_url("PLfirst")},
+                ]
+            },
+            playlist_url("PLfirst"): {
+                "entries": [
+                    entry("unlisted001", title="Unlisted"),
+                    entry("foreign0001", channel_id="UCbbbbbbbbbbbbbbbbbbbbbb"),
+                    entry("missingchan", channel_id=None),
+                    entry(
+                        "shortvideo1", url="https://www.youtube.com/shorts/shortvideo1"
+                    ),
+                    entry("pastlive001", live_status="was_live"),
+                    "invalid",
+                ]
+            },
+            playlist_url("PLbroken"): DownloadError("This playlist does not exist"),
+        },
+    )
+
+    result = list(
+        youtube.YouTubeClient()._playlist_videos(
+            CHANNEL, frozenset({"video", "livestream"})
+        )
+    )
+
+    assert [(item.id, item.content_type) for item in result] == [
+        ("unlisted001", "video"),
+        ("pastlive001", "livestream"),
+    ]
+    assert result[0].title == "Unlisted"
+    assert requested == [
+        f"{CHANNEL.url}/playlists",
+        playlist_url("PLfirst"),
+        playlist_url("PLbroken"),
+    ]
+
+
+def test_playlist_videos_propagate_access_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    playlist_downloader(
+        monkeypatch,
+        {
+            f"{CHANNEL.url}/playlists": {"entries": [{"url": playlist_url("PLx")}]},
+            playlist_url("PLx"): DownloadError("Sign in to confirm you're not a bot"),
+        },
+    )
+
+    with pytest.raises(DownloadError, match="not a bot"):
+        list(youtube.YouTubeClient()._playlist_videos(CHANNEL, frozenset({"video"})))
+
+
+def test_playlist_videos_tolerate_channels_without_playlists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    playlist_downloader(
+        monkeypatch,
+        {
+            f"{CHANNEL.url}/playlists": DownloadError(
+                "This channel does not have a playlists tab"
+            )
+        },
+    )
+
+    assert not list(
+        youtube.YouTubeClient()._playlist_videos(CHANNEL, frozenset({"video"}))
+    )
 
 
 def video(video_id: str) -> DiscoveredVideo:
