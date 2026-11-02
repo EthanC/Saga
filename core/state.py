@@ -51,6 +51,9 @@ from core.staging import completed_download_size, download_reservation, inventor
 from core.webpage_errors import legacy_ziggy_not_sent
 from core.youtube_errors import is_access_error
 
+PUBLICATION_RETRY_BASE = 300.0
+PUBLICATION_RETRY_CAP = 3600.0
+
 
 def utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
@@ -66,6 +69,7 @@ class Channel(SQLModel, table=True):
     canonical_url: str
     baseline_at: datetime | None = Field(default=None, index=True)
     backfill_complete: bool = False
+    backfill_completed_at: datetime | None = None
     last_polled_at: datetime | None = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
@@ -116,6 +120,9 @@ class Video(SQLModel, table=True):
     notification_silent: bool = False
     notification_ambiguous: bool = False
     publication_retry_at: datetime | None = None
+    publication_attempts: int = 0
+    publication_failure: str | None = None
+    publication_error: str | None = None
     webpage_url: str
 
 
@@ -609,10 +616,18 @@ class StateStore:
             if channel is None:
                 raise LookupError(f"Unknown channel {channel_id}")
             channel.backfill_complete = True
-            channel.updated_at = utcnow()
+            channel.backfill_completed_at = channel.updated_at = utcnow()
             session.add(channel)
             session.commit()
         logger.debug("Marked history backfill complete for channel {}", channel_id)
+
+    def backfill_completed_at(self, channel_id: str) -> datetime | None:
+        """Return when one channel's last full enumeration finished, if recorded."""
+        with Session(self.engine) as session:
+            channel = session.get(Channel, channel_id)
+            if channel is None or channel.backfill_completed_at is None:
+                return None
+            return _as_utc(channel.backfill_completed_at)
 
     def notification_baseline(self, channel_id: str) -> datetime:
         """Return one channel's established notification boundary in UTC."""
@@ -638,6 +653,7 @@ class StateStore:
                 if video.notification_ambiguous
                 and not video.notification_silent
                 and not video.notification_eligible
+                and video.publication_failure != "permanent"
             }
             return set(identifiers) - known_ids | ambiguous
 
@@ -658,6 +674,8 @@ class StateStore:
                     col(Video.notification_ambiguous).is_(True),
                     col(Video.notification_silent).is_(False),
                     col(Video.notification_eligible).is_(False),
+                    col(Video.publication_failure).is_(None)
+                    | (col(Video.publication_failure) != "permanent"),
                     col(Video.publication_retry_at).is_(None)
                     | (col(Video.publication_retry_at) <= current),
                 )
@@ -683,6 +701,43 @@ class StateStore:
                 replay_ready=video.replay_ready,
                 published_precise=False,
                 content_type=cast(ContentType, video.content_type),
+            )
+
+    def record_publication_failure(
+        self,
+        video_id: str,
+        error: str,
+        *,
+        permanent: bool,
+        base_delay: float = PUBLICATION_RETRY_BASE,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        """Stop resolving gone videos and back off retries for unready ones."""
+        current = now or utcnow()
+        with self._write_lock, Session(self.engine) as session:
+            video = session.get(Video, video_id)
+            if video is None:
+                raise LookupError(f"Unknown video {video_id}")
+            video.publication_attempts += 1
+            video.publication_failure = "permanent" if permanent else "transient"
+            video.publication_error = redact_diagnostics(error)[:2000]
+            video.publication_retry_at = (
+                None
+                if permanent
+                else current
+                + timedelta(
+                    seconds=min(
+                        PUBLICATION_RETRY_CAP,
+                        retry_delay(base_delay, video.publication_attempts),
+                    )
+                )
+            )
+            session.add(video)
+            session.commit()
+            return (
+                None
+                if video.publication_retry_at is None
+                else _as_utc(video.publication_retry_at)
             )
 
     def reset_interrupted_claims(self, *, background_deadline: float = 86_400) -> None:
@@ -2794,12 +2849,20 @@ class StateStore:
         else:
             video.title = discovery.title or video.title
             video.published_at = discovery.published_at or video.published_at
+            if (
+                video.publication_failure == "transient"
+                and discovery.live_status != video.live_status
+            ):
+                # A scheduled stream that starts or ends may now have metadata.
+                video.publication_retry_at = None
             video.live_status = discovery.live_status
             video.content_type = discovery.content_type
             video.replay_ready = discovery.replay_ready
             video.notification_silent = video.notification_silent or silent
             if discovery.published_precise:
                 video.notification_ambiguous = False
+                video.publication_attempts = 0
+                video.publication_failure = video.publication_error = None
             else:
                 video.notification_ambiguous = video.notification_ambiguous or ambiguous
             video.notification_candidate = video.notification_candidate or (
@@ -2867,6 +2930,7 @@ class StateStore:
             column["name"] for column in schema.get_columns("subscription")
         }
         video_columns = {column["name"] for column in schema.get_columns("video")}
+        channel_columns = {column["name"] for column in schema.get_columns("channel")}
         report_checkpoint_columns = {
             column["name"] for column in schema.get_columns("reportcheckpoint")
         }
@@ -2883,6 +2947,20 @@ class StateStore:
         if "publication_retry_at" not in video_columns:
             statements.append(
                 "ALTER TABLE video ADD COLUMN publication_retry_at DATETIME"
+            )
+        if "publication_attempts" not in video_columns:
+            statements.append(
+                "ALTER TABLE video ADD COLUMN publication_attempts INTEGER NOT NULL "
+                "DEFAULT 0"
+            )
+        statements.extend(
+            f"ALTER TABLE video ADD COLUMN {name} VARCHAR"
+            for name in ("publication_failure", "publication_error")
+            if name not in video_columns
+        )
+        if "backfill_completed_at" not in channel_columns:
+            statements.append(
+                "ALTER TABLE channel ADD COLUMN backfill_completed_at DATETIME"
             )
         if "schedule" not in report_checkpoint_columns:
             statements.append(

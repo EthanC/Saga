@@ -123,6 +123,14 @@ def test_load_youtube_configs_rejects_document_shapes(
         ({**VALID_INSTANCE, "retries": True}, "non-negative integer"),
         ({**VALID_INSTANCE, "retries": -1}, "non-negative integer"),
         ({**VALID_INSTANCE, "retry_delay": -1}, "must be non-negative"),
+        (
+            {**VALID_INSTANCE, "reconciliation_interval": 0},
+            "reconciliation_interval must be greater than zero",
+        ),
+        (
+            {**VALID_INSTANCE, "reconciliation_interval": "6h"},
+            "reconciliation_interval must be a finite number",
+        ),
     ],
 )
 def test_parse_youtube_config_rejects_invalid_values(value: Any, message: str) -> None:

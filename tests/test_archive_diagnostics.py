@@ -173,7 +173,7 @@ def test_wrapped_results_and_retry_hints_survive_worker_ipc(
     monkeypatch.setattr(
         archival, "ArchiveGateway", lambda *args, **kwargs: SimpleNamespace(upload=fail)
     )
-    workers._worker(
+    workers._execute(
         cast(Any, child), Event(), "gateway", "upload", {"settings": None}, (), {}
     )
     parent = Connection(child.messages)

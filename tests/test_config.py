@@ -20,6 +20,7 @@ name = "primary"
 cooldown = 90
 retries = 4
 retry_delay = 10
+reconciliation_interval = 43200
 
 [[instances.youtube.channels]]
 reference = "@ExampleHandle"
@@ -41,6 +42,7 @@ livestreams = false
     assert configs[0].cooldown == 90.0
     assert configs[0].retries == 4
     assert configs[0].retry_delay == 10.0
+    assert configs[0].reconciliation_interval == 43_200.0
     assert [channel.reference for channel in configs[0].channels] == [
         "@ExampleHandle",
         "UCaaaaaaaaaaaaaaaaaaaaaa",

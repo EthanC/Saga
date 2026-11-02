@@ -494,6 +494,9 @@ def test_reconciliation_records_batches_and_survives_failure(
         def mark_backfill_complete(self, channel_id: str) -> None:
             self.completed += 1
 
+        def backfill_completed_at(self, channel_id: str) -> None:
+            return None
+
     state = State()
     service = service_with(tmp_path, state, Youtube())
     waits = 0
@@ -579,7 +582,9 @@ def test_reconciliation_cancellation_waits_for_thread(tmp_path: Path) -> None:
             finish.wait(timeout=5)
             raise RuntimeError("late failure")
 
-    service = service_with(tmp_path, SimpleNamespace(), Youtube())
+    service = service_with(
+        tmp_path, SimpleNamespace(backfill_completed_at=lambda _: None), Youtube()
+    )
 
     async def scenario() -> None:
         task = asyncio.create_task(
@@ -717,6 +722,16 @@ def test_resolve_publications_selects_replaces_and_preserves(tmp_path: Path) -> 
 
         def publication_detail_ids(self, ids: Any) -> set[str]:
             return set(ids)
+
+        def record_publication_failure(
+            self, video_id: str, error: str, *, permanent: bool
+        ) -> datetime:
+            assert (video_id, error, permanent) == (
+                failed.id,
+                "RuntimeError: failed",
+                False,
+            )
+            return baseline
 
     class Youtube:
         def video_metadata(self, video_id: str) -> VideoMetadata:

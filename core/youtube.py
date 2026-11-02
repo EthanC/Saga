@@ -34,7 +34,12 @@ from core.staging import (
 )
 from core.state import DiscoveredVideo, ResolvedChannel
 from core.workers import run_managed
-from core.youtube_errors import VideoAccessError, cookie_fingerprint, is_access_error
+from core.youtube_errors import (
+    UNAVAILABLE_MARKERS,
+    VideoAccessError,
+    cookie_fingerprint,
+    is_access_error,
+)
 
 DEFERRED_LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
 CONTENT_TABS: tuple[tuple[ContentType, str], ...] = (
@@ -1002,12 +1007,6 @@ def _classify_download_error(
         result = VideoAccessError(detail)
         result.cookie_generation = cookie_generation
         return result
-    unavailable_markers = (
-        "private video",
-        "video unavailable",
-        "this video is unavailable",
-        "has been removed",
-    )
-    if any(marker in detail.casefold() for marker in unavailable_markers):
+    if any(marker in detail.casefold() for marker in UNAVAILABLE_MARKERS):
         return VideoUnavailableError(detail)
     return RuntimeError(detail)

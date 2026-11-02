@@ -67,6 +67,7 @@ class YouTubeConfig:
     cooldown: float = 60.0
     retries: int = 3
     retry_delay: float = 5.0
+    reconciliation_interval: float = 21_600.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -376,7 +377,14 @@ def _parse_youtube_config(value: Any, index: int) -> YouTubeConfig:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a table")
 
-    allowed = {"name", "channels", "cooldown", "retries", "retry_delay"}
+    allowed = {
+        "name",
+        "channels",
+        "cooldown",
+        "retries",
+        "retry_delay",
+        "reconciliation_interval",
+    }
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"Unknown keys in {label}: {_keys(unknown)}")
@@ -411,12 +419,20 @@ def _parse_youtube_config(value: Any, index: int) -> YouTubeConfig:
     if retry_delay < 0:
         raise ValueError(f"{label}.retry_delay must be non-negative")
 
+    reconciliation_interval = _finite_number(
+        value.get("reconciliation_interval", 21_600.0),
+        f"{label}.reconciliation_interval",
+    )
+    if reconciliation_interval <= 0:
+        raise ValueError(f"{label}.reconciliation_interval must be greater than zero")
+
     return YouTubeConfig(
         name=name,
         channels=channels,
         cooldown=cooldown,
         retries=retries,
         retry_delay=retry_delay,
+        reconciliation_interval=reconciliation_interval,
     )
 
 

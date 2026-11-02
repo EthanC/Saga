@@ -57,14 +57,6 @@ def test_child_protocol_dispatches_callbacks_and_serializes_outcomes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, category: str, method: str
 ) -> None:
     connection = Connection()
-    monkeypatch.setattr(logging_module, "configure_logging", lambda settings: None)
-    monkeypatch.setattr(
-        workers,
-        "os",
-        SimpleNamespace(
-            name="nt" if category == "ziggy" else "posix", setsid=lambda: None
-        ),
-    )
 
     class Client:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -106,7 +98,7 @@ def test_child_protocol_dispatches_callbacks_and_serializes_outcomes(
     stop = Event()
     if category == "failure":
         stop.set()
-    workers._worker(
+    workers._execute(
         cast(Any, connection),
         stop,
         category,
@@ -119,7 +111,6 @@ def test_child_protocol_dispatches_callbacks_and_serializes_outcomes(
         (),
         {},
     )
-    assert connection.closed
     if category == "gateway" and method == "upload":
         assert connection.messages[-1][0] == "upload_failure"
     elif category in {"unknown", "failure"}:
@@ -150,7 +141,7 @@ def test_managed_download_without_parent_guard_keeps_native_space_checks(
         "YouTubeClient",
         lambda **kwargs: SimpleNamespace(download_video=download),
     )
-    workers._worker(
+    workers._execute(
         cast(Any, connection),
         Event(),
         "youtube",
@@ -218,7 +209,8 @@ def test_parent_keeps_progress_durable_and_handles_lost_worker_outcomes(
             run()
     assert parent.closed and child.closed
     if outcome == "callback_error":
-        assert parent.messages[0][0] == "error"
+        assert parent.messages[1][0] == "error"
+    assert parent.messages[0][:2] == ("gateway", "upload")
 
 
 @pytest.mark.parametrize(

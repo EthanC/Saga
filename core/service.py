@@ -33,7 +33,7 @@ from core.staging import maintain_partials
 from core.state import DiscoveredVideo, ResolvedChannel, StateStore, utcnow
 from core.storage import data_usage, remaining_data_bytes
 from core.youtube import YouTubeClient
-from core.youtube_errors import cookie_fingerprint
+from core.youtube_errors import cookie_fingerprint, is_permanent_video_error
 
 STARTUP_STALL_TIMEOUT = 300
 
@@ -47,6 +47,7 @@ class MonitoredChannel:
     content_types: frozenset[ContentType]
     retries: int = 0
     retry_delay: float = 0.0
+    reconciliation_interval: float = 21_600.0
 
 
 class SagaService:
@@ -176,6 +177,7 @@ class SagaService:
         cooldown_by_channel: dict[str, float] = {}
         retries_by_channel: dict[str, int] = {}
         retry_delay_by_channel: dict[str, float] = {}
+        reconciliation_by_channel: dict[str, float] = {}
         content_types_by_channel: dict[str, set[ContentType]] = {}
 
         for config in self.configurations:
@@ -224,6 +226,12 @@ class SagaService:
                     if previous_delay is None
                     else min(previous_delay, config.retry_delay)
                 )
+                reconciliation_by_channel[resolved.id] = min(
+                    reconciliation_by_channel.get(
+                        resolved.id, config.reconciliation_interval
+                    ),
+                    config.reconciliation_interval,
+                )
             routes_by_instance.append((config, tuple(routes)))
 
         self.state.synchronize_subscriptions(routes_by_instance)
@@ -242,6 +250,7 @@ class SagaService:
                 frozenset(content_types_by_channel[channel_id]),
                 retries_by_channel[channel_id],
                 retry_delay_by_channel[channel_id],
+                reconciliation_by_channel[channel_id],
             )
             for channel_id, cooldown in cooldown_by_channel.items()
         )
@@ -288,7 +297,24 @@ class SagaService:
 
     async def _reconciliation_loop(self, monitored: MonitoredChannel) -> None:
         channel = monitored.channel
-        logger.debug("History worker started for {}", channel.title)
+        interval = monitored.reconciliation_interval
+        logger.debug(
+            "History worker started for {} with a {} second interval",
+            channel.title,
+            interval,
+        )
+        completed_at = self.state.backfill_completed_at(channel.id)
+        if completed_at is not None:
+            remaining = interval - (utcnow() - completed_at).total_seconds()
+            if remaining > 0:
+                logger.info(
+                    "Full history for {} was reconciled at {}; next reconciliation "
+                    "in {:.0f} seconds",
+                    channel.title,
+                    completed_at,
+                    remaining,
+                )
+                await self._wait(remaining)
         while not self.stop.is_set():
             try:
                 logger.info("Reconciling full history for {}", channel.title)
@@ -326,7 +352,7 @@ class SagaService:
                 return
             except Exception:
                 logger.exception("History reconciliation failed for {}", channel.title)
-            await self._wait(21_600)
+            await self._wait(interval)
 
     async def _scan_history(
         self, monitored: MonitoredChannel, record_batch: Any
@@ -421,12 +447,26 @@ class SagaService:
             except CooperativeStop:
                 raise
             except Exception as error:
-                logger.warning(
-                    "Could not resolve an exact publication time for {}: {}: {}",
-                    video.id,
-                    type(error).__name__,
-                    error,
+                detail = f"{type(error).__name__}: {error}"
+                permanent = is_permanent_video_error(str(error))
+                retry_at = self.state.record_publication_failure(
+                    video.id, detail, permanent=permanent
                 )
+                if permanent:
+                    logger.warning(
+                        "Video {} is permanently unavailable; no longer resolving "
+                        "its publication time: {}",
+                        video.id,
+                        detail,
+                    )
+                else:
+                    logger.warning(
+                        "Could not resolve an exact publication time for {}; "
+                        "retrying after {}: {}",
+                        video.id,
+                        retry_at,
+                        detail,
+                    )
                 resolved.append(video)
                 continue
             resolved.append(
@@ -476,8 +516,8 @@ class SagaService:
                 return operation(*args)
             except CooperativeStop:
                 raise
-            except Exception:
-                if attempt >= retries:
+            except Exception as error:
+                if attempt >= retries or is_permanent_video_error(str(error)):
                     raise
                 self.stop_controller.wait(retry_delay)
         raise AssertionError("unreachable")  # pragma: no cover

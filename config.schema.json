@@ -54,6 +54,12 @@
           "minimum": 0,
           "default": 5
         },
+        "reconciliation_interval": {
+          "description": "Seconds between full channel history scans.",
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "default": 21600
+        },
         "channels": {
           "description": "Channels monitored by this instance.",
           "type": "array",

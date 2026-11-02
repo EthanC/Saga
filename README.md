@@ -52,6 +52,10 @@ The container probe reads a small health snapshot without importing the download
 
 Startup reports progress while resolving channels and establishing notification baselines. Five minutes without startup progress fails the probe. Publication timestamps are resolved by a separate worker using a persistent SQLite queue, so metadata lookups do not delay startup or polling. Channel scans are limited to two recent scans and one history scan at a time; upload and download worker limits are separate.
 
+Videos that YouTube reports as unavailable, private, removed, or members-only are recorded in SQLite and no longer looked up for publication times. Other lookup failures, including scheduled livestreams that are still offline, retry with backoff from 5 minutes to 1 hour. A change in a livestream's status triggers the next lookup immediately.
+
+YouTube, Archive, and webpage requests run in reusable child processes, so yt-dlp is not reloaded for every request. A process is replaced after a failed request, a forced stop, or 100 requests. Idle processes exit after 10 minutes.
+
 The probe measures worker liveness. Active recovery, remote-service retry backoff, rejected credentials, storage limits, and jobs requiring operator review are degraded conditions, not restart triggers. Prolonged storage or authentication failures and required-job failures emit ERROR alerts while retries continue. Undispatched due work or an active worker without progress beyond `SAGA_TRANSFER_STALL_TIMEOUT` fails the probe. Optional validation outcomes remain warnings. Failed, expired, or stalled webpage preservation produces an actionable ERROR notification without making the container unhealthy.
 
 Archive service cooldowns log once at WARNING. An outage escalates to ERROR after `SAGA_TRANSFER_STALL_TIMEOUT` without acknowledged uploads or advancing upload bytes. Healthy long transfers suppress service escalations and reminders; stalled workers still fail the health check. Unchanged escalated incidents repeat at most once per hour. Confirmed authentication rejection or item-permission denial alerts immediately, including while another upload is progressing. Failure counts, request IDs, request phases, and retry timestamps do not reset the reminder limit.
@@ -131,6 +135,8 @@ discord_webhook_urls = [
 ```
 
 References accept handles, channel IDs, and YouTube channel URLs. Videos, Shorts, and livestreams can be toggled per channel. See [`config.example.toml`](config.example.toml) for all options.
+
+`cooldown` sets the seconds between recent scans. `reconciliation_interval` sets the seconds between full history scans and defaults to 21600 (six hours). The last completed history scan is saved, so a restart waits out the rest of the interval instead of rescanning every channel. A channel in several instances uses the shortest interval.
 
 ## Archival Reports
 

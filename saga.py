@@ -13,6 +13,7 @@ from core.logging import bind_stop_controller, configure_logging
 from core.service import SagaService
 from core.shutdown import CooperativeStop, StopController
 from core.state import StateStore
+from core.workers import shutdown_workers
 from core.youtube import YouTubeClient
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -85,6 +86,7 @@ async def start() -> None:
     finally:
         logger.debug("Closing persistent state and releasing process lock")
         logger.info("Saved shutdown operations: {}", state.shutdown_summary())
+        shutdown_workers()
         state.close()
         lock.release()
         logger.info("Saga stopped")
