@@ -1,12 +1,12 @@
 FROM denoland/deno:alpine-2.9.8 AS deno
 
-FROM ghcr.io/astral-sh/uv:0.13.4 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.7 AS uv
 
 FROM alpine:3.24 AS python
 
 COPY --from=uv /uv /usr/local/bin/uv
-RUN uv python install --install-dir /opt/python 3.15.0 \
-    && ln -s "$(UV_PYTHON_INSTALL_DIR=/opt/python uv python find --managed-python 3.15.0)" /usr/local/bin/python
+RUN uv python install --install-dir /opt/python 3.15.2 \
+    && ln -s "$(UV_PYTHON_INSTALL_DIR=/opt/python uv python find --managed-python 3.15.2)" /usr/local/bin/python
 
 FROM python AS builder
 

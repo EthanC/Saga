@@ -9,27 +9,27 @@ authors = [{ name = "EthanC", email = "16727756+EthanC@users.noreply.github.com"
 dependencies = [
   "archivist-py==1.4.0",
   "bgutil-ytdlp-pot-provider==2.0.2",
-  "cronsim>=2.7",
+  "cronsim>=2.8",
   "discord-clyde>=1.2.0",
   "environs>=15.2.0",
-  "filelock>=4.2.4",
+  "filelock>=4.2.9",
   "loguru>=0.7.3",
   "loguru-discord>=2.2.0",
   "niquests>=3.21.2",
   "sqlmodel>=0.0.48",
-  "tzdata>=2026.5",
-  "tzlocal>=5.4.4",
-  "yt-dlp[default]>=2026.8.19",
+  "tzdata>=2026.6",
+  "tzlocal>=5.4.5",
+  "yt-dlp[default]>=2026.10.26",
 ]
 
 [dependency-groups]
 dev = [
-  "coverage>=7.16.2",
+  "coverage>=7.17.2",
   "jsonschema>=4.26.0",
-  "pytest>=9.1.1",
+  "pytest>=9.2.0",
   "pytest-cov>=7.1.0",
-  "ruff>=0.17.1",
-  "ty>=0.0.90",
+  "ruff>=0.17.4",
+  "ty>=0.0.98",
 ]
 
 [tool.ruff]
