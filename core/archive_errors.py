@@ -126,6 +126,12 @@ def failure_facts(error: Exception) -> dict[str, Any]:
         if isinstance(cause, ServiceError)
         else None
     )
+    message = getattr(cause, "service_message", None)
+    if isinstance(cause, NetworkError):
+        # Transport failures carry no response, so the exception type is the
+        # only safe clue separating timeouts, resets, and TLS failures.
+        code = code or getattr(cause, "cause_type", None)
+        message = message or str(cause) or None
     headers = getattr(cause, "diagnostic_headers", None)
     raw = getattr(cause, "retry_after_raw", None)
     if raw is not None:
@@ -136,7 +142,7 @@ def failure_facts(error: Exception) -> dict[str, Any]:
         "error_phase": phase,
         **diagnostic_fields(
             code,
-            getattr(cause, "service_message", None),
+            message,
             getattr(cause, "request_id", None),
             json.dumps(headers) if headers is not None else None,
         ),

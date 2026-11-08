@@ -180,7 +180,46 @@ def test_request_network_failures_keep_the_failed_phase(
             "error_kind": "network",
             "error_status": None,
             "error_phase": "csrf",
+            "error_code": "ConnectionError",
+            "error_message": "network request to Internet Archive failed",
         }.items()
+    )
+
+
+def test_transfer_network_failures_name_the_transport_failure_in_alerts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    video_id, media, frozen = seed_upload(store, tmp_path)
+    wire(monkeypatch, "item-create", 200, "", frozen.identifier)
+    original = archival.Session.request
+
+    def request(self: Any, method: str, url: str, **kwargs: Any) -> Response:
+        if url.endswith(".mkv"):
+            raise niquests.exceptions.ReadTimeout("read timed out")
+        return original(self, method, url, **kwargs)
+
+    monkeypatch.setattr(archival.Session, "request", request)
+    processor = ArchiveProcessor(settings(tmp_path), store, YouTubeClient())
+    work = store.claim_archive(lane="upload", prefer_recent=False)
+    assert work is not None
+    processor.process(work)
+    row = saved(store, video_id)
+    assert (row.error_kind, row.error_phase, row.error_code) == (
+        "network",
+        "file-upload",
+        "ReadTimeout",
+    )
+    assert row.error_message == "network request to Internet Archive failed"
+    assert "reason=ReadTimeout" in (row.last_error or "") and media.exists()
+    store.close()
+
+
+def test_network_failures_without_detail_keep_empty_diagnostics() -> None:
+    error = NetworkError("")
+    assert (
+        failure_facts(error).items()
+        >= {"error_kind": "network", "error_code": None, "error_message": None}.items()
     )
 
 
