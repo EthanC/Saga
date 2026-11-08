@@ -41,6 +41,7 @@ from core.archive_retry import (
     INCIDENT_REMINDER_DELAY,
     MAX_PROBE_DELAY,
     MIN_WRITE_INTERVAL,
+    RELEASE_WRITE_INTERVAL,
     THROTTLE_PROBATION,
     ArchiveServiceState,
     retryable_record,
@@ -960,8 +961,15 @@ class StateStore:
             and not gate.probe_token
             and not gate.probe_video_id
         ):
-            gate.probation_until = gate.retry_at = None
-            gate.write_interval_seconds = 0
+            # Restoring full concurrency at once re-triggers throttling, so a
+            # clean probation only halves the spacing until it is negligible.
+            interval = gate.write_interval_seconds / 2
+            if interval < RELEASE_WRITE_INTERVAL:
+                gate.probation_until = gate.retry_at = None
+                gate.write_interval_seconds = 0
+            else:
+                gate.write_interval_seconds = interval
+                gate.probation_until = now + timedelta(seconds=THROTTLE_PROBATION)
             session.add(gate)
         if not self._archive_paced(gate):
             return gate

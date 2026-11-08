@@ -19,6 +19,12 @@ def due(store: StateStore) -> datetime:
     return _as_utc(stamp)
 
 
+def probation(store: StateStore) -> datetime:
+    stamp = gate(store).probation_until
+    assert stamp is not None
+    return _as_utc(stamp)
+
+
 def test_successful_throttle_probe_resumes_one_paced_write_not_four_workers(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
@@ -56,13 +62,49 @@ def test_successful_throttle_probe_resumes_one_paced_write_not_four_workers(
     # A long-running paced write cannot be bypassed when the probation timer ends.
     clock[0] = deadline
     assert upload(store, clock[0]) is None
-    processor(store, tmp_path, gateway).process(admitted[0])
+    operation = processor(store, tmp_path, gateway)
+    operation.process(admitted[0])
+    # Each clean probation halves the spacing instead of releasing every worker.
+    for interval in (30, 15):
+        clock[0] = max(due(store), probation(store))
+        work = upload(store, clock[0])
+        assert work is not None and work.archive_probe_token
+        assert gate(store).write_interval_seconds == interval
+        assert upload(store, clock[0]) is None
+        operation.process(work)
+        assert due(store) == clock[0] + timedelta(seconds=interval)
+    clock[0] = max(due(store), probation(store))
     with ThreadPoolExecutor(max_workers=4) as workers:
         claims = list(workers.map(lambda _: upload(store, clock[0]), range(4)))
     assert all(work is not None and work.archive_probe_token is None for work in claims)
     assert (
         gate(store).probation_until is None and gate(store).write_interval_seconds == 0
     )
+    store.close()
+
+
+def test_throttling_during_gradual_release_doubles_the_current_spacing(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    for index in range(3):
+        seed_upload(store, tmp_path, f"Decay{index:06}")
+    with Session(store.engine) as session:
+        session.add(
+            ArchiveServiceState(
+                probation_until=clock[0], write_interval_seconds=240, retry_at=clock[0]
+            )
+        )
+        session.commit()
+    gateway = FakeGateway()
+    gateway.upload_error = RateLimitError("slow down")
+    work = upload(store, clock[0])
+    assert work is not None and work.archive_probe_token
+    assert gate(store).write_interval_seconds == 120
+    processor(store, tmp_path, gateway).process(work)
+    state = gate(store)
+    assert state.failures == 1 and state.write_interval_seconds == 240
+    assert probation(store) == clock[0] + timedelta(seconds=THROTTLE_PROBATION)
     store.close()
 
 
