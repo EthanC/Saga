@@ -231,11 +231,35 @@ class ArchiveGateway:
             self._session() as session,
             self._client(session) as client,
         ):
+            self._respect_upload_limit(client, metadata.identifier, "item-create")
             file = InternetArchiveUploadFile(
                 cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
                 name=metadata.media_name,
             )
             return client.upload([file], options, wait=False)
+
+    @staticmethod
+    def _respect_upload_limit(
+        client: TransportArchiveClient, identifier: str, phase: str
+    ) -> None:
+        """Defer a write while IA-S3 reports the account's task queue as full."""
+        try:
+            reason = client.upload_limit(identifier)
+        except ServiceError as error:
+            # Credential steps are shared with the write, so their failures are
+            # final for this attempt. The limit read itself is only advisory.
+            if error.request_phase in {"csrf", "login", "upload-key"}:
+                raise
+            logger.debug("Archive upload-limit check failed: {}", _error_text(error))
+            return
+        if reason is not None:
+            raise RateLimitError(
+                "Internet Archive S3 reports the account task queue is over its limit",
+                service="Internet Archive",
+                service_code="SlowDown",
+                service_message=f"Upload deferred before sending: {reason}",
+                request_phase=phase,
+            )
 
     def inspect(
         self,
@@ -277,6 +301,7 @@ class ArchiveGateway:
             self._session() as session,
             self._client(session) as client,
         ):
+            self._respect_upload_limit(client, metadata.identifier, "file-upload")
             return client.add_file_transport(
                 metadata.identifier,
                 InternetArchiveUploadFile(

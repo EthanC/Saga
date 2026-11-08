@@ -317,6 +317,7 @@ def test_gateway_status_and_transport_recovery_delegation(
     monkeypatch.setattr(
         TransportArchiveClient, "get_item", lambda *args: valid_item(frozen)
     )
+    monkeypatch.setattr(TransportArchiveClient, "upload_limit", lambda *args: None)
     monkeypatch.setattr(
         TransportArchiveClient,
         "add_file_transport",
@@ -980,6 +981,9 @@ def test_gateway_http_upload_reads_media_only_for_transfer(
         elif method == "PUT" and url.endswith(frozen.media_name):
             transferred.append(b"".join(kwargs["data"]))
             response.headers["ETag"] = "etag"
+        elif url == "https://s3.us.archive.org":
+            assert kwargs["params"]["check_limit"] == "1"
+            response._content = b'{"over_limit":0}'
         elif method != "PUT":
             pytest.fail("upload waited for background processing")
         return response

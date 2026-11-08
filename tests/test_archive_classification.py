@@ -55,6 +55,9 @@ def wire(
         elif method == "POST":
             content = {"success": True, "identifier": identifier}
             phase = "identifier-check"
+        elif url == "https://s3.us.archive.org":
+            content = {"over_limit": 0}
+            phase = "upload-limit"
         else:
             puts.append(url)
             content = ""

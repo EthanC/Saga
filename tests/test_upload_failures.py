@@ -169,6 +169,8 @@ def test_transient_upload_preflight_errors_retry_without_recovery(
             puts.append(url)
             if url.endswith(frozen.media_name):
                 assert b"".join(kwargs["data"]) == b"test"
+        elif url == "https://s3.us.archive.org":
+            response._content = b'{"over_limit":0}'
         else:
             pytest.fail(f"unexpected preflight recovery request: {method} {url}")
         return response
