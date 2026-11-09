@@ -24,7 +24,7 @@ from core.archive_errors import failure_facts
 from core.state import ArchiveJob, StateStore, utcnow
 from core.transport import TransportArchiveClient
 from core.youtube import YouTubeClient
-from tests.test_archival import FakeGateway, saved, seed_upload, settings
+from tests.test_archival import FakeGateway, route_sends, saved, seed_upload, settings
 
 
 def wire(
@@ -75,6 +75,7 @@ def wire(
         return response
 
     monkeypatch.setattr(archival.Session, "request", request)
+    route_sends(monkeypatch, request)
     return puts
 
 

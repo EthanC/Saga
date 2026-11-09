@@ -9,6 +9,7 @@ from threading import Event
 from types import SimpleNamespace
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl
 
 import pytest
 from archivist import (
@@ -26,6 +27,7 @@ from archivist import (
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
     InternetArchiveUploadFileResult,
+    InternetArchiveUploadLimit,
     InternetArchiveUploadResult,
     InvalidServiceResponseError,
     NetworkError,
@@ -318,7 +320,9 @@ def test_gateway_status_and_transport_recovery_delegation(
         TransportArchiveClient, "get_item", lambda *args: valid_item(frozen)
     )
     monkeypatch.setattr(
-        TransportArchiveClient, "upload_limit", lambda *args: {"over_limit": 0}
+        TransportArchiveClient,
+        "upload_limit",
+        lambda *args: InternetArchiveUploadLimit(over_limit=False),
     )
     monkeypatch.setattr(
         TransportArchiveClient,
@@ -419,6 +423,25 @@ def settings(root: Path, **values: Any) -> Settings:
         unknown_download_bytes=4,
         **values,
     )
+
+
+def route_sends(monkeypatch: pytest.MonkeyPatch, request: Any) -> None:
+    """Pass Archivist's identity-isolated reads to a ``Session.request`` fake."""
+
+    def send(self: Any, prepared: Any, **kwargs: Any) -> Response:
+        url, _, query = str(prepared.url).partition("?")
+        if url.count("/") == 3:
+            url = url.removesuffix("/")  # Preparing adds "/" to a bare host.
+        return request(
+            self,
+            prepared.method,
+            url,
+            params=dict(parse_qsl(query)),
+            headers=dict(prepared.headers),
+            data=prepared.body,
+        )
+
+    monkeypatch.setattr(archival.Session, "send", send)
 
 
 def seed_upload(
@@ -991,6 +1014,7 @@ def test_gateway_http_upload_reads_media_only_for_transfer(
         return response
 
     monkeypatch.setattr(archival.Session, "request", request)
+    route_sends(monkeypatch, request)
     processor = ArchiveProcessor(settings(tmp_path), state, YouTubeClient())
     work = state.claim_archive(lane="upload", prefer_recent=False)
     assert work is not None

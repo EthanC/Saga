@@ -248,7 +248,7 @@ class ArchiveGateway:
     ) -> dict[str, Any] | None:
         """Defer a write while IA-S3 reports the account's task queue as full."""
         try:
-            queue = client.upload_limit(identifier)
+            limit = client.upload_limit(identifier)
         except ServiceError as error:
             # Credential steps are shared with the write, so their failures are
             # final for this attempt. The limit read itself is only advisory.
@@ -259,14 +259,18 @@ class ArchiveGateway:
                 _error_text(error),
             )
             return None
-        if queue["over_limit"] not in (None, 0, "0"):
-            reason = queue.get("limit_reason")
+        queue: dict[str, Any] = dict(limit.counters)
+        if limit.over_limit is not None:
+            queue["over_limit"] = int(limit.over_limit)
+        if limit.limit_reason:
+            queue["limit_reason"] = limit.limit_reason
+        if limit.over_limit:
             error = RateLimitError(
                 "Internet Archive S3 reports the account task queue is over its limit",
                 service="Internet Archive",
                 service_code="SlowDown",
                 service_message="Upload deferred before sending: "
-                + (reason if isinstance(reason, str) and reason else "over_limit"),
+                + (limit.limit_reason or "over_limit"),
                 request_phase=phase,
             )
             error.__dict__["upload_queue"] = queue

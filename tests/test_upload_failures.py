@@ -25,6 +25,7 @@ from core.state import ArchiveJob, StateStore, utcnow
 from core.transport import RecoveryConflictError, TransportArchiveClient
 from tests.test_archival import (
     FakeGateway,
+    route_sends,
     run_job,
     saved,
     seed_upload,
@@ -176,6 +177,7 @@ def test_transient_upload_preflight_errors_retry_without_recovery(
         return response
 
     monkeypatch.setattr(archival.Session, "request", request)
+    route_sends(monkeypatch, request)
     processor = ArchiveProcessor(settings(tmp_path), state, youtube.YouTubeClient())
     work = state.claim_archive(lane="upload", prefer_recent=False)
     assert work is not None

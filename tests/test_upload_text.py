@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 from archivist import (
     InternetArchiveUploadFileResult,
+    InternetArchiveUploadLimit,
     InternetArchiveUploadResult,
     InvalidOptionError,
 )
@@ -51,7 +52,9 @@ def test_upload_cleans_invalid_display_text_without_changing_provenance(
 
     monkeypatch.setattr(TransportArchiveClient, "upload", upload)
     monkeypatch.setattr(
-        TransportArchiveClient, "upload_limit", lambda *args: {"over_limit": 0}
+        TransportArchiveClient,
+        "upload_limit",
+        lambda *args: InternetArchiveUploadLimit(over_limit=False),
     )
     processor = ArchiveProcessor(
         settings(tmp_path), store, YouTubeClient(), ArchiveGateway(settings(tmp_path))

@@ -12,7 +12,7 @@ from core.archival import ArchiveGateway, ArchiveProcessor
 from core.archive_errors import failure_facts, queue_snapshot
 from core.state import StateStore
 from core.youtube import YouTubeClient
-from tests.test_archival import saved, seed_upload, settings
+from tests.test_archival import route_sends, saved, seed_upload, settings
 
 SLOW_DOWN = (
     "<Error><Code>SlowDown</Code><Message>Please reduce your request rate."
@@ -80,6 +80,7 @@ def wire(
         return response
 
     monkeypatch.setattr(archival.Session, "request", request)
+    route_sends(monkeypatch, request)
     return puts
 
 
@@ -114,7 +115,7 @@ def test_full_task_queue_defers_upload_before_creating_the_item(
 
 
 @pytest.mark.parametrize(
-    "status,limit", [(200, {"over_limit": 0}), (200, "not json"), (503, "")]
+    "status,limit", [(200, {"over_limit": 0}), (200, {}), (200, "not json"), (503, "")]
 )
 def test_clear_or_unreadable_limit_check_lets_the_upload_proceed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int, limit: Any
@@ -192,8 +193,15 @@ def test_over_limit_deferral_keeps_reason_and_counters(
     assert work is not None
     processor.process(work)
     queue = json.loads(saved(store, video_id).error_queue or "")
-    assert queue["over_limit"] == 1 and queue["limit_reason"] == "accesskey"
-    assert queue["accesskey_tasks_queued"] == 12
+    assert queue == {
+        **{
+            key: value
+            for key, value in QUEUE.items()
+            if key not in {"limit_reason", "internal_unlisted"}
+        },
+        "over_limit": 1,
+        "limit_reason": "accesskey",
+    }
     store.close()
 
 

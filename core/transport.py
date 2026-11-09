@@ -20,8 +20,6 @@ from archivist import (
 from archivist.core._http import ResponseLike, response_mapping, response_text
 from archivist.services.internet_archive import _common, _diagnostics, _items, _recovery
 
-LIMIT_CHECK_TIMEOUT = 15.0
-
 
 class RecoveryDeferredError(RuntimeError):
     """Remote evidence is insufficient for a guarded file transfer."""
@@ -41,30 +39,6 @@ class TransportArchiveClient(InternetArchiveClient):
     def __enter__(self) -> TransportArchiveClient:
         super().__enter__()
         return self
-
-    @_diagnostics.diagnostic_operation
-    def upload_limit(self, identifier: str) -> dict[str, object]:
-        """Return IA-S3's task-queue verdict and counters for this account and item."""
-        key = self._recovery_key()
-        response = self._request(
-            "GET",
-            _items.S3_URL,
-            request_timeout=LIMIT_CHECK_TIMEOUT,
-            headers={"Accept": "application/json"},
-            params={
-                "check_limit": "1",
-                "accesskey": key.access_key,
-                "bucket": identifier,
-            },
-            allow_redirects=False,
-        )
-        _items.raise_for_item_status(cast(ResponseLike, response))
-        data = response_mapping(cast(ResponseLike, response), service=_common.SERVICE)
-        detail = data.get("detail")
-        return {
-            **(dict(detail) if isinstance(detail, Mapping) else {}),
-            "over_limit": data.get("over_limit"),
-        }
 
     @_diagnostics.diagnostic_operation
     def add_file_transport(
