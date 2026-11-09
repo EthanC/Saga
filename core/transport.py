@@ -49,6 +49,7 @@ class TransportArchiveClient(InternetArchiveClient):
         expected_metadata: Mapping[str, str],
         expected_size: int,
         queue_derive: bool = True,
+        interactive_priority: bool = True,
     ) -> InternetArchiveUploadResult:
         """Attempt one missing original PUT after fresh ownership/provenance checks."""
         if not expected_metadata.get("source") or not expected_metadata.get(
@@ -119,10 +120,11 @@ class TransportArchiveClient(InternetArchiveClient):
                 "Content-Type": "application/octet-stream",
                 "Content-Length": str(prepared.size),
                 "If-None-Match": "*",
+            }
+            if interactive_priority:
                 # Match the original create and upload. IA warns that
                 # mixed priorities can reorder an item's writes.
-                "x-archive-interactive-priority": "1",
-            }
+                headers["x-archive-interactive-priority"] = "1"
             if not queue_derive:
                 # Match an original upload that skipped derive processing.
                 headers["x-archive-queue-derive"] = "0"

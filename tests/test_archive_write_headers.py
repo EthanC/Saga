@@ -105,3 +105,24 @@ def test_disabled_derive_marks_every_upload_and_recovery_put(
     _, writes = transfer(tmp_path, monkeypatch, operation, archive_queue_derive=False)
     assert writes and len(writes) == (2 if operation == "upload" else 1)
     assert all(headers["x-archive-queue-derive"] == "0" for _, headers in writes)
+
+
+@pytest.mark.parametrize("priority", [True, False])
+def test_create_upload_and_recovery_agree_on_interactive_priority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, priority: bool
+) -> None:
+    _, uploads = transfer(
+        tmp_path, monkeypatch, "upload", archive_interactive_priority=priority
+    )
+    _, recoveries = transfer(
+        tmp_path / "recovery",
+        monkeypatch,
+        "recover",
+        archive_interactive_priority=priority,
+    )
+    writes = uploads + recoveries
+    assert len(writes) == 3
+    assert all(
+        headers.get("x-archive-interactive-priority") == ("1" if priority else None)
+        for _, headers in writes
+    )

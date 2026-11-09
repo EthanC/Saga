@@ -44,6 +44,7 @@ SETTING_NAMES = (
     "SAGA_ARCHIVE_POLL_TIMEOUT",
     "SAGA_ARCHIVE_POLL_INTERVAL",
     "SAGA_ARCHIVE_QUEUE_DERIVE",
+    "SAGA_ARCHIVE_INTERACTIVE_PRIORITY",
     "SAGA_MINIMUM_FREE_BYTES",
     "SAGA_MAX_DATA_BYTES",
     "SAGA_DOWNLOAD_BYTES_PER_SECOND",
@@ -198,6 +199,7 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_ARCHIVE_POLL_TIMEOUT": "3",
         "SAGA_ARCHIVE_POLL_INTERVAL": "4",
         "SAGA_ARCHIVE_QUEUE_DERIVE": "false",
+        "SAGA_ARCHIVE_INTERACTIVE_PRIORITY": "false",
         "SAGA_MINIMUM_FREE_BYTES": "0",
         "SAGA_MAX_DATA_BYTES": "250000000000",
         "SAGA_DOWNLOAD_BYTES_PER_SECOND": "6250000",
@@ -228,6 +230,7 @@ def test_load_settings_accepts_all_optional_values(
     assert result.notification_timeout == 2.5
     assert result.archive_workers == 4
     assert result.archive_queue_derive is False
+    assert result.archive_interactive_priority is False
     assert result.minimum_free_bytes == 0
     assert result.max_data_bytes == 250_000_000_000
     assert result.download_bytes_per_second == 6_250_000
@@ -252,6 +255,7 @@ def test_load_settings_discovers_default_cookies(
     assert result.config_path == config_directory / "config.toml"
     assert result.youtube_cookies_path == cookies
     assert result.archive_queue_derive is True
+    assert result.archive_interactive_priority is True
 
 
 def test_example_environment_preserves_container_paths(
@@ -276,6 +280,7 @@ def test_example_environment_preserves_container_paths(
     assert result.healthcheck_file == Path(paths["SAGA_HEALTHCHECK_FILE"])
     assert result.max_data_bytes == 0
     assert result.archive_queue_derive is True
+    assert result.archive_interactive_priority is True
 
 
 def test_backup_schedule_requires_a_future_occurrence(
@@ -321,6 +326,10 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": "fast"}, "SAGA_UPLOAD_BYTES_PER_SECOND"),
         ({"SAGA_ARCHIVE_RETRY_DELAY": "0"}, "positive finite number"),
         ({"SAGA_ARCHIVE_QUEUE_DERIVE": "maybe"}, "SAGA_ARCHIVE_QUEUE_DERIVE"),
+        (
+            {"SAGA_ARCHIVE_INTERACTIVE_PRIORITY": "maybe"},
+            "SAGA_ARCHIVE_INTERACTIVE_PRIORITY",
+        ),
         ({"REPORT_DISCORD_WEBHOOK_URL": "https://example.com/hook"}, "valid Discord"),
         ({"SAGA_REPORT_SCHEDULE": "0 * * *"}, "must have five fields"),
         ({"SAGA_REPORT_SCHEDULE": "0 99 * * *"}, "is invalid"),

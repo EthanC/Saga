@@ -148,6 +148,8 @@ Saga merges yt-dlp's `bestvideo+bestaudio` selection into MKV without re-encodin
 
 The Internet Archive derives each uploaded item by default: it makes playable formats and thumbnails from the original. Set `SAGA_ARCHIVE_QUEUE_DERIVE=false` to skip this. Items then keep only their original files, with no playable derivatives or thumbnails. Skipping derives puts fewer tasks in the Archive's task queue, and `SlowDown` throttling is tied to that queue. Uploads and recovery transfers send the same setting. Change it only while no uploads are pending, so that every write to an item uses one value.
 
+Item creation, uploads, and recovery transfers ask for the Archive's express task queue by default. Set `SAGA_ARCHIVE_INTERACTIVE_PRIORITY=false` to use the normal queue instead. Every write sends or omits the request together, because the Archive warns that mixed priorities on one item can reorder its writes. For the same reason, change this setting only while no uploads are pending.
+
 Saga retries failed transfers, resumes interrupted downloads, and pauses new downloads when disk space is low. Livestreams wait until a replay is available. See `data/transfers.json` for transfer progress, queue status, and staging space.
 
 Retries prefer the video/audio formats recorded for validated cached inputs. If those formats disappear or their descriptors change, the claimed download resets only its owned, validated inputs and downloads the new selection. Completed originals and ambiguous inputs remain protected. Startup reschedules format-change failures left by older releases.
