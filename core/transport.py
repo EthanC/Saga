@@ -48,6 +48,7 @@ class TransportArchiveClient(InternetArchiveClient):
         *,
         expected_metadata: Mapping[str, str],
         expected_size: int,
+        queue_derive: bool = True,
     ) -> InternetArchiveUploadResult:
         """Attempt one missing original PUT after fresh ownership/provenance checks."""
         if not expected_metadata.get("source") or not expected_metadata.get(
@@ -114,6 +115,17 @@ class TransportArchiveClient(InternetArchiveClient):
                     "missing-file evidence is not authoritative"
                 )
             outcome = InternetArchiveUploadFileResult(prepared.name, prepared.size)
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(prepared.size),
+                "If-None-Match": "*",
+                # Match the original create and upload. IA warns that
+                # mixed priorities can reorder an item's writes.
+                "x-archive-interactive-priority": "1",
+            }
+            if not queue_derive:
+                # Match an original upload that skipped derive processing.
+                headers["x-archive-queue-derive"] = "0"
             try:
                 response = self._recovery_request(
                     "PUT",
@@ -121,14 +133,7 @@ class TransportArchiveClient(InternetArchiveClient):
                     key,
                     request_timeout=self._timeout,
                     mutation=True,
-                    headers={
-                        "Content-Type": "application/octet-stream",
-                        "Content-Length": str(prepared.size),
-                        "If-None-Match": "*",
-                        # Match the original create and upload. IA warns that
-                        # mixed priorities can reorder an item's writes.
-                        "x-archive-interactive-priority": "1",
-                    },
+                    headers=headers,
                     data=prepared,
                 )
                 _items.raise_for_item_status(cast(ResponseLike, response))

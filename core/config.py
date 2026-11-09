@@ -121,6 +121,7 @@ class Settings:
     archive_request_timeout: float = 60.0
     archive_poll_timeout: float = 900.0
     archive_poll_interval: float = 5.0
+    archive_queue_derive: bool = True
     minimum_free_bytes: int = 5_000_000_000
     max_data_bytes: int = 0
     download_bytes_per_second: int = 0
@@ -356,6 +357,7 @@ def load_settings(project_root: Path) -> Settings:
         archive_request_timeout=archive_request_timeout,
         archive_poll_timeout=archive_poll_timeout,
         archive_poll_interval=archive_poll_interval,
+        archive_queue_derive=env.bool("SAGA_ARCHIVE_QUEUE_DERIVE", True),
         minimum_free_bytes=minimum_free_bytes,
         max_data_bytes=_nonnegative_env_int(env, "SAGA_MAX_DATA_BYTES", 0),
         download_bytes_per_second=download_bytes_per_second,

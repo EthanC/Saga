@@ -225,6 +225,7 @@ class ArchiveGateway:
                 "source": metadata.source_url,
                 "saga_operation_id": metadata.operation_id,
             },
+            queue_derive=self.settings.archive_queue_derive,
         )
         with (
             media_path.open("rb") as stream,
@@ -347,6 +348,7 @@ class ArchiveGateway:
                         "saga_operation_id": metadata.operation_id,
                     },
                     expected_size=media_path.stat().st_size,
+                    queue_derive=self.settings.archive_queue_derive,
                 ),
                 queue,
             )
