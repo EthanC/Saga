@@ -15,7 +15,25 @@ from archivist import (
 
 from core.logging import redact_diagnostics
 
-DIAGNOSTIC_FIELDS = ("error_code", "error_message", "error_request_id", "error_headers")
+DIAGNOSTIC_FIELDS = (
+    "error_code",
+    "error_message",
+    "error_request_id",
+    "error_headers",
+    "error_queue",
+)
+# IA-S3 documents `detail` as internal and changeable, so only known counters stay.
+QUEUE_COUNTERS = (
+    "accesskey_ration",
+    "accesskey_tasks_queued",
+    "bucket_limit",
+    "bucket_ration",
+    "bucket_tasks_queued",
+    "rationing_engaged",
+    "rationing_level",
+    "total_global_limit",
+    "total_tasks_queued",
+)
 THROTTLING_CODES = {"SlowDown", "Throttling", "ThrottlingException", "TooManyRequests"}
 AUTHENTICATION_CODES = {
     "InvalidAccessKeyId",
@@ -43,6 +61,7 @@ def diagnostic_fields(
     error_message: str | None = None,
     error_request_id: str | None = None,
     error_headers: str | None = None,
+    error_queue: str | None = None,
 ) -> dict[str, Any]:
     headers = json.loads(error_headers) if error_headers else None
     bounded = {
@@ -57,7 +76,22 @@ def diagnostic_fields(
         "error_headers": json.dumps(bounded, sort_keys=True)
         if headers is not None
         else None,
+        "error_queue": queue_snapshot(json.loads(error_queue)) if error_queue else None,
     }
+
+
+def queue_snapshot(data: Any) -> str | None:
+    """Keep IA-S3 task-queue counters and its limit reason, bounded for storage."""
+    if not isinstance(data, dict):
+        return None
+    snapshot: dict[str, Any] = {
+        name: data[name]
+        for name in ("over_limit", *QUEUE_COUNTERS)
+        if isinstance(data.get(name), int)
+    }
+    if isinstance(data.get("limit_reason"), str) and data["limit_reason"]:
+        snapshot["limit_reason"] = safe_text(data["limit_reason"])
+    return json.dumps(snapshot, sort_keys=True) if snapshot else None
 
 
 def apply_diagnostics(record: Any, **fields: Any) -> None:
@@ -84,11 +118,8 @@ def diagnostic_snapshot(record: Any) -> dict[str, Any]:
     fields = diagnostic_fields(
         **{name: getattr(record, name) for name in DIAGNOSTIC_FIELDS}
     )
-    fields["error_headers"] = (
-        json.loads(fields["error_headers"])
-        if fields["error_headers"] is not None
-        else None
-    )
+    for name in ("error_headers", "error_queue"):
+        fields[name] = json.loads(fields[name]) if fields[name] is not None else None
     fields["incident_category"] = incident_category(
         record.error_kind, fields["error_code"]
     )
@@ -145,6 +176,9 @@ def failure_facts(error: Exception) -> dict[str, Any]:
             message,
             getattr(cause, "request_id", None),
             json.dumps(headers) if headers is not None else None,
+            json.dumps(queue)
+            if (queue := getattr(cause, "upload_queue", None))
+            else None,
         ),
     }
 

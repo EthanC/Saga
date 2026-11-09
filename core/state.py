@@ -203,6 +203,7 @@ class ArchiveProgress(SQLModel, table=True):
     error_message: str | None = None
     error_request_id: str | None = None
     error_headers: str | None = None
+    error_queue: str | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -225,6 +226,7 @@ class ArchiveJob(SQLModel, table=True):
     error_message: str | None = None
     error_request_id: str | None = None
     error_headers: str | None = None
+    error_queue: str | None = None
 
 
 class WorkerTiming(SQLModel, table=True):
@@ -1035,6 +1037,7 @@ class StateStore:
         error_message: str | None = None,
         error_request_id: str | None = None,
         error_headers: str | None = None,
+        error_queue: str | None = None,
     ) -> float:
         now = utcnow()
         with self._write_lock, Session(self.engine) as session:
@@ -1105,6 +1108,7 @@ class StateStore:
                 error_message=error_message,
                 error_request_id=error_request_id,
                 error_headers=error_headers,
+                error_queue=error_queue,
             )
             self._clear_archive_probe(gate)
             session.add(gate)
@@ -2034,6 +2038,7 @@ class StateStore:
         error_message: str | None = None,
         error_request_id: str | None = None,
         error_headers: str | None = None,
+        error_queue: str | None = None,
         **facts: Any,
     ) -> None:
         """Commit background facts only for the current independent claim."""
@@ -2070,6 +2075,7 @@ class StateStore:
                 error_message=error_message,
                 error_request_id=error_request_id,
                 error_headers=error_headers,
+                error_queue=error_queue,
             )
             job.error_kind, job.error_status, job.error_phase = (
                 error_kind,
@@ -2146,6 +2152,7 @@ class StateStore:
         error_message: str | None = None,
         error_request_id: str | None = None,
         error_headers: str | None = None,
+        error_queue: str | None = None,
     ) -> None:
         """Release failed or uncertain transfers and give checks their own queue."""
         with self._write_lock, Session(self.engine) as session:
@@ -2169,6 +2176,7 @@ class StateStore:
                 error_message=error_message,
                 error_request_id=error_request_id,
                 error_headers=error_headers,
+                error_queue=error_queue,
             )
             progress.error_kind, progress.error_status, progress.error_phase = (
                 error_kind,

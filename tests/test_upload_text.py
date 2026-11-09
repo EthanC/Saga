@@ -50,7 +50,9 @@ def test_upload_cleans_invalid_display_text_without_changing_provenance(
         )
 
     monkeypatch.setattr(TransportArchiveClient, "upload", upload)
-    monkeypatch.setattr(TransportArchiveClient, "upload_limit", lambda *args: None)
+    monkeypatch.setattr(
+        TransportArchiveClient, "upload_limit", lambda *args: {"over_limit": 0}
+    )
     processor = ArchiveProcessor(
         settings(tmp_path), store, YouTubeClient(), ArchiveGateway(settings(tmp_path))
     )

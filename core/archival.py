@@ -231,35 +231,60 @@ class ArchiveGateway:
             self._session() as session,
             self._client(session) as client,
         ):
-            self._respect_upload_limit(client, metadata.identifier, "item-create")
+            queue = self._respect_upload_limit(
+                client, metadata.identifier, "item-create"
+            )
             file = InternetArchiveUploadFile(
                 cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
                 name=metadata.media_name,
             )
-            return client.upload([file], options, wait=False)
+            return self._with_queue(
+                lambda: client.upload([file], options, wait=False), queue
+            )
 
     @staticmethod
     def _respect_upload_limit(
         client: TransportArchiveClient, identifier: str, phase: str
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Defer a write while IA-S3 reports the account's task queue as full."""
         try:
-            reason = client.upload_limit(identifier)
+            queue = client.upload_limit(identifier)
         except ServiceError as error:
             # Credential steps are shared with the write, so their failures are
             # final for this attempt. The limit read itself is only advisory.
             if error.request_phase in {"csrf", "login", "upload-key"}:
                 raise
-            logger.debug("Archive upload-limit check failed: {}", _error_text(error))
-            return
-        if reason is not None:
-            raise RateLimitError(
+            logger.warning(
+                "Archive upload-limit check failed; sending without it: {}",
+                _error_text(error),
+            )
+            return None
+        if queue["over_limit"] not in (None, 0, "0"):
+            reason = queue.get("limit_reason")
+            error = RateLimitError(
                 "Internet Archive S3 reports the account task queue is over its limit",
                 service="Internet Archive",
                 service_code="SlowDown",
-                service_message=f"Upload deferred before sending: {reason}",
+                service_message="Upload deferred before sending: "
+                + (reason if isinstance(reason, str) and reason else "over_limit"),
                 request_phase=phase,
             )
+            error.__dict__["upload_queue"] = queue
+            raise error
+        return queue
+
+    @staticmethod
+    def _with_queue(
+        operation: Callable[[], InternetArchiveUploadResult],
+        queue: dict[str, Any] | None,
+    ) -> InternetArchiveUploadResult:
+        """Attach the pre-write queue snapshot to a failed write for diagnosis."""
+        try:
+            return operation()
+        except (InternetArchiveUploadError, ServiceError) as error:
+            if queue is not None:
+                failure_cause(error).__dict__["upload_queue"] = queue
+            raise
 
     def inspect(
         self,
@@ -301,18 +326,25 @@ class ArchiveGateway:
             self._session() as session,
             self._client(session) as client,
         ):
-            self._respect_upload_limit(client, metadata.identifier, "file-upload")
-            return client.add_file_transport(
-                metadata.identifier,
-                InternetArchiveUploadFile(
-                    cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
-                    name=metadata.media_name,
+            queue = self._respect_upload_limit(
+                client, metadata.identifier, "file-upload"
+            )
+            return self._with_queue(
+                lambda: client.add_file_transport(
+                    metadata.identifier,
+                    InternetArchiveUploadFile(
+                        cast(
+                            Any, _ProgressStream(stream, progress, self.stop_controller)
+                        ),
+                        name=metadata.media_name,
+                    ),
+                    expected_metadata={
+                        "source": metadata.source_url,
+                        "saga_operation_id": metadata.operation_id,
+                    },
+                    expected_size=media_path.stat().st_size,
                 ),
-                expected_metadata={
-                    "source": metadata.source_url,
-                    "saga_operation_id": metadata.operation_id,
-                },
-                expected_size=media_path.stat().st_size,
+                queue,
             )
 
     def submit_page(self, url: str) -> str:

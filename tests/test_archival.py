@@ -317,7 +317,9 @@ def test_gateway_status_and_transport_recovery_delegation(
     monkeypatch.setattr(
         TransportArchiveClient, "get_item", lambda *args: valid_item(frozen)
     )
-    monkeypatch.setattr(TransportArchiveClient, "upload_limit", lambda *args: None)
+    monkeypatch.setattr(
+        TransportArchiveClient, "upload_limit", lambda *args: {"over_limit": 0}
+    )
     monkeypatch.setattr(
         TransportArchiveClient,
         "add_file_transport",

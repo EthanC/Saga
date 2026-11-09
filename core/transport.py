@@ -43,8 +43,8 @@ class TransportArchiveClient(InternetArchiveClient):
         return self
 
     @_diagnostics.diagnostic_operation
-    def upload_limit(self, identifier: str) -> str | None:
-        """Return IA-S3's rationing reason when this account's task queue is full."""
+    def upload_limit(self, identifier: str) -> dict[str, object]:
+        """Return IA-S3's task-queue verdict and counters for this account and item."""
         key = self._recovery_key()
         response = self._request(
             "GET",
@@ -60,11 +60,11 @@ class TransportArchiveClient(InternetArchiveClient):
         )
         _items.raise_for_item_status(cast(ResponseLike, response))
         data = response_mapping(cast(ResponseLike, response), service=_common.SERVICE)
-        if data.get("over_limit") in (None, 0, "0"):
-            return None
         detail = data.get("detail")
-        reason = detail.get("limit_reason") if isinstance(detail, Mapping) else None
-        return reason if isinstance(reason, str) and reason else "over_limit"
+        return {
+            **(dict(detail) if isinstance(detail, Mapping) else {}),
+            "over_limit": data.get("over_limit"),
+        }
 
     @_diagnostics.diagnostic_operation
     def add_file_transport(

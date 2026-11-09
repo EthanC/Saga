@@ -36,6 +36,7 @@ class ArchiveServiceState(SQLModel, table=True):
     error_message: str | None = None
     error_request_id: str | None = None
     error_headers: str | None = None
+    error_queue: str | None = None
     last_error: str | None = None
     incident_id: str | None = None
     incident_notified_category: str | None = None
