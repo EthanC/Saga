@@ -29,6 +29,19 @@ def outage(store: StateStore, root: Path, now: datetime) -> tuple[Any, FakeGatew
     return operation, gateway
 
 
+def failed_retry(
+    store: StateStore, operation: Any, clock: list[datetime], phase: str = "item-create"
+) -> None:
+    clock[0] = retry_at(store)
+    work = upload(store, clock[0])
+    assert work is not None and work.archive_probe_token
+    operation.gateway.upload_error = ServiceError(
+        "busy", status_code=503, request_phase=phase
+    )
+    operation.process(work)
+    assert gate(store).failures == 2
+
+
 def mutate(store: StateStore, **fields: Any) -> None:
     with Session(store.engine) as session:
         circuit = session.get(ArchiveServiceState, 1)
@@ -57,8 +70,16 @@ def test_incident_escalation_reminders_detail_changes_and_restart(
     assert [event["severity"] for event in first] == ["warning"]
     identity = first[0]["details"]["incident_id"]
     clock[0] += timedelta(seconds=31)
+    # One failure followed by Saga's own backoff is not yet an escalation.
+    assert store.archive_service_notifications(stall_timeout=30) == []
+    assert (
+        store.transfer_health(stall_timeout=30)["archive_service"]["severity"]
+        == "warning"
+    )
+    failed_retry(store, operation, clock)
     escalation = store.archive_service_notifications(stall_timeout=30)
     assert [event["severity"] for event in escalation] == ["error"]
+    escalated_at = clock[0]
     assert store.archive_service_notifications(stall_timeout=30) == []
     for index in range(3):
         clock[0] += timedelta(minutes=15)
@@ -84,7 +105,7 @@ def test_incident_escalation_reminders_detail_changes_and_restart(
     store = StateStore(path)
     store.reset_interrupted_claims()
     assert store.archive_service_notifications(stall_timeout=30) == []
-    clock[0] = start + timedelta(seconds=3630)
+    clock[0] = escalated_at + timedelta(seconds=3599)
     assert store.archive_service_notifications(stall_timeout=30) == []
     clock[0] += timedelta(seconds=1)
     reminders = store.archive_service_notifications(stall_timeout=30)
@@ -136,7 +157,8 @@ def test_recovery_is_once_persisted_and_next_outage_has_a_new_identity(
     store = StateStore(path)
     seed_upload(store, tmp_path)
     operation, gateway = outage(store, tmp_path, clock[0])
-    clock[0] += timedelta(seconds=31)
+    # An incident first seen after a failed retry announces itself, then escalates.
+    failed_retry(store, operation, clock)
     events = store.archive_service_notifications(stall_timeout=30)
     assert [event["severity"] for event in events] == ["warning", "error"]
     identity = gate(store).incident_id
@@ -228,6 +250,7 @@ def test_service_uses_durable_policy_and_marks_recovery_for_discord(
         }
     ]
     saga._emit_health_alerts(alerts)
+    failed_retry(store, operation, clock)
     clock[0] += timedelta(seconds=saga.settings.transfer_stall_timeout + 1)
     saga._emit_health_alerts(alerts)
     saga._emit_health_alerts(alerts)

@@ -41,7 +41,20 @@ def incident_facts(
     idle = max(0.0, (now - (progress or start)).total_seconds())
     category = incident_category(gate.error_kind, gate.error_code)
     actionable = gate.failures > 0 and category in {"authentication", "item-specific"}
-    error = gate.failures > 0 and (idle > stall_timeout or actionable)
+    # Saga's own backoff can outlast the stall timeout after one failure. Time
+    # alone escalates once a retry has failed or has itself stopped progressing.
+    probe_idle = (
+        max(
+            0.0,
+            (
+                now - max(aware(gate.probe_claimed_at), progress or start)
+            ).total_seconds(),
+        )
+        if gate.probe_claimed_at
+        else 0.0
+    )
+    retried = gate.failures > 1 or probe_idle > stall_timeout
+    error = gate.failures > 0 and (idle > stall_timeout and retried or actionable)
     return {
         "incident_age_seconds": max(0.0, (now - start).total_seconds()),
         "incident_category": category,
