@@ -1072,6 +1072,7 @@ def test_transport_recovery_is_scoped_and_never_hashes(
         else:
             assert b"".join(kwargs["data"]) == b"test"
             assert kwargs["headers"]["If-None-Match"] == "*"
+            assert kwargs["headers"]["x-archive-interactive-priority"] == "1"
             response._content = b""
             response.headers["ETag"] = "etag"
         return response

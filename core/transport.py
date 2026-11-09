@@ -151,6 +151,9 @@ class TransportArchiveClient(InternetArchiveClient):
                         "Content-Type": "application/octet-stream",
                         "Content-Length": str(prepared.size),
                         "If-None-Match": "*",
+                        # Match the original create and upload. IA warns that
+                        # mixed priorities can reorder an item's writes.
+                        "x-archive-interactive-priority": "1",
                     },
                     data=prepared,
                 )
