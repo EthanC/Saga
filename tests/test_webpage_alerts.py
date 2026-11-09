@@ -51,7 +51,8 @@ def test_webpage_errors_reach_discord_once_per_outcome_set_across_restarts(
 
     monkeypatch.setattr(logging_module, "DiscordSink", Sink)
     monkeypatch.setattr(logging_module, "_STOP_CONTROLLER", None)
-    monkeypatch.setattr(logging_module, "stdout", StringIO())
+    console = StringIO()
+    monkeypatch.setattr(logging_module, "stdout", console)
     logging_module.configure_logging(LoggingSettings("INFO", "fixture", "ERROR"))
     path = tmp_path / "saga.sqlite"
     store = StateStore(path)
@@ -107,12 +108,9 @@ def test_webpage_errors_reach_discord_once_per_outcome_set_across_restarts(
         session.commit()
     emit()
     emit()
-    assert [message.levelno for message in messages] == [
-        logging.ERROR,
-        logging.ERROR,
-        logging.INFO,
-    ]
-    assert "condition cleared" in messages[-1].getMessage()
+    # The INFO recovery follows LOG_DISCORD_LEVEL=ERROR and stays off Discord.
+    assert [message.levelno for message in messages] == [logging.ERROR, logging.ERROR]
+    assert "condition cleared" in console.getvalue()
     assert not store.transfer_health(stall_timeout=30)["webpage_notification"]["active"]
     store.close()
     logger.remove()

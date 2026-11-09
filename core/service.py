@@ -747,18 +747,14 @@ class SagaService:
             )
             for event in self.state.webpage_outcome_notifications(outcome):
                 if event.get("recovery"):
-                    logger.bind(preservation_outcome_recovery=True).info(
-                        "{}: {}", event["message"], event["details"]
-                    )
+                    logger.info("{}: {}", event["message"], event["details"])
                 else:
                     logger.error("{}: {}", event["message"], event["details"])
         for event in self.state.archive_service_notifications(
             stall_timeout=self.settings.transfer_stall_timeout
         ):
             if event.get("recovery"):
-                logger.bind(archive_incident_recovery=True).info(
-                    "{}: {}", event["message"], event["details"]
-                )
+                logger.info("{}: {}", event["message"], event["details"])
             else:
                 log = logger.error if event["severity"] == "error" else logger.warning
                 log("{}: {}", event["message"], event["details"])

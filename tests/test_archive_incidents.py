@@ -219,7 +219,7 @@ def test_brief_recovery_does_not_close_incident_or_reset_notification_budget(
     store.close()
 
 
-def test_service_uses_durable_policy_and_marks_recovery_for_discord(
+def test_service_uses_durable_policy_and_logs_recovery_at_info(
     tmp_path: Path, clock: list[datetime], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
@@ -228,17 +228,13 @@ def test_service_uses_durable_policy_and_marks_recovery_for_discord(
     saga = SagaService(settings(tmp_path), (), store, YouTubeClient())
     events: list[str] = []
 
-    def bind(**fields: Any) -> Any:
-        assert fields == {"archive_incident_recovery": True}
-        return SimpleNamespace(info=lambda *args: events.append("info"))
-
     monkeypatch.setattr(
         service,
         "logger",
         SimpleNamespace(
             warning=lambda *args: events.append("warning"),
             error=lambda *args: events.append("error"),
-            bind=bind,
+            info=lambda *args: events.append("info"),
         ),
     )
     alerts = [

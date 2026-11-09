@@ -49,7 +49,7 @@ class FakeLogger:
         self.messages.append((message, values))
 
 
-def test_archive_recovery_reaches_error_discord_sink_as_info(
+def test_discord_level_is_absolute_for_recovery_info(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     console = StringIO()
@@ -74,9 +74,8 @@ def test_archive_recovery_reaches_error_discord_sink_as_info(
         "downloader"
     )
     logger.complete()
-    assert [record.levelno for record in discord] == [logging.ERROR, logging.INFO]
-    assert "Archive recovered" in discord[1].getMessage()
-    assert "credential-secret" not in discord[1].getMessage()
+    assert [record.levelno for record in discord] == [logging.ERROR]
+    assert "Archive recovered" in console.getvalue()
     assert "credential-secret" not in console.getvalue()
     assert "unrelated info" in console.getvalue()
     logger.remove()
