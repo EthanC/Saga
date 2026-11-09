@@ -32,6 +32,9 @@ LOG_LEVELS = frozenset(
     {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
 )
 _CRON_FIELD_COUNT = 5
+# Multipart limits enforced by the pinned Archivist 1.5.0 client.
+MULTIPART_MAX_PART_SIZE = 5 * 1024**3
+MULTIPART_MAX_PARTS = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +126,8 @@ class Settings:
     archive_poll_interval: float = 5.0
     archive_queue_derive: bool = True
     archive_interactive_priority: bool = True
+    archive_multipart_threshold: int = 0
+    archive_multipart_part_size: int = 512 * 1024**2
     minimum_free_bytes: int = 5_000_000_000
     max_data_bytes: int = 0
     download_bytes_per_second: int = 0
@@ -293,6 +298,17 @@ def load_settings(project_root: Path) -> Settings:
     )
     archive_poll_timeout = _positive_env_float(env, "SAGA_ARCHIVE_POLL_TIMEOUT", 900.0)
     archive_poll_interval = _positive_env_float(env, "SAGA_ARCHIVE_POLL_INTERVAL", 5.0)
+    archive_multipart_threshold = _nonnegative_env_int(
+        env, "SAGA_ARCHIVE_MULTIPART_THRESHOLD", 0
+    )
+    archive_multipart_part_size = _nonnegative_env_int(
+        env, "SAGA_ARCHIVE_MULTIPART_PART_SIZE", 512 * 1024**2
+    )
+    if not 1 <= archive_multipart_part_size <= MULTIPART_MAX_PART_SIZE:
+        raise ValueError(
+            "SAGA_ARCHIVE_MULTIPART_PART_SIZE must be between 1 and "
+            f"{MULTIPART_MAX_PART_SIZE} bytes"
+        )
     minimum_free_bytes = env.int("SAGA_MINIMUM_FREE_BYTES", 5_000_000_000)
     if minimum_free_bytes < 0:
         raise ValueError("SAGA_MINIMUM_FREE_BYTES must be non-negative")
@@ -362,6 +378,8 @@ def load_settings(project_root: Path) -> Settings:
         archive_interactive_priority=env.bool(
             "SAGA_ARCHIVE_INTERACTIVE_PRIORITY", True
         ),
+        archive_multipart_threshold=archive_multipart_threshold,
+        archive_multipart_part_size=archive_multipart_part_size,
         minimum_free_bytes=minimum_free_bytes,
         max_data_bytes=_nonnegative_env_int(env, "SAGA_MAX_DATA_BYTES", 0),
         download_bytes_per_second=download_bytes_per_second,

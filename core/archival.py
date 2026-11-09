@@ -23,10 +23,14 @@ from archivist import (
     InternetArchiveFailedStatus,
     InternetArchiveItem,
     InternetArchiveItemAvailability,
+    InternetArchiveMultipartError,
+    InternetArchiveMultipartResult,
+    InternetArchiveMultipartState,
     InternetArchivePendingStatus,
     InternetArchiveSuccessStatus,
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
+    InternetArchiveUploadFileResult,
     InternetArchiveUploadOptions,
     InternetArchiveUploadResult,
     InvalidOptionError,
@@ -40,7 +44,7 @@ from niquests import Session
 from core.archive_errors import failure_cause, failure_facts
 from core.archive_retry import retry_hint, retryable_error
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
-from core.config import Settings
+from core.config import MULTIPART_MAX_PART_SIZE, MULTIPART_MAX_PARTS, Settings
 from core.logging import redact_diagnostics
 from core.progress import DownloadCheckpoint
 from core.shutdown import CooperativeStop, StopController
@@ -58,6 +62,7 @@ from core.youtube import (
 from core.youtube_errors import VideoAccessError
 
 MAX_IDENTIFIER_LENGTH = 100
+CREDENTIAL_PHASES = frozenset({"csrf", "login", "upload-key"})
 
 
 class _NoSubmissionRedirects(HTTPRedirectHandler):
@@ -146,6 +151,37 @@ class _ProgressStream:
         return chunk
 
 
+class _MultipartProgressStream(_ProgressStream):
+    """Report hashing reads as liveness and only part reads as transfer progress.
+
+    Archivist 1.5.0 hashes the whole source with sequential reads before it
+    sends any request, so the first ``size`` bytes read are never transferred.
+    """
+
+    def __init__(
+        self,
+        stream: Any,
+        size: int,
+        callback: Callable[[int], None],
+        heartbeat: Callable[[], None],
+        controller: StopController,
+    ) -> None:
+        super().__init__(stream, callback, controller)
+        self.unhashed = size
+        self.heartbeat = heartbeat
+
+    def read(self, amount: int = -1) -> bytes:
+        if not self.unhashed:
+            return super().read(amount)
+        cast(StopController, self.controller).check()
+        chunk = self.stream.read(amount)
+        self.unhashed = max(0, self.unhashed - len(chunk))
+        if time.monotonic() - self.last_update >= 5:
+            self.heartbeat()
+            self.last_update = time.monotonic()
+        return chunk
+
+
 class _StopSession(Session):
     def __init__(self, controller: StopController) -> None:
         super().__init__(retries=0)
@@ -204,7 +240,25 @@ class ArchiveGateway:
     ) -> InternetArchiveUploadResult:
         if self.managed:
             return self._managed("upload", (metadata, media_path), {}, progress)
-        options = InternetArchiveUploadOptions(
+        options = self._options(metadata)
+        with (
+            media_path.open("rb") as stream,
+            self._session() as session,
+            self._client(session) as client,
+        ):
+            queue = self._respect_upload_limit(
+                client, metadata.identifier, "item-create"
+            )
+            file = InternetArchiveUploadFile(
+                cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
+                name=metadata.media_name,
+            )
+            return self._with_queue(
+                lambda: client.upload([file], options, wait=False), queue
+            )
+
+    def _options(self, metadata: FrozenArchiveMetadata) -> InternetArchiveUploadOptions:
+        return InternetArchiveUploadOptions(
             identifier=metadata.identifier,
             title=_upload_text(metadata.title) or metadata.identifier,
             description=_upload_text(metadata.description, multiline=True)
@@ -228,21 +282,100 @@ class ArchiveGateway:
             queue_derive=self.settings.archive_queue_derive,
             interactive_priority=self.settings.archive_interactive_priority,
         )
+
+    def upload_multipart(  # noqa: PLR0913 - Resume state and its callbacks.
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        create: bool,
+        state: str | None,
+        progress: Callable[[int], None],
+        heartbeat: Callable[[], None],
+        on_state: Callable[[str], None],
+    ) -> InternetArchiveUploadResult:
+        """Send one original in resumable parts, saving each state before going on."""
+        if self.managed:
+            return self._managed(
+                "upload_multipart",
+                (metadata, media_path),
+                {"create": create, "state": state},
+                progress,
+                heartbeat=heartbeat,
+                on_state=on_state,
+            )
+        resume = (
+            InternetArchiveMultipartState.from_dict(json.loads(state))
+            if state
+            else None
+        )
+        size = media_path.stat().st_size
+        # Larger originals use bigger parts to stay within Archivist's part limit.
+        part_size = min(
+            max(
+                self.settings.archive_multipart_part_size,
+                -(-size // MULTIPART_MAX_PARTS),
+            ),
+            MULTIPART_MAX_PART_SIZE,
+        )
+
+        def save(value: InternetArchiveMultipartState) -> None:
+            on_state(json.dumps(value.to_dict(), sort_keys=True))
+
         with (
             media_path.open("rb") as stream,
             self._session() as session,
             self._client(session) as client,
         ):
             queue = self._respect_upload_limit(
-                client, metadata.identifier, "item-create"
+                client,
+                metadata.identifier,
+                "item-create" if create and resume is None else "file-upload",
             )
             file = InternetArchiveUploadFile(
-                cast(Any, _ProgressStream(stream, progress, self.stop_controller)),
+                cast(
+                    Any,
+                    _MultipartProgressStream(
+                        stream, size, progress, heartbeat, self.stop_controller
+                    ),
+                ),
                 name=metadata.media_name,
             )
-            return self._with_queue(
-                lambda: client.upload([file], options, wait=False), queue
-            )
+
+            def send() -> InternetArchiveMultipartResult:
+                if create:
+                    return client.upload_multipart(
+                        file,
+                        self._options(metadata),
+                        part_size=part_size,
+                        state=resume,
+                        on_state=save,
+                    )
+                return client.add_file_multipart(
+                    metadata.identifier,
+                    file,
+                    expected_metadata={
+                        "source": metadata.source_url,
+                        "saga_operation_id": metadata.operation_id,
+                    },
+                    part_size=part_size,
+                    queue_derive=self.settings.archive_queue_derive,
+                    interactive_priority=self.settings.archive_interactive_priority,
+                    state=resume,
+                    on_state=save,
+                )
+
+            result = self._with_queue(send, queue)
+        # The completion reply has no per-file ETag; the saved resume state
+        # already holds the whole-file MD5 and SHA-1.
+        return InternetArchiveUploadResult(
+            result.identifier,
+            (
+                InternetArchiveUploadFileResult(
+                    result.name, result.size, transferred=True
+                ),
+            ),
+        )
 
     @staticmethod
     def _respect_upload_limit(
@@ -254,7 +387,7 @@ class ArchiveGateway:
         except ServiceError as error:
             # Credential steps are shared with the write, so their failures are
             # final for this attempt. The limit read itself is only advisory.
-            if error.request_phase in {"csrf", "login", "upload-key"}:
+            if error.request_phase in CREDENTIAL_PHASES:
                 raise
             logger.warning(
                 "Archive upload-limit check failed; sending without it: {}",
@@ -280,10 +413,7 @@ class ArchiveGateway:
         return queue
 
     @staticmethod
-    def _with_queue(
-        operation: Callable[[], InternetArchiveUploadResult],
-        queue: dict[str, Any] | None,
-    ) -> InternetArchiveUploadResult:
+    def _with_queue[T](operation: Callable[[], T], queue: dict[str, Any] | None) -> T:
         """Attach the pre-write queue snapshot to a failed write for diagnosis."""
         try:
             return operation()
@@ -373,6 +503,7 @@ class ArchiveGateway:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         progress: Callable[[int], None] | None = None,
+        **callbacks: Callable[..., Any],
     ) -> Any:
         return run_managed(
             "gateway",
@@ -389,6 +520,7 @@ class ArchiveGateway:
                 "acquire": self.upload_limiter.acquire,
                 "refund": self.upload_limiter.refund,
                 "progress": progress or (lambda value: None),
+                **callbacks,
             },
         )
 
@@ -416,6 +548,17 @@ class ArchiveBackend(Protocol):
         media_path: Path,
         *,
         progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult: ...
+    def upload_multipart(  # noqa: PLR0913
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        create: bool,
+        state: str | None,
+        progress: Callable[[int], None],
+        heartbeat: Callable[[], None],
+        on_state: Callable[[str], None],
     ) -> InternetArchiveUploadResult: ...
     def submit_page(self, url: str) -> str: ...
     def page_status(self, job_id: str) -> InternetArchiveCaptureStatus: ...
@@ -695,6 +838,8 @@ class ArchiveProcessor:
                 media_path=None,
                 download_completed_at=None,
                 ready_at=None,
+                # A new download cannot resume parts sent from the lost bytes.
+                multipart_state=None,
                 last_error="staging media disappeared; downloading again",
                 failure_phase=None,
             )
@@ -705,6 +850,7 @@ class ArchiveProcessor:
                 status="download",
                 release=True,
                 media_path=None,
+                multipart_state=None,
                 last_error="download completion is not recorded",
             )
             return
@@ -747,30 +893,78 @@ class ArchiveProcessor:
                 )
                 work.progress.transfer_bytes = bytes_sent
 
-        try:
-            operation = (
-                self._gateway().recover
-                if work.progress.upload_mode == "recover"
-                else self._gateway().upload
+        def heartbeat() -> None:
+            # Hashing before the first part is work, not a stalled transfer.
+            self.state.update_archive(work.video.id, transfer_progress_at=utcnow())
+
+        def save_state(state: str) -> None:
+            facts = json.loads(state)
+            self.state.update_archive(
+                work.video.id,
+                multipart_state=state,
+                media_md5=facts["md5"],
+                media_sha1=facts["sha1"],
             )
-            result = operation(frozen, path, progress=progress)
+            work.progress.multipart_state = state
+
+        try:
+            if (
+                work.progress.multipart_state is not None
+                or 0 < self.settings.archive_multipart_threshold <= path.stat().st_size
+            ):
+                result = self._gateway().upload_multipart(
+                    frozen,
+                    path,
+                    create=work.progress.upload_mode != "recover",
+                    state=work.progress.multipart_state,
+                    progress=progress,
+                    heartbeat=heartbeat,
+                    on_state=save_state,
+                )
+            else:
+                operation = (
+                    self._gateway().recover
+                    if work.progress.upload_mode == "recover"
+                    else self._gateway().upload
+                )
+                result = operation(frozen, path, progress=progress)
         except InternetArchiveUploadError as error:
             if self._acknowledged(work, error.result):
                 self._acknowledge(work, error.result)
                 return
             self.stop_controller.check()
-            code = error.cause.status_code
-            known_failure = (
-                not isinstance(error.cause, NetworkError)
-                and code is not None
-                and 400 <= code < 500
-                and code not in {408, 409, 412}
-            )
+            known_failure = _known_failure(error.cause)
             if known_failure and error.failed_file:
                 self.state.update_archive(work.video.id, upload_mode="recover")
             self.state.defer_transfer(
                 work,
                 status="upload" if known_failure else "reconcile_upload",
+                error=_error_text(error),
+                delay=self._failure_delay(work, error),
+                deadline=self.settings.background_deadline,
+                **failure_facts(error),
+            )
+            return
+        except InternetArchiveMultipartError as error:
+            self.stop_controller.check()
+            phase = error.cause.request_phase
+            gone = error.uncertain or error.cause.service_code == "NoSuchUpload"
+            if gone:
+                # The upload ID cannot be resumed, and its completion is unknown.
+                # Only the item's own listing decides whether to send it again.
+                self.state.update_archive(work.video.id, multipart_state=None)
+            # A live upload ID resumes from its saved parts. Before one exists,
+            # only a rejected item creation is known to have changed nothing.
+            retry = (
+                not gone
+                and error.state is not None
+                or error.state is None
+                and phase == "item-create"
+                and _known_failure(error.cause)
+            )
+            self.state.defer_transfer(
+                work,
+                status="upload" if retry else "reconcile_upload",
                 error=_error_text(error),
                 delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
@@ -1237,6 +1431,17 @@ def _working_directory(work: ArchiveWork) -> Path:
     if not work.progress.working_directory:
         raise RuntimeError("archive stage has no working directory")
     return Path(work.progress.working_directory)
+
+
+def _known_failure(error: ServiceError) -> bool:
+    """Return whether a rejection proves the request changed nothing remotely."""
+    code = error.status_code
+    return (
+        not isinstance(error, NetworkError)
+        and code is not None
+        and 400 <= code < 500
+        and code not in {408, 409, 412}
+    )
 
 
 def _metadata_matches(metadata: Any, name: str, expected: str) -> bool:

@@ -106,9 +106,17 @@ def _execute(
             client = ArchiveGateway(
                 options["settings"], upload_limiter=limiter, stop_controller=controller
             )
-            if method in {"upload", "recover"}:
+            if method in {"upload", "recover", "upload_multipart"}:
                 kwargs["progress"] = lambda *values: _rpc(
                     connection, "progress", values
+                )
+            if method == "upload_multipart":
+                # The parent saves each resume state before the next part is sent.
+                kwargs["heartbeat"] = lambda *values: _rpc(
+                    connection, "heartbeat", values
+                )
+                kwargs["on_state"] = lambda *values: _rpc(
+                    connection, "on_state", values
                 )
             result = getattr(client, method)(*args, **kwargs)
         elif category == "ziggy":

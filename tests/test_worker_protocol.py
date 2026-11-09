@@ -46,6 +46,7 @@ class Connection:
         ("youtube", "scan_history"),
         ("youtube", "video_metadata"),
         ("gateway", "upload"),
+        ("gateway", "upload_multipart"),
         ("gateway", "inspect"),
         ("ziggy", "submit"),
         ("log", "emit"),
@@ -82,6 +83,12 @@ def test_child_protocol_dispatches_callbacks_and_serializes_outcomes(
                 InternetArchiveUploadResult("item", ()), NetworkError("lost")
             )
 
+        def upload_multipart(self, *args: Any, **kwargs: Any) -> str:
+            kwargs["progress"](4)
+            kwargs["heartbeat"]()
+            kwargs["on_state"]("{}")
+            return "multipart"
+
         def inspect(self, *args: Any, **kwargs: Any) -> str:
             return "inspection"
 
@@ -113,6 +120,13 @@ def test_child_protocol_dispatches_callbacks_and_serializes_outcomes(
     )
     if category == "gateway" and method == "upload":
         assert connection.messages[-1][0] == "upload_failure"
+    elif method == "upload_multipart":
+        assert [message[0] for message in connection.messages] == [
+            "progress",
+            "heartbeat",
+            "on_state",
+            "result",
+        ]
     elif category in {"unknown", "failure"}:
         assert connection.messages[-1][0] == "failure"
     else:
@@ -311,6 +325,35 @@ def test_managed_gateway_dispatch_preserves_upload_callbacks(
     gateway.inspect(cast(Any, "metadata"), size=4)
     gateway.submit_page("url")
     gateway.page_status("job")
+
+
+def test_managed_multipart_keeps_resume_callbacks_in_the_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        archival, "run_managed", lambda *args, **kwargs: calls.append(args)
+    )
+    saved: list[str] = []
+    gateway = archival.ArchiveGateway(settings(tmp_path), managed=True)
+    gateway.upload_multipart(
+        cast(Any, "metadata"),
+        tmp_path,
+        create=False,
+        state="saved",
+        progress=lambda _: None,
+        heartbeat=lambda: None,
+        on_state=saved.append,
+    )
+    (_, method, _, args, kwargs, _, callbacks) = calls[0]
+    assert (method, args[1], kwargs) == (
+        "upload_multipart",
+        tmp_path,
+        {"create": False, "state": "saved"},
+    )
+    assert {"progress", "heartbeat", "on_state"} <= set(callbacks)
+    callbacks["on_state"]("next")
+    assert saved == ["next"]
 
 
 def test_log_forwarding_uses_bounded_process_with_redacted_message(

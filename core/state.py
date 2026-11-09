@@ -204,6 +204,7 @@ class ArchiveProgress(SQLModel, table=True):
     error_request_id: str | None = None
     error_headers: str | None = None
     error_queue: str | None = None
+    multipart_state: str | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -2121,6 +2122,7 @@ class StateStore:
                 progress.upload_receipt = receipt
                 progress.upload_etag = etag
                 progress.upload_origin = "recovered" if recovered else "transferred"
+            progress.multipart_state = None
             progress.status = "complete"
             progress.claimed_at = None
             progress.retry_at = None

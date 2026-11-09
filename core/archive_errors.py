@@ -6,6 +6,7 @@ from typing import Any
 
 from archivist import (
     AuthenticationError,
+    InternetArchiveMultipartError,
     InternetArchiveRecoveryError,
     InternetArchiveUploadError,
     NetworkError,
@@ -43,7 +44,15 @@ AUTHENTICATION_CODES = {
 }
 PERMISSION_CODES = {"AccessDenied", "AllAccessDisabled", "UnauthorizedAccess"}
 TRANSIENT_CODES = {"InternalError", "ServiceUnavailable", "RequestTimeout"}
-ITEM_PHASES = {"item-create", "file-upload", "item-metadata"}
+ITEM_PHASES = {
+    "item-create",
+    "file-upload",
+    "item-metadata",
+    "multipart-initiate",
+    "multipart-part",
+    "multipart-list",
+    "multipart-complete",
+}
 
 
 def safe_text(value: str | None, limit: int = 256) -> str | None:
@@ -127,7 +136,14 @@ def diagnostic_snapshot(record: Any) -> dict[str, Any]:
 
 
 def failure_cause(error: Exception) -> Exception:
-    while isinstance(error, (InternetArchiveUploadError, InternetArchiveRecoveryError)):
+    while isinstance(
+        error,
+        (
+            InternetArchiveUploadError,
+            InternetArchiveRecoveryError,
+            InternetArchiveMultipartError,
+        ),
+    ):
         error = error.cause
     return error
 

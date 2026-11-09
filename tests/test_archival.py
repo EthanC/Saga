@@ -533,6 +533,11 @@ class FakeGateway:
         self.recovery_calls += 1
         return self.upload(metadata, media_path, **kwargs)
 
+    def upload_multipart(
+        self, metadata: FrozenArchiveMetadata, media_path: Path, **kwargs: Any
+    ) -> InternetArchiveUploadResult:
+        return self.upload(metadata, media_path, progress=kwargs["progress"])
+
     def inspect(self, *args: Any, **kwargs: Any) -> Inspection:
         self.inspect_calls += 1
         return self.inspection
