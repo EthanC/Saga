@@ -13,14 +13,14 @@ wheels = [
 
 [[package]]
 name = "archivist-py"
-version = "1.5.0"
+version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "niquests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/62/19/b436f4d5f899a4928fcb2c5e9328b1e9e55b76d39865634ed9884e6f73e3/archivist_py-1.5.0.tar.gz", hash = "sha256:56b706bb584a3f4907fc2319be9dedc3b5d08fdb4b0846ad539e35348cf2d301", size = 88888, upload-time = "2026-11-09T05:21:54.053Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/57/f76966c41e4495ac29aa6d1f95e500cf188d0e269ab7887dcba7b73ea858/archivist_py-1.5.2.tar.gz", hash = "sha256:2721a0ebf7ca98f158265578e7a55891d69c207e9bd0236c8adfe94a4e59fa51", size = 89193, upload-time = "2026-11-09T06:06:13.738Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/48/f789c82ad7cb1cb5b812af86527e037fd1d88f1af61cbe01a0383b8e01f8/archivist_py-1.5.0-py3-none-any.whl", hash = "sha256:87dce4a7201a5c856b69cb569b4d9a9f1aa41e04a6ec5d6de9a719e4b21be3a7", size = 101089, upload-time = "2026-11-09T05:21:53.072Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/e3/8c367625be870af0584e2a65271d5155234b0b47bc5b565f45a49353f71b/archivist_py-1.5.2-py3-none-any.whl", hash = "sha256:489cc00aabba1baaa70634778177808d568c9a2f62c285d9c804b48b18914b12", size = 101397, upload-time = "2026-11-09T06:06:12.66Z" },
 ]
 
 [[package]]
@@ -765,7 +765,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "archivist-py", specifier = "==1.5.0" },
+    { name = "archivist-py", specifier = "==1.5.2" },
     { name = "bgutil-ytdlp-pot-provider", specifier = "==2.0.2" },
     { name = "cronsim", specifier = ">=2.8" },
     { name = "discord-clyde", specifier = ">=1.2.0" },

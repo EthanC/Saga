@@ -1,4 +1,4 @@
-"""Transport-only recovery extension for the pinned Archivist 1.5.0 client."""
+"""Transport-only recovery extension for the pinned Archivist 1.5.2 client."""
 
 from __future__ import annotations
 
