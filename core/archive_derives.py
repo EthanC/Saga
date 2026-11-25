@@ -25,7 +25,14 @@ from core.archive_tasks import TaskBacklog, TaskSource
 from core.config import Settings
 from core.logging import redact_diagnostics
 from core.shutdown import CooperativeStop, StopController
-from core.state import ArchiveWork, StateStore, _as_utc, retry_delay, utcnow
+from core.state import (
+    ArchiveProgress,
+    ArchiveWork,
+    StateStore,
+    _as_utc,
+    retry_delay,
+    utcnow,
+)
 
 DERIVE_COMMAND = "derive.php"
 # Catalog reads per worker pass, so confirmation adds little Archive load.
@@ -36,6 +43,11 @@ WAIT_RUNNING = 1
 WAIT_PAUSED = 9
 # Derive states that wait on the Archive and can stall without a task ID.
 WATCHED = frozenset({"requested", "running", "unknown"})
+# Why a derive stalled: no task ID, a task the Tasks API lost, or a task
+# that finished without derivative files.
+ITEM_ONLY = "item"
+LOST = "lost"
+NO_OUTPUT = "no_output"
 LIVE_STATES = {
     InternetArchiveTaskState.QUEUED: "requested",
     InternetArchiveTaskState.RUNNING: "running",
@@ -263,7 +275,7 @@ class DeriveDispatcher:
                         progress.derive_task_id,
                         progress.ia_identifier,
                     )
-                    outcome = self._from_item(work)
+                    outcome = self._from_item(work, cause=LOST)
                 else:
                     outcome = self._from_status(work, status)
         except ServiceError as error:
@@ -283,19 +295,9 @@ class DeriveDispatcher:
             self.state.finish_derive(work, job_status="waiting", retry_at=next_check)
             return True
         error = None
-        if self._stalled(work, outcome["derive_status"]):
-            days = self.settings.archive_derive_stale_days
-            error = (
-                f"DeriveStalled: no derivative files after {days:g} days "
-                "without an Archive task ID"
-            )
-            logger.error(
-                "Derive for {} showed no derivative files for {:g} days; marked "
-                "failed. Retry it with: python saga.py retry-derives {}",
-                progress.ia_identifier,
-                days,
-                progress.ia_identifier,
-            )
+        cause = self._stale_cause(progress, outcome.pop("_cause", None), outcome)
+        if cause is not None:
+            error = self._report_stale(progress, cause)
             raw = outcome.get("derive_raw_state", progress.derive_raw_state)
             outcome.clear()
             outcome.update(derive_status="failed", derive_raw_state=raw)
@@ -327,27 +329,42 @@ class DeriveDispatcher:
             )
         return True
 
-    def _stalled(self, work: ArchiveWork, status: str) -> bool:
-        """Return whether an item-read-only derive has waited too long.
+    def _stale_cause(
+        self, progress: ArchiveProgress, cause: str | None, outcome: dict[str, Any]
+    ) -> str | None:
+        """Return why a derive that made no progress has waited too long.
 
-        Only derives Saga saw as a pending item task, with no task ID to ask
-        about, can stall this way. Their clock starts at the later of
-        ``derive_status_at`` and the last time the account backlog fell to the
-        target or below, and it fails them only while the backlog stays there.
-        A derive held up by a full Archive queue therefore gets the whole
-        stale period again once the queue drains.
+        A derive known only from item reads stalls while it stays requested,
+        running, or unknown. A derive with a task ID stalls only while it
+        stays unknown because this check found the task lost or finished,
+        and the item read in this same check was complete and showed no
+        derivative files. Checks that fail or read an incomplete item never
+        reach here, and paused derives are never stalled.
         """
-        progress = work.progress
+        if progress.derive_task_id is None:
+            if (
+                progress.derive_requested_at is None
+                or progress.derive_status not in WATCHED
+                or outcome["derive_status"] not in WATCHED
+            ):
+                return None
+            cause = ITEM_ONLY
+        elif cause is None or progress.derive_status != "unknown":
+            return None
+        return cause if self._timed_out(progress) else None
+
+    def _timed_out(self, progress: ArchiveProgress) -> bool:
+        """Return whether the stale period has passed on the shared clock.
+
+        The clock starts at the later of ``derive_status_at`` and the last
+        time the account backlog fell to the target or below, and a derive
+        fails only while the backlog stays there. A derive held up by a full
+        Archive queue gets the whole stale period again once the queue
+        drains, and an unreadable backlog fails nothing.
+        """
         stamp = progress.derive_status_at
         limit = self.settings.archive_derive_stale_days * 86_400
-        if (
-            progress.derive_task_id is not None
-            or progress.derive_requested_at is None
-            or progress.derive_status not in WATCHED
-            or status not in WATCHED
-            or stamp is None
-            or (utcnow() - _as_utc(stamp)).total_seconds() <= limit
-        ):
+        if stamp is None or (utcnow() - _as_utc(stamp)).total_seconds() <= limit:
             return False
         if self._settled is None:
             backlog = self._read_backlog()
@@ -360,6 +377,42 @@ class DeriveDispatcher:
             and (utcnow() - max(_as_utc(stamp), since)).total_seconds() > limit
         )
 
+    def _report_stale(self, progress: ArchiveProgress, cause: str) -> str:
+        """Log the single error for a stalled derive and return its reason."""
+        days = self.settings.archive_derive_stale_days
+        identifier = progress.ia_identifier
+        task_id = progress.derive_task_id
+        if cause == NO_OUTPUT:
+            logger.error(
+                "Derive task {} for {} finished without derivative files and none "
+                "appeared for {:g} days; marked failed. A retry probably won't help; "
+                "check the item on the Archive by hand",
+                task_id,
+                identifier,
+                days,
+            )
+            return f"DeriveNoOutput: task {task_id} finished without derivatives"
+        if cause == LOST:
+            message = (
+                f"DeriveStalled: task {task_id} no longer tracked by the Tasks API"
+            )
+            detail = f"task {task_id} is no longer tracked by the Archive's Tasks API"
+        else:
+            message = (
+                f"DeriveStalled: no derivative files after {days:g} days "
+                "without an Archive task ID"
+            )
+            detail = "it showed no derivative files"
+        logger.error(
+            "Derive for {} stalled: {} for {:g} days; marked failed. "
+            "Retry it with: python saga.py retry-derives {}",
+            identifier,
+            detail,
+            days,
+            identifier,
+        )
+        return message
+
     def _from_status(
         self, work: ArchiveWork, status: InternetArchiveTaskStatus
     ) -> dict[str, Any] | None:
@@ -370,6 +423,8 @@ class DeriveDispatcher:
             return {"derive_status": "failed", **raw}
         if status.state is InternetArchiveTaskState.FINISHED:
             item = self.gateway.get_item(_identifier(work))
+            if not _resolved(item):
+                return None
             if _derived(item):
                 # The Archive reports no finish time, so record when Saga saw it.
                 return {"derive_status": "done", "derive_completed_at": utcnow(), **raw}
@@ -378,19 +433,25 @@ class DeriveDispatcher:
                 status.task_id,
                 _identifier(work),
             )
-            return {"derive_status": "unknown", **raw}
+            return {"derive_status": "unknown", "_cause": NO_OUTPUT, **raw}
         logger.warning(
             "Derive {} for {} has an unrecognized state {!r}; reading the item",
             status.task_id,
             _identifier(work),
             status.raw_state,
         )
-        return self._from_item(work)
+        return self._from_item(work, cause=LOST)
 
-    def _from_item(self, work: ArchiveWork) -> dict[str, Any] | None:
-        """Read derive state from the item's files and outstanding tasks."""
+    def _from_item(
+        self, work: ArchiveWork, *, cause: str | None = None
+    ) -> dict[str, Any] | None:
+        """Read derive state from the item's files and outstanding tasks.
+
+        ``cause`` records why a derive with a task ID was read from its item,
+        so an ``unknown`` result can stall on the shared clock.
+        """
         item = self.gateway.get_item(_identifier(work))
-        if not item.metadata or item.server_unavailable or not item.listing_complete:
+        if not _resolved(item):
             return None
         if _derived(item):
             return {"derive_status": "done", "derive_completed_at": utcnow()}
@@ -422,7 +483,7 @@ class DeriveDispatcher:
         ):
             # No derive was ever seen for this item, so it still needs one.
             return {"derive_status": "pending"}
-        return {"derive_status": "unknown"}
+        return {"derive_status": "unknown", "_cause": cause}
 
     def _backoff(self, work: ArchiveWork, error: Exception) -> datetime:
         assert work.job is not None
@@ -436,6 +497,11 @@ class DeriveDispatcher:
 def _identifier(work: ArchiveWork) -> str:
     assert work.progress.ia_identifier is not None
     return work.progress.ia_identifier
+
+
+def _resolved(item: InternetArchiveItem) -> bool:
+    """Return whether an item read is complete enough to judge its files."""
+    return bool(item.metadata) and not item.server_unavailable and item.listing_complete
 
 
 def _derived(item: InternetArchiveItem) -> bool:

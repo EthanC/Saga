@@ -1346,7 +1346,7 @@ def test_stalled_timeout_needs_a_settled_backlog_and_no_files(
     assert saved(store, video_id).derive_status == expected
 
 
-def test_stalled_timeout_skips_task_ids_and_unread_items(
+def test_stale_clocks_start_at_the_first_backlog_reading(
     store: StateStore, tmp_path: Path
 ) -> None:
     tracked = requested(
@@ -1370,12 +1370,13 @@ def test_stalled_timeout_skips_task_ids_and_unread_items(
         item(tasks=(task(InternetArchiveItemTaskState.PENDING, 0),)),
     ]
     dispatcher(store, tmp_path, archive).check_round()
+    # The lost task is old, but the backlog clock only starts now.
     assert saved(store, tracked).derive_status == "unknown"
+    assert cast(Backlog, archive.tasks).reads == 1
     # A first read starts the clock instead of failing an old item at once.
     row = saved(store, unread)
     assert row.derive_status == "requested"
     assert near(row.derive_status_at, datetime.now(UTC))
-    assert cast(Backlog, archive.tasks).reads == 0
 
 
 def test_derive_state_changes_only_with_its_timestamp(
@@ -1558,3 +1559,269 @@ def test_a_retried_derive_ignores_the_failed_task_still_on_the_item(
     assert (row.derive_status, row.derive_task_id) == ("done", 101)
     assert claim is not None and claim.status == "passed"
     assert [name for name, _ in archive.calls].count("queue") == 1
+
+
+# Stale timeout for derives with a task ID
+
+
+def stuck_case(case: str) -> tuple[list[Any], str]:
+    """Return the task API answer for one stuck case and its failure reason."""
+    if case == "not_found":
+        return [InternetArchiveTaskNotFoundError(101)], (
+            "DeriveStalled: task 101 no longer tracked by the Tasks API"
+        )
+    if case == "unknown":
+        return [status(InternetArchiveTaskState.UNKNOWN, raw="?")], (
+            "DeriveStalled: task 101 no longer tracked by the Tasks API"
+        )
+    return [status(InternetArchiveTaskState.FINISHED)], (
+        "DeriveNoOutput: task 101 finished without derivatives"
+    )
+
+
+class Clock:
+    """Move the dispatcher's clock forward from the start of a test."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from core import archive_derives
+
+        self.start = datetime.now(UTC)
+        self.now = self.start
+        monkeypatch.setattr(archive_derives, "utcnow", lambda: self.now)
+
+    def at(self, days: float) -> None:
+        self.now = self.start + timedelta(days=days)
+
+
+def stuck_row(store: StateStore, root: Path, video_id: str = "stuck000000") -> str:
+    """Seed a requested derive with task ID 101 that has just become unknown."""
+    return requested(store, root, video_id)
+
+
+def check_at(
+    derives: DeriveDispatcher,
+    store: StateStore,
+    clock: Clock,
+    video_id: str,
+    days: float,
+    answer: list[Any],
+    found: InternetArchiveItem | Exception,
+    outstanding: int = 5,
+) -> ArchiveProgress:
+    archive = cast(Archive, derives.gateway)
+    cast(Backlog, archive.tasks).outstanding = outstanding
+    archive.statuses = list(answer)
+    archive.items = [found]
+    clock.at(days)
+    due(store, video_id)
+    derives.check_round()
+    return saved(store, video_id)
+
+
+def errors(messages: list[str]) -> list[str]:
+    return [message for message in messages if "marked failed" in message]
+
+
+@pytest.fixture
+def error_log() -> Any:
+    messages: list[str] = []
+    handler = archival.logger.add(messages.append, level="ERROR", format="{message}")
+    yield messages
+    archival.logger.remove(handler)
+
+
+def backlog_at(
+    derives: DeriveDispatcher, clock: Clock, days: float, outstanding: int
+) -> None:
+    """Let the dispatcher read the backlog at a given day."""
+    cast(Backlog, cast(Archive, derives.gateway).tasks).outstanding = outstanding
+    clock.at(days)
+    derives.submit_round()
+
+
+def unknown_since(
+    derives: DeriveDispatcher,
+    store: StateStore,
+    clock: Clock,
+    video_id: str,
+    answer: list[Any],
+    days: float,
+) -> None:
+    """Make the derive unknown through a check, dated to a given day."""
+    row = check_at(derives, store, clock, video_id, days, answer, item())
+    assert row.derive_status == "unknown"
+    set_progress(store, video_id, derive_status_at=clock.start + timedelta(days=days))
+
+
+@pytest.mark.parametrize("drop", [0, 4])
+@pytest.mark.parametrize("case", ["not_found", "unknown", "finished"])
+def test_a_stuck_task_fails_after_the_stale_days_on_the_shared_clock(
+    store: StateStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_log: list[str],
+    case: str,
+    drop: float,
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = stuck_row(store, tmp_path)
+    derives = dispatcher(store, tmp_path, Archive())
+    answer, reason = stuck_case(case)
+    backlog_at(derives, clock, 0, 25 if drop else 5)
+    # The derive becomes unknown on day 2; the backlog falls on day `drop`.
+    unknown_since(derives, store, clock, video_id, answer, 2)
+    backlog_at(derives, clock, drop, 5)
+    deadline = max(2, drop) + 7
+    for days in (5, deadline - 0.1):
+        row = check_at(derives, store, clock, video_id, days, answer, item())
+        assert row.derive_status == "unknown"
+    row = check_at(derives, store, clock, video_id, deadline + 0.1, answer, item())
+    claim = job(store, video_id)
+    assert (row.derive_status, row.derive_task_id) == ("failed", 101)
+    assert claim is not None and claim.status == "failed"
+    assert claim.last_error == reason
+    # A failed row is never claimed again, so it logs one error.
+    check_at(derives, store, clock, video_id, deadline + 1, answer, item())
+    logged = errors(error_log)
+    assert len(logged) == 1
+    if case == "finished":
+        assert "A retry probably won't help" in logged[0]
+        assert "retry-derives" not in logged[0]
+    else:
+        assert "no longer tracked by the Archive's Tasks API" in logged[0]
+        assert "retry-derives" in logged[0]
+
+
+@pytest.mark.parametrize("case", ["not_found", "unknown", "finished"])
+def test_files_found_by_the_last_read_finish_the_derive_instead(
+    store: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = stuck_row(store, tmp_path)
+    derives = dispatcher(store, tmp_path, Archive())
+    answer, _ = stuck_case(case)
+    backlog_at(derives, clock, 0, 5)
+    unknown_since(derives, store, clock, video_id, answer, 0)
+    row = check_at(derives, store, clock, video_id, 30, answer, item(derived=True))
+    assert row.derive_status == "done"
+    assert row.derive_completed_at is not None
+    claim = job(store, video_id)
+    assert claim is not None and claim.last_error is None
+
+
+@pytest.mark.parametrize("case", ["not_found", "unknown", "finished"])
+def test_a_backlog_above_the_target_never_fails_a_stuck_task(
+    store: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = stuck_row(store, tmp_path)
+    derives = dispatcher(store, tmp_path, Archive())
+    answer, _ = stuck_case(case)
+    backlog_at(derives, clock, 0, 25)
+    unknown_since(derives, store, clock, video_id, answer, 0)
+    for days in (10, 20, 40):
+        row = check_at(derives, store, clock, video_id, days, answer, item(), 25)
+        assert row.derive_status == "unknown"
+    # An unreadable backlog fails nothing either.
+    archive = cast(Archive, derives.gateway)
+    archive.tasks = Backlog(None)
+    derives._settled_since = clock.start
+    clock.at(60)
+    due(store, video_id)
+    archive.statuses, archive.items = list(answer), [item()]
+    derives.check_round()
+    assert saved(store, video_id).derive_status == "unknown"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RateLimitError("slow", retry_after=5),
+        NetworkError("reset"),
+        InvalidServiceResponseError("bad"),
+    ],
+)
+@pytest.mark.parametrize("on_item", [False, True])
+def test_a_failed_or_incomplete_last_check_never_times_out(
+    store: StateStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: ServiceError,
+    on_item: bool,
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = stuck_row(store, tmp_path)
+    derives = dispatcher(store, tmp_path, Archive())
+    lost = [InternetArchiveTaskNotFoundError(101)]
+    backlog_at(derives, clock, 0, 5)
+    unknown_since(derives, store, clock, video_id, lost, 0)
+    row = check_at(
+        derives, store, clock, video_id, 30, lost if on_item else [failure], failure
+    )
+    claim = job(store, video_id)
+    assert row.derive_status == "unknown"
+    assert claim is not None and claim.status == "waiting"
+    assert claim.last_error is not None
+    finished = [status(InternetArchiveTaskState.FINISHED)]
+    for answer, found in (
+        (lost, item(metadata=False)),
+        (lost, item(complete=False)),
+        (lost, item(unavailable=True)),
+        (finished, item(complete=False)),
+    ):
+        row = check_at(derives, store, clock, video_id, 30, answer, found)
+        assert row.derive_status == "unknown"
+    # The same row fails once a check completes with a full item read.
+    row = check_at(derives, store, clock, video_id, 30, lost, item())
+    assert row.derive_status == "failed"
+
+
+def test_a_paused_derive_never_fails_on_the_stale_clock(
+    store: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = requested(
+        store,
+        tmp_path,
+        "paused00000",
+        derive_status="paused",
+        derive_status_at=clock.start,
+    )
+    derives = dispatcher(store, tmp_path, Archive())
+    backlog_at(derives, clock, 0, 5)
+    held = [status(InternetArchiveTaskState.PAUSED)]
+    for days in (10, 40):
+        row = check_at(derives, store, clock, video_id, days, held, item())
+        assert row.derive_status == "paused"
+    # A paused task that the Tasks API then loses starts a new unknown period.
+    lost = [InternetArchiveTaskNotFoundError(101)]
+    row = check_at(derives, store, clock, video_id, 41, lost, item())
+    assert row.derive_status == "unknown"
+
+
+def test_retrying_a_lost_task_adopts_the_derive_still_queued(
+    store: StateStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock(monkeypatch)
+    video_id = stuck_row(store, tmp_path)
+    archive = Archive()
+    derives = dispatcher(store, tmp_path, archive)
+    lost = [InternetArchiveTaskNotFoundError(101)]
+    backlog_at(derives, clock, 0, 5)
+    unknown_since(derives, store, clock, video_id, lost, 0)
+    row = check_at(derives, store, clock, video_id, 8, lost, item())
+    assert row.derive_status == "failed"
+    identifier = row.ia_identifier
+    assert identifier is not None
+    assert store.reset_failed_derives([identifier]) == [identifier]
+    # The Archive still has the derive queued, so nothing new is posted.
+    archive.submissions = [
+        InternetArchiveTaskSubmission(101, identifier, None, already_pending=True)
+    ]
+    archive.statuses = [status(InternetArchiveTaskState.QUEUED, 101)]
+    archive.calls.clear()
+    assert derives.submit_round() == 1
+    row = saved(store, video_id)
+    assert (row.derive_status, row.derive_task_id) == ("requested", 101)
+    assert near(row.derive_requested_at, SUBMITTED)
+    assert archive.calls == [("queue", identifier), ("status", 101)]
