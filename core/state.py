@@ -46,6 +46,7 @@ from core.archive_retry import (
     ArchiveServiceState,
     retryable_record,
 )
+from core.archive_tasks import TaskBacklog
 from core.config import ContentType, YouTubeChannelConfig, YouTubeConfig
 from core.logging import redact_diagnostics
 from core.staging import completed_download_size, download_reservation, inventory_inputs
@@ -303,6 +304,8 @@ class Report(SQLModel, table=True):
     awaiting_replay: int = 0
     unavailable: int = 0
     operator_action: int = 0
+    ia_tasks_outstanding: int | None = None
+    ia_tasks_error: int | None = None
     status: str = Field(default="pending", index=True)
     attempts: int = 0
     retry_at: datetime | None = Field(default=None, index=True)
@@ -1145,6 +1148,17 @@ class StateStore:
                 job.retry_at = None
                 session.add(job)
 
+    def record_archive_tasks(self, backlog: TaskBacklog) -> None:
+        """Save the latest account task summary for health and reports."""
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            gate = self._archive_gate(session, utcnow())
+            gate.task_queued, gate.task_running = backlog.queued, backlog.running
+            gate.task_error, gate.task_paused = backlog.error, backlog.paused
+            gate.task_sampled_at = backlog.sampled_at
+            session.add(gate)
+            session.commit()
+
     def finish_archive_request(self, work: ArchiveWork, *, base_delay: float) -> None:
         if work.archive_generation is None:
             return
@@ -1291,6 +1305,7 @@ class StateStore:
             if gate.incident_closed_at
             else None,
             **incident_facts(gate, [row for row, _ in rows], current, stall_timeout),
+            "account_tasks": _account_tasks(gate),
         }
         by_id = {row.video_id: row for row, _ in rows}
         pending = any(
@@ -1339,7 +1354,9 @@ class StateStore:
                 {
                     "key": "archive:service",
                     "severity": snapshot["severity"],
-                    "message": _archive_incident_message(snapshot["incident_category"]),
+                    "message": _archive_incident_message(
+                        snapshot["incident_category"], snapshot["error_queue"]
+                    ),
                     "details": snapshot,
                 }
             )
@@ -1439,10 +1456,13 @@ class StateStore:
                     gate.incident_last_notified_at = current
                     if error and not escalated:
                         gate.incident_escalated_at = current
+                    diagnostics = diagnostic_snapshot(gate)
                     events.append(
                         {
                             "severity": "error" if error else "warning",
-                            "message": _archive_incident_message(category),
+                            "message": _archive_incident_message(
+                                category, diagnostics["error_queue"]
+                            ),
                             "details": {
                                 "incident_id": gate.incident_id,
                                 **facts,
@@ -1454,7 +1474,7 @@ class StateStore:
                                 "error_status": gate.error_status,
                                 "error_phase": gate.error_phase,
                                 "reason": gate.error_code or "unknown",
-                                **diagnostic_snapshot(gate),
+                                **diagnostics,
                             },
                         }
                     )
@@ -2510,6 +2530,7 @@ class StateStore:
                     unavailable=int(unavailable),
                     operator_action=int(operator_action),
                     **self._queue_counts(session),
+                    **self._task_counts(session),
                 )
                 session.add(existing)
             checkpoint = session.get(ReportCheckpoint, 1)
@@ -2523,6 +2544,16 @@ class StateStore:
             session.refresh(existing)
             session.expunge(existing)
             return existing
+
+    @staticmethod
+    def _task_counts(session: Session) -> dict[str, Any]:
+        gate = session.get(ArchiveServiceState, 1)
+        if gate is None or gate.task_sampled_at is None:
+            return {}
+        return {
+            "ia_tasks_outstanding": (gate.task_queued or 0) + (gate.task_running or 0),
+            "ia_tasks_error": gate.task_error or 0,
+        }
 
     @staticmethod
     def _queue_counts(session: Session) -> dict[str, Any]:
@@ -3154,7 +3185,28 @@ def retry_delay(base: float, attempts: int) -> float:
     )
 
 
-def _archive_incident_message(category: str) -> str:
+def _account_tasks(gate: ArchiveServiceState) -> dict[str, Any] | None:
+    if gate.task_sampled_at is None:
+        return None
+    return {
+        "queued": gate.task_queued,
+        "running": gate.task_running,
+        "error": gate.task_error,
+        "paused": gate.task_paused,
+        "outstanding": (gate.task_queued or 0) + (gate.task_running or 0),
+        "sampled_at": _as_utc(gate.task_sampled_at).isoformat(),
+    }
+
+
+def _archive_incident_message(
+    category: str, queue: dict[str, Any] | None = None
+) -> str:
+    if category == "deferred-backlog":
+        queue = queue or {}
+        if "task_limit" not in queue:
+            return "Deferred: IA task backlog is at its limit"
+        backlog = queue.get("task_queued", 0) + queue.get("task_running", 0)
+        return f"Deferred: IA task backlog {backlog:,} \u2265 {queue['task_limit']:,}"
     return {
         "transient": "Archive service unavailable; retries are coordinated",
         "throttled": "Archive throttled requests; retries are coordinated",

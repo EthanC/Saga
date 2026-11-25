@@ -102,9 +102,14 @@ def _execute(
             result = getattr(client, method)(*args, **kwargs)
         elif category == "gateway":
             from core.archival import ArchiveGateway
+            from core.archive_tasks import PresetTasks
 
+            # The parent owns the shared task-summary cache and its pacing.
             client = ArchiveGateway(
-                options["settings"], upload_limiter=limiter, stop_controller=controller
+                options["settings"],
+                upload_limiter=limiter,
+                stop_controller=controller,
+                tasks=PresetTasks(options.get("task_backlog")),
             )
             if method in {"upload", "recover", "upload_multipart"}:
                 kwargs["progress"] = lambda *values: _rpc(

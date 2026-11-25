@@ -40,6 +40,8 @@ QUEUE_COUNTERS = (
     "total_global_limit",
     "total_tasks_queued",
 )
+# Account catalog task counts that Saga reads before a write, with its limit.
+TASK_COUNTERS = ("task_queued", "task_running", "task_error", "task_limit")
 THROTTLING_CODES = {"SlowDown", "Throttling", "ThrottlingException", "TooManyRequests"}
 AUTHENTICATION_CODES = {
     "InvalidAccessKeyId",
@@ -100,7 +102,7 @@ def queue_snapshot(data: Any) -> str | None:
         return None
     snapshot: dict[str, Any] = {
         name: data[name]
-        for name in ("over_limit", *QUEUE_COUNTERS)
+        for name in ("over_limit", *QUEUE_COUNTERS, *TASK_COUNTERS)
         if isinstance(data.get(name), int)
     }
     if isinstance(data.get("limit_reason"), str) and data["limit_reason"]:
@@ -114,8 +116,9 @@ def apply_diagnostics(record: Any, **fields: Any) -> None:
 
 
 def incident_category(kind: str | None, code: str | None) -> str:
-    if kind in {"network", "rate_limit", "authentication", "permission"}:
+    if kind in {"network", "rate_limit", "authentication", "permission", "deferred"}:
         return {
+            "deferred": "deferred-backlog",
             "network": "transient",
             "rate_limit": "throttled",
             "authentication": "authentication",
@@ -176,7 +179,10 @@ def failure_facts(error: Exception) -> dict[str, Any]:
     status = cause.status_code if isinstance(cause, ServiceError) else None
     code = getattr(cause, "service_code", None)
     kind = (
-        "network"
+        # Saga deferred the write itself; the Archive never saw a request.
+        "deferred"
+        if getattr(cause, "deferred_backlog", False)
+        else "network"
         if isinstance(cause, NetworkError)
         else "rate_limit"
         if isinstance(cause, RateLimitError)

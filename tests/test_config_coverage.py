@@ -45,6 +45,8 @@ SETTING_NAMES = (
     "SAGA_ARCHIVE_POLL_INTERVAL",
     "SAGA_ARCHIVE_QUEUE_DERIVE",
     "SAGA_ARCHIVE_INTERACTIVE_PRIORITY",
+    "SAGA_ARCHIVE_TASK_QUEUE_LIMIT",
+    "SAGA_ARCHIVE_TASK_SUMMARY_TTL",
     "SAGA_ARCHIVE_MULTIPART_THRESHOLD",
     "SAGA_ARCHIVE_MULTIPART_PART_SIZE",
     "SAGA_MINIMUM_FREE_BYTES",
@@ -202,6 +204,8 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_ARCHIVE_POLL_INTERVAL": "4",
         "SAGA_ARCHIVE_QUEUE_DERIVE": "false",
         "SAGA_ARCHIVE_INTERACTIVE_PRIORITY": "false",
+        "SAGA_ARCHIVE_TASK_QUEUE_LIMIT": "400",
+        "SAGA_ARCHIVE_TASK_SUMMARY_TTL": "30",
         "SAGA_ARCHIVE_MULTIPART_THRESHOLD": "20000000000",
         "SAGA_ARCHIVE_MULTIPART_PART_SIZE": "5368709120",
         "SAGA_MINIMUM_FREE_BYTES": "0",
@@ -235,6 +239,8 @@ def test_load_settings_accepts_all_optional_values(
     assert result.archive_workers == 4
     assert result.archive_queue_derive is False
     assert result.archive_interactive_priority is False
+    assert result.archive_task_queue_limit == 400
+    assert result.archive_task_summary_ttl == 30
     assert result.archive_multipart_threshold == 20_000_000_000
     assert result.archive_multipart_part_size == 5 * 1024**3
     assert result.minimum_free_bytes == 0
@@ -337,6 +343,8 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"SAGA_ARCHIVE_RETRY_DELAY": "0"}, "positive finite number"),
         ({"SAGA_ARCHIVE_QUEUE_DERIVE": "maybe"}, "SAGA_ARCHIVE_QUEUE_DERIVE"),
         ({"SAGA_ARCHIVE_MULTIPART_THRESHOLD": "-1"}, "MULTIPART_THRESHOLD"),
+        ({"SAGA_ARCHIVE_TASK_QUEUE_LIMIT": "-1"}, "SAGA_ARCHIVE_TASK_QUEUE_LIMIT"),
+        ({"SAGA_ARCHIVE_TASK_SUMMARY_TTL": "0"}, "positive finite number"),
         ({"SAGA_ARCHIVE_MULTIPART_PART_SIZE": "0"}, "between 1 and 5368709120"),
         (
             {"SAGA_ARCHIVE_MULTIPART_PART_SIZE": "5368709121"},

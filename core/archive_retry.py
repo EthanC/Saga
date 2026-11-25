@@ -49,12 +49,17 @@ class ArchiveServiceState(SQLModel, table=True):
     incident_started_at: datetime | None = None
     incident_healthy_since: datetime | None = None
     incident_closed_at: datetime | None = None
+    task_queued: int | None = None
+    task_running: int | None = None
+    task_error: int | None = None
+    task_paused: int | None = None
+    task_sampled_at: datetime | None = None
 
 
 def retryable_fields(
     kind: str | None, status: int | None, phase: str | None, detail: str
 ) -> bool:
-    if kind in {"network", "authentication", "rate_limit"}:
+    if kind in {"network", "authentication", "rate_limit", "deferred"}:
         return True
     if kind == "service":
         return (

@@ -126,6 +126,8 @@ class Settings:
     archive_poll_interval: float = 5.0
     archive_queue_derive: bool = True
     archive_interactive_priority: bool = True
+    archive_task_queue_limit: int = 0
+    archive_task_summary_ttl: float = 60.0
     archive_multipart_threshold: int = 0
     archive_multipart_part_size: int = 512 * 1024**2
     minimum_free_bytes: int = 5_000_000_000
@@ -377,6 +379,12 @@ def load_settings(project_root: Path) -> Settings:
         archive_queue_derive=env.bool("SAGA_ARCHIVE_QUEUE_DERIVE", True),
         archive_interactive_priority=env.bool(
             "SAGA_ARCHIVE_INTERACTIVE_PRIORITY", True
+        ),
+        archive_task_queue_limit=_nonnegative_env_int(
+            env, "SAGA_ARCHIVE_TASK_QUEUE_LIMIT", 0
+        ),
+        archive_task_summary_ttl=_positive_env_float(
+            env, "SAGA_ARCHIVE_TASK_SUMMARY_TTL", 60.0
         ),
         archive_multipart_threshold=archive_multipart_threshold,
         archive_multipart_part_size=archive_multipart_part_size,

@@ -54,7 +54,13 @@ def incident_facts(
         else 0.0
     )
     retried = gate.failures > 1 or probe_idle > stall_timeout
-    error = gate.failures > 0 and (idle > stall_timeout and retried or actionable)
+    # Saga's own backlog deferrals never reached the Archive, so they wait
+    # for the backlog to drain instead of escalating as a service failure.
+    error = (
+        gate.failures > 0
+        and category != "deferred-backlog"
+        and (idle > stall_timeout and retried or actionable)
+    )
     return {
         "incident_age_seconds": max(0.0, (now - start).total_seconds()),
         "incident_category": category,

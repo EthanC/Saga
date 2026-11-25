@@ -151,6 +151,14 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
             f"{report.webpage_failed:,} failed/expired",
             f"Recovered/historical uploads: {report.recovered_uploads:,} "
             "(excluded from newly transferred bytes)",
+            *(
+                [
+                    f"IA tasks: {report.ia_tasks_outstanding:,} outstanding"
+                    f" | {report.ia_tasks_error or 0:,} failed"
+                ]
+                if report.ia_tasks_outstanding is not None
+                else []
+            ),
         ]
     )
     footer = Markdown.subtext(

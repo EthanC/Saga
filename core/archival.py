@@ -31,6 +31,7 @@ from archivist import (
     InternetArchiveRecoveryConflictError,
     InternetArchiveRecoveryDeferredError,
     InternetArchiveSuccessStatus,
+    InternetArchiveTaskSummary,
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
     InternetArchiveUploadFileResult,
@@ -46,6 +47,7 @@ from niquests import Session
 
 from core.archive_errors import RecoveryConflictError, failure_cause, failure_facts
 from core.archive_retry import retry_hint, retryable_error
+from core.archive_tasks import TaskBacklog, TaskSource, TaskSummaryCache
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import MULTIPART_MAX_PART_SIZE, MULTIPART_MAX_PARTS, Settings
 from core.logging import redact_diagnostics
@@ -65,6 +67,8 @@ from core.youtube_errors import VideoAccessError
 
 MAX_IDENTIFIER_LENGTH = 100
 CREDENTIAL_PHASES = frozenset({"csrf", "login", "upload-key"})
+TASK_PHASES = frozenset({"item-create", "file-upload"})
+DEFERRED_PREFIX = "Upload deferred before sending: "
 
 
 class _NoSubmissionRedirects(HTTPRedirectHandler):
@@ -204,6 +208,7 @@ class ArchiveGateway:
         *,
         stop_controller: StopController | None = None,
         managed: bool = False,
+        tasks: TaskSource | None = None,
     ) -> None:
         assert settings.internet_archive_email is not None
         assert settings.internet_archive_password is not None
@@ -215,6 +220,7 @@ class ArchiveGateway:
         self.settings = settings
         self.stop_controller = stop_controller or StopController()
         self.managed = managed
+        self.tasks = tasks or TaskSummaryCache(settings.archive_task_summary_ttl)
 
     def _session(self) -> Session:
         self.stop_controller.check()
@@ -241,7 +247,26 @@ class ArchiveGateway:
         progress: Callable[[int], None],
     ) -> InternetArchiveUploadResult:
         if self.managed:
-            return self._managed("upload", (metadata, media_path), {}, progress)
+            return self._observed(
+                "item-create",
+                lambda: self._managed(
+                    "upload",
+                    (metadata, media_path),
+                    {},
+                    progress,
+                    backlog=self._backlog("item-create"),
+                ),
+            )
+        return self._observed(
+            "item-create", lambda: self._upload(metadata, media_path, progress)
+        )
+
+    def _upload(
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult:
         options = self._options(metadata)
         with (
             media_path.open("rb") as stream,
@@ -297,15 +322,44 @@ class ArchiveGateway:
         on_state: Callable[[str], None],
     ) -> InternetArchiveUploadResult:
         """Send one original in resumable parts, saving each state before going on."""
+        phase = "item-create" if create and state is None else "file-upload"
         if self.managed:
-            return self._managed(
-                "upload_multipart",
-                (metadata, media_path),
-                {"create": create, "state": state},
-                progress,
+            return self._observed(
+                phase,
+                lambda: self._managed(
+                    "upload_multipart",
+                    (metadata, media_path),
+                    {"create": create, "state": state},
+                    progress,
+                    backlog=self._backlog(phase),
+                    heartbeat=heartbeat,
+                    on_state=on_state,
+                ),
+            )
+        return self._observed(
+            phase,
+            lambda: self._upload_multipart(
+                metadata,
+                media_path,
+                create=create,
+                state=state,
+                progress=progress,
                 heartbeat=heartbeat,
                 on_state=on_state,
-            )
+            ),
+        )
+
+    def _upload_multipart(  # noqa: PLR0913 - Resume state and its callbacks.
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        *,
+        create: bool,
+        state: str | None,
+        progress: Callable[[int], None],
+        heartbeat: Callable[[], None],
+        on_state: Callable[[str], None],
+    ) -> InternetArchiveUploadResult:
         resume = (
             InternetArchiveMultipartState.from_dict(json.loads(state))
             if state
@@ -379,8 +433,92 @@ class ArchiveGateway:
             ),
         )
 
-    @staticmethod
     def _respect_upload_limit(
+        self, client: InternetArchiveClient, identifier: str, phase: str
+    ) -> dict[str, Any] | None:
+        """Defer a write while the account's Archive task queue is full."""
+        queue = self._check_limit(client, identifier, phase)
+        limit = self.settings.archive_task_queue_limit
+        if limit <= 0 or phase not in TASK_PHASES:
+            return queue
+        backlog = self.tasks.read(
+            client.task_summary,
+            limit=limit,
+            base_delay=self.settings.archive_retry_delay,
+        )
+        if backlog is None:
+            return queue
+        queue = {
+            **(queue or {}),
+            "task_queued": backlog.queued,
+            "task_running": backlog.running,
+            "task_error": backlog.error,
+            "task_limit": limit,
+        }
+        if backlog.outstanding >= limit:
+            error = RateLimitError(
+                "Internet Archive account task backlog is at its limit",
+                service="Internet Archive",
+                service_code="SlowDown",
+                service_message=DEFERRED_PREFIX
+                + f"account task backlog {backlog.outstanding} >= {limit}",
+                request_phase=phase,
+                retry_after=backlog.retry_seconds,
+            )
+            error.__dict__["upload_queue"] = queue
+            error.__dict__["deferred_backlog"] = True
+            raise error
+        return queue
+
+    def _backlog(self, phase: str) -> TaskBacklog | None:
+        """Read the shared backlog in the managing process for a managed write."""
+        limit = self.settings.archive_task_queue_limit
+        if limit <= 0 or phase not in TASK_PHASES:
+            return None
+        return self.tasks.read(
+            self.task_summary, limit=limit, base_delay=self.settings.archive_retry_delay
+        )
+
+    def _observed[T](self, phase: str, operation: Callable[[], T]) -> T:
+        """Count queued tasks and log the backlog seen with each IA verdict."""
+        try:
+            result = operation()
+        except Exception as error:
+            cause = failure_cause(error)
+            if isinstance(cause, ServiceError):
+                if cause.retry_after is None and (hint := self.tasks.throttle_hint()):
+                    cause.retry_after = hint
+                latest = self.tasks.latest()
+                if (
+                    latest is not None
+                    and isinstance(cause, RateLimitError)
+                    and cause.service_code == "SlowDown"
+                    and not (cause.service_message or "").startswith(DEFERRED_PREFIX)
+                ):
+                    logger.warning(
+                        "Archive returned SlowDown at {} with {} outstanding "
+                        "account tasks",
+                        cause.request_phase,
+                        latest.outstanding,
+                    )
+            raise
+        self.tasks.note_write(2 if self.settings.archive_queue_derive else 1)
+        if phase == "item-create" and (latest := self.tasks.latest()) is not None:
+            logger.info(
+                "Archive created an item with {} outstanding account tasks",
+                latest.outstanding,
+            )
+        return result
+
+    def task_summary(self) -> InternetArchiveTaskSummary:
+        """Read the account's catalog task counts through Archivist."""
+        if self.managed:
+            return self._managed("task_summary", (), {})
+        with self._session() as session, self._client(session) as client:
+            return client.task_summary()
+
+    @staticmethod
+    def _check_limit(
         client: InternetArchiveClient, identifier: str, phase: str
     ) -> dict[str, Any] | None:
         """Defer a write while IA-S3 reports the account's task queue as full."""
@@ -406,8 +544,7 @@ class ArchiveGateway:
                 "Internet Archive S3 reports the account task queue is over its limit",
                 service="Internet Archive",
                 service_code="SlowDown",
-                service_message="Upload deferred before sending: "
-                + (limit.limit_reason or "over_limit"),
+                service_message=DEFERRED_PREFIX + (limit.limit_reason or "over_limit"),
                 request_phase=phase,
             )
             error.__dict__["upload_queue"] = queue
@@ -458,7 +595,26 @@ class ArchiveGateway:
         progress: Callable[[int], None],
     ) -> InternetArchiveUploadResult:
         if self.managed:
-            return self._managed("recover", (metadata, media_path), {}, progress)
+            return self._observed(
+                "file-upload",
+                lambda: self._managed(
+                    "recover",
+                    (metadata, media_path),
+                    {},
+                    progress,
+                    backlog=self._backlog("file-upload"),
+                ),
+            )
+        return self._observed(
+            "file-upload", lambda: self._recover(metadata, media_path, progress)
+        )
+
+    def _recover(
+        self,
+        metadata: FrozenArchiveMetadata,
+        media_path: Path,
+        progress: Callable[[int], None],
+    ) -> InternetArchiveUploadResult:
         with (
             media_path.open("rb") as stream,
             self._session() as session,
@@ -505,6 +661,8 @@ class ArchiveGateway:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
         progress: Callable[[int], None] | None = None,
+        *,
+        backlog: TaskBacklog | None = None,
         **callbacks: Callable[..., Any],
     ) -> Any:
         return run_managed(
@@ -514,6 +672,7 @@ class ArchiveGateway:
                 "settings": self.settings,
                 "limiter_enabled": self.upload_limiter.enabled,
                 "chunk_size": self.upload_limiter.chunk_size,
+                "task_backlog": backlog,
             },
             args,
             kwargs,
@@ -590,6 +749,10 @@ class ArchiveProcessor:
                 upload_limiter,
                 stop_controller=self.stop_controller,
                 managed=self.managed_io,
+                tasks=TaskSummaryCache(
+                    settings.archive_task_summary_ttl,
+                    listener=state.record_archive_tasks,
+                ),
             )
         self.download_root = ensure_download_root(settings.download_root)
 
