@@ -480,27 +480,34 @@ def test_write_outcomes_without_a_backlog_or_service_cause_are_not_logged(
     messages, handler = logs()
     try:
         with pytest.raises(OSError):
-            gateway._observed("item-create", lambda: (_ for _ in ()).throw(OSError()))
+            gateway._observed(
+                "item-create", lambda: (_ for _ in ()).throw(OSError()), "deferred"
+            )
         with pytest.raises(RateLimitError):
             gateway._observed(
                 "item-create",
                 lambda: (_ for _ in ()).throw(
                     RateLimitError("slow", service_code="SlowDown", retry_after=5)
                 ),
+                "deferred",
             )
-        assert gateway._observed("item-create", lambda: 1) == 1
+        assert gateway._observed("item-create", lambda: 1, "immediate") == 1
         gateway.tasks.read(lambda: summary(3), limit=400, base_delay=1)
-        assert gateway._observed("file-upload", lambda: 2) == 2
+        assert gateway._observed("file-upload", lambda: 2, "deferred") == 2
         error = RateLimitError(
             "deferred",
             service_code="SlowDown",
             service_message=archival.DEFERRED_PREFIX + "account task backlog",
         )
         with pytest.raises(RateLimitError):
-            gateway._observed("item-create", lambda: (_ for _ in ()).throw(error))
+            gateway._observed(
+                "item-create", lambda: (_ for _ in ()).throw(error), "deferred"
+            )
         with pytest.raises(ServiceError):
             gateway._observed(
-                "item-create", lambda: (_ for _ in ()).throw(ServiceError("x"))
+                "item-create",
+                lambda: (_ for _ in ()).throw(ServiceError("x")),
+                "deferred",
             )
     finally:
         archival.logger.remove(handler)
@@ -547,7 +554,7 @@ def test_managed_writes_read_the_shared_summary_in_the_managing_process(
     ]
     assert {value.outstanding for _, value in calls[1:]} == {10}
     assert isinstance(gateway.tasks, TaskSummaryCache)
-    assert gateway.tasks._added == 6
+    assert gateway.tasks._added == 3
 
 
 def test_child_gateway_uses_the_preset_reading_and_reads_summaries_directly(

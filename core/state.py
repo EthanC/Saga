@@ -55,6 +55,27 @@ from core.youtube_errors import is_access_error
 
 PUBLICATION_RETRY_BASE = 300.0
 PUBLICATION_RETRY_CAP = 3600.0
+DERIVE_STATUSES = (
+    "not_needed",
+    "pending",
+    "requested",
+    "running",
+    "paused",
+    "done",
+    "failed",
+    "unknown",
+)
+REPORTED_DERIVES = ("pending", "requested", "running", "paused", "done", "failed")
+DERIVE_FIELDS = frozenset(
+    {"derive_task_id", "derive_requested_at", "derive_completed_at", "derive_raw_state"}
+)
+DERIVE_ALERT_AGE = 86_400.0
+# Derive failures known before Saga tracked derives, by item identifier.
+KNOWN_DERIVE_FAILURES = {
+    "riyadhfalcons-vs-royalravens-major-i-tournament-elimination-round-1-1jd2l2k6ZQY": (
+        5765169292
+    )
+}
 
 
 def utcnow() -> datetime:
@@ -206,6 +227,13 @@ class ArchiveProgress(SQLModel, table=True):
     error_headers: str | None = None
     error_queue: str | None = None
     multipart_state: str | None = None
+    derive_policy: str | None = None
+    derive_status: str | None = None
+    derive_status_at: datetime | None = None
+    derive_task_id: int | None = None
+    derive_requested_at: datetime | None = None
+    derive_completed_at: datetime | None = None
+    derive_raw_state: str | None = None
 
 
 class ArchiveJob(SQLModel, table=True):
@@ -306,6 +334,15 @@ class Report(SQLModel, table=True):
     operator_action: int = 0
     ia_tasks_outstanding: int | None = None
     ia_tasks_error: int | None = None
+    derive_policy: str | None = None
+    derives_pending: int = 0
+    derives_requested: int = 0
+    derives_running: int = 0
+    derives_paused: int = 0
+    derives_done: int = 0
+    derives_failed: int = 0
+    derive_lag_seconds: float | None = None
+    derive_failures: str | None = None
     status: str = Field(default="pending", index=True)
     attempts: int = 0
     retry_at: datetime | None = Field(default=None, index=True)
@@ -2152,6 +2189,12 @@ class StateStore:
             apply_diagnostics(progress)
             progress.failure_phase = None
             progress.updated_at = utcnow()
+            if progress.derive_status is None:
+                if progress.derive_policy == "deferred":
+                    self._set_derive_status(progress, "pending")
+                    self._queue_job(session, work.video.id, "derive")
+                elif progress.derive_policy == "never":
+                    self._set_derive_status(progress, "not_needed")
             session.add(progress)
             self._queue_job(session, work.video.id, "cleanup")
             self._queue_job(session, work.video.id, "webpage", deadline=deadline)
@@ -2300,6 +2343,9 @@ class StateStore:
             "status",
             "claimed_at",
             "retry_at",
+            # Derive state changes only through _set_derive_status.
+            "derive_status",
+            "derive_status_at",
         }
         unknown = set(values) - allowed
         if unknown:
@@ -2447,7 +2493,12 @@ class StateStore:
             return checkpoint
 
     def create_report_snapshot(
-        self, window_start: datetime, window_end: datetime, generated_at: datetime
+        self,
+        window_start: datetime,
+        window_end: datetime,
+        generated_at: datetime,
+        *,
+        derive_policy: str | None = None,
     ) -> Report:
         """Aggregate and commit one immutable report before any delivery attempt."""
         with self._write_lock, Session(self.engine) as session:
@@ -2531,6 +2582,8 @@ class StateStore:
                     operator_action=int(operator_action),
                     **self._queue_counts(session),
                     **self._task_counts(session),
+                    **self._derive_counts(session, generated_at),
+                    derive_policy=derive_policy,
                 )
                 session.add(existing)
             checkpoint = session.get(ReportCheckpoint, 1)
@@ -2544,6 +2597,22 @@ class StateStore:
             session.refresh(existing)
             session.expunge(existing)
             return existing
+
+    @staticmethod
+    def _derive_counts(session: Session, now: datetime) -> dict[str, Any]:
+        summary = _derive_summary(session, now)
+        return {
+            **{f"derives_{status}": summary[status] for status in REPORTED_DERIVES},
+            "derive_lag_seconds": summary["lag_seconds"],
+            "derive_failures": json.dumps(
+                [
+                    {"identifier": item["identifier"], "task_id": item["task_id"]}
+                    for item in summary["failures"]
+                ]
+            )
+            if summary["failures"]
+            else None,
+        }
 
     @staticmethod
     def _task_counts(session: Session) -> dict[str, Any]:
@@ -2616,6 +2685,7 @@ class StateStore:
         channel_intervals: dict[str, float] | None = None,
         include_archive: bool = True,
         youtube_cookie_generation: str | None = None,
+        derive_max_lag: float = 14 * 86_400.0,
     ) -> dict[str, Any]:
         """Measure progress, due age, and backpressure independently across lanes."""
         from core.pipeline_health import build_pipeline_health
@@ -2699,6 +2769,10 @@ class StateStore:
                     )
                 ]
             health["alerts"].extend(service_alerts)
+            if include_archive:
+                derives = _derive_summary(session, current)
+                health["derives"] = derives
+                health["alerts"].extend(_derive_alerts(derives, derive_max_lag))
             health["archive_diagnostics"] = {
                 "transfers": [
                     {
@@ -3049,6 +3123,7 @@ class StateStore:
             if session.get(SchemaMigration, 2) is not None:
                 self._recover_unsubmitted_ziggy(session)
                 self._recheck_throttled_item_creation(session)
+                self._adopt_derive_tracking(session)
                 if session.get(SchemaMigration, 3) is None:
                     session.add(SchemaMigration(version=3))
                     session.commit()
@@ -3119,6 +3194,7 @@ class StateStore:
             session.commit()
             self._recover_unsubmitted_ziggy(session)
             self._recheck_throttled_item_creation(session)
+            self._adopt_derive_tracking(session)
 
     @staticmethod
     def _recover_unsubmitted_ziggy(session: Session) -> None:
@@ -3176,6 +3252,380 @@ class StateStore:
             cls._restart_recovery_job(session, progress.video_id, delay=0)
         session.add(SchemaMigration(version=5))
         session.commit()
+
+    @classmethod
+    def _adopt_derive_tracking(cls, session: Session) -> None:
+        """Record the derive option that items written by older releases used.
+
+        Older releases sent every write without the derive opt-out. Uploaded
+        items wait for one catalog read to learn their derive state, and
+        unfinished transfers keep that option for their remaining writes.
+        """
+        # A derive state without its timestamp counts from the upload, or
+        # from now when no upload time is saved.
+        for progress in session.exec(
+            select(ArchiveProgress).where(
+                col(ArchiveProgress.derive_status).is_not(None),
+                col(ArchiveProgress.derive_status_at).is_(None),
+            )
+        ).all():
+            progress.derive_status_at = progress.media_uploaded_at or utcnow()
+            session.add(progress)
+        session.commit()
+        if session.get(SchemaMigration, 6) is not None:
+            return
+        for progress in session.exec(
+            select(ArchiveProgress).where(col(ArchiveProgress.derive_policy).is_(None))
+        ).all():
+            if progress.media_uploaded_at is not None:
+                progress.derive_policy = "immediate"
+                cls._set_derive_status(progress, "unknown")
+                # Unknown since the upload; the first item read restarts it.
+                progress.derive_status_at = progress.media_uploaded_at
+                progress.derive_task_id = KNOWN_DERIVE_FAILURES.get(
+                    progress.ia_identifier or ""
+                )
+                cls._queue_job(session, progress.video_id, "derive")
+            elif progress.status in {"upload", "uploading", "reconcile_upload"}:
+                progress.derive_policy = "immediate"
+            else:
+                continue
+            session.add(progress)
+        session.add(SchemaMigration(version=6))
+        session.commit()
+
+    @staticmethod
+    def _set_derive_status(progress: ArchiveProgress, status: str) -> None:
+        if progress.derive_status != status:
+            progress.derive_status = status
+            progress.derive_status_at = utcnow()
+
+    def uploads_due(self, now: datetime | None = None) -> bool:
+        """Return whether any original is waiting for an upload worker."""
+        current = now or utcnow()
+        with Session(self.engine) as session:
+            return (
+                session.exec(
+                    select(ArchiveProgress.video_id)
+                    .where(
+                        ArchiveProgress.status == "upload",
+                        col(ArchiveProgress.claimed_at).is_(None),
+                        col(ArchiveProgress.media_uploaded_at).is_(None),
+                        col(ArchiveProgress.maintenance_token).is_(None),
+                        col(ArchiveProgress.retry_at).is_(None)
+                        | (col(ArchiveProgress.retry_at) <= current),
+                    )
+                    .limit(1)
+                ).first()
+                is not None
+            )
+
+    def claim_derive(
+        self, mode: str, *, now: datetime | None = None
+    ) -> ArchiveWork | None:
+        """Claim one due derive job for submission, confirmation, or adoption.
+
+        ``submit`` claims only items waiting for their first derive request,
+        oldest upload first, and never a failed derive. ``check`` claims
+        requested or observed derives. ``reconcile`` claims items uploaded by
+        older releases whose derive state has never been read.
+        """
+        current = now or utcnow()
+        status = col(ArchiveProgress.derive_status)
+        observed = col(ArchiveProgress.derive_task_id).is_not(None) | col(
+            ArchiveProgress.derive_requested_at
+        ).is_not(None)
+        condition = {
+            "submit": status == "pending",
+            "check": status.in_(("requested", "running", "paused"))
+            | ((status == "unknown") & observed),
+            "reconcile": (status == "unknown") & ~observed,
+        }[mode]
+        order = (
+            col(ArchiveProgress.media_uploaded_at)
+            if mode == "submit"
+            else col(ArchiveJob.retry_at)
+        )
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            row = session.exec(
+                select(ArchiveJob, ArchiveProgress)
+                .join(
+                    ArchiveProgress,
+                    col(ArchiveProgress.video_id) == col(ArchiveJob.video_id),
+                )
+                .where(
+                    ArchiveJob.kind == "derive",
+                    col(ArchiveJob.status).in_(("pending", "waiting")),
+                    col(ArchiveJob.claim_token).is_(None),
+                    col(ArchiveJob.retry_at).is_(None)
+                    | (col(ArchiveJob.retry_at) <= current),
+                    col(ArchiveProgress.ia_identifier).is_not(None),
+                    condition,
+                )
+                .order_by(order, col(ArchiveJob.video_id))
+                .limit(1)
+            ).first()
+            if row is None:
+                session.commit()
+                return None
+            job, progress = row
+            video = session.get(Video, job.video_id)
+            assert video is not None
+            channel = session.get(Channel, video.channel_id)
+            assert channel is not None
+            job.claim_token = str(uuid4())
+            job.claimed_at = current
+            if mode == "submit":
+                job.attempts += 1
+            session.add(job)
+            session.commit()
+            for item in (job, progress, video, channel):
+                session.refresh(item)
+                session.expunge(item)
+            return ArchiveWork(progress, video, channel, job)
+
+    def finish_derive(  # noqa: PLR0913 - One derive outcome and its diagnostics.
+        self,
+        work: ArchiveWork,
+        *,
+        job_status: str,
+        retry_at: datetime | None,
+        derive_status: str | None = None,
+        error: str | None = None,
+        reset_attempts: bool = False,
+        error_kind: str | None = None,
+        error_status: int | None = None,
+        error_phase: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        error_request_id: str | None = None,
+        error_headers: str | None = None,
+        error_queue: str | None = None,
+        **facts: Any,
+    ) -> None:
+        """Release one derive claim and save what the Archive reported."""
+        assert work.job is not None
+        unknown = set(facts) - DERIVE_FIELDS
+        if unknown:
+            raise ValueError(f"Unknown derive fields: {sorted(unknown)}")
+        with self._write_lock, Session(self.engine) as session:
+            job = session.get(ArchiveJob, (work.video.id, "derive"))
+            if job is None or job.claim_token != work.job.claim_token:
+                raise RuntimeError("derive claim no longer belongs to this worker")
+            progress = session.get(ArchiveProgress, work.video.id)
+            assert progress is not None
+            if derive_status is not None:
+                self._set_derive_status(progress, derive_status)
+            for name, value in facts.items():
+                setattr(progress, name, value)
+            job.status = job_status
+            job.retry_at = retry_at
+            job.claim_token = None
+            job.claimed_at = None
+            if reset_attempts:
+                job.attempts = 0
+            job.last_error = redact_diagnostics(error)[:2000] if error else None
+            job.error_kind, job.error_status, job.error_phase = (
+                error_kind,
+                error_status,
+                error_phase,
+            )
+            apply_diagnostics(
+                job,
+                error_code=error_code,
+                error_message=error_message,
+                error_request_id=error_request_id,
+                error_headers=error_headers,
+                error_queue=error_queue,
+            )
+            job.updated_at = progress.updated_at = utcnow()
+            session.add_all((job, progress))
+            session.commit()
+
+    def reset_failed_derives(self, selectors: Sequence[str] = ()) -> list[str]:
+        """Return chosen failed derives to the dispatcher for one new request.
+
+        Each selector is a video ID or Archive identifier; none selects every
+        failed derive. Returns the identifiers that were reset.
+        """
+        with self._write_lock, Session(self.engine) as session:
+            session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            statement = select(ArchiveProgress).where(
+                ArchiveProgress.derive_status == "failed"
+            )
+            if selectors:
+                statement = statement.where(
+                    col(ArchiveProgress.video_id).in_(tuple(selectors))
+                    | col(ArchiveProgress.ia_identifier).in_(tuple(selectors))
+                )
+            reset: list[str] = []
+            for progress in session.exec(
+                statement.order_by(col(ArchiveProgress.video_id))
+            ).all():
+                self._queue_job(session, progress.video_id, "derive")
+                session.flush()
+                job = session.get(ArchiveJob, (progress.video_id, "derive"))
+                assert job is not None
+                if job.claim_token is not None:
+                    continue
+                job.status = "pending"
+                job.retry_at = None
+                job.attempts = 0
+                job.last_error = None
+                job.error_kind = job.error_status = job.error_phase = None
+                apply_diagnostics(job)
+                job.updated_at = utcnow()
+                self._set_derive_status(progress, "pending")
+                progress.derive_task_id = None
+                progress.derive_requested_at = None
+                progress.derive_completed_at = None
+                progress.derive_raw_state = None
+                session.add_all((job, progress))
+                reset.append(progress.ia_identifier or progress.video_id)
+            session.commit()
+        return reset
+
+
+def _derive_summary(session: Session, now: datetime) -> dict[str, Any]:
+    """Count derive states and describe the ones that need attention."""
+    counts = dict(
+        session.exec(
+            select(
+                ArchiveProgress.derive_status, func.count(col(ArchiveProgress.video_id))
+            )
+            .where(col(ArchiveProgress.derive_status).is_not(None))
+            .group_by(ArchiveProgress.derive_status)
+        ).all()
+    )
+    oldest = session.exec(
+        select(func.min(col(ArchiveProgress.derive_status_at))).where(
+            ArchiveProgress.derive_status == "pending"
+        )
+    ).one()
+    rows = session.exec(
+        select(ArchiveProgress, ArchiveJob)
+        .join(
+            ArchiveJob,
+            (col(ArchiveJob.video_id) == col(ArchiveProgress.video_id))
+            & (col(ArchiveJob.kind) == "derive"),
+            isouter=True,
+        )
+        .where(col(ArchiveProgress.derive_status).in_(("failed", "unknown", "paused")))
+        .order_by(col(ArchiveProgress.derive_status_at), col(ArchiveProgress.video_id))
+    ).all()
+    current = _as_utc(now)
+
+    def age(progress: ArchiveProgress) -> float:
+        stamp = progress.derive_status_at
+        return (current - _as_utc(stamp)).total_seconds() if stamp else 0.0
+
+    def describe(progress: ArchiveProgress, job: ArchiveJob | None) -> dict[str, Any]:
+        return {
+            "video_id": progress.video_id,
+            "identifier": progress.ia_identifier,
+            "status": progress.derive_status,
+            "task_id": progress.derive_task_id,
+            "raw_state": progress.derive_raw_state,
+            "age_seconds": age(progress),
+            "error_kind": job.error_kind if job else None,
+            "reason": redact_diagnostics(job.last_error)[:256]
+            if job and job.last_error
+            else None,
+        }
+
+    def unread(progress: ArchiveProgress) -> bool:
+        # Older items wait for their first item read during reconciliation.
+        return (
+            progress.derive_status == "unknown"
+            and progress.derive_task_id is None
+            and progress.derive_requested_at is None
+        )
+
+    stale = [
+        describe(progress, job)
+        for progress, job in rows
+        if progress.derive_status in {"failed", "unknown"}
+        and not unread(progress)
+        and age(progress) > DERIVE_ALERT_AGE
+    ]
+    return {
+        **{status: int(counts.get(status, 0)) for status in DERIVE_STATUSES},
+        "lag_seconds": max(0.0, (current - _as_utc(oldest)).total_seconds())
+        if oldest
+        else None,
+        "failures": [
+            describe(progress, job)
+            for progress, job in rows
+            if progress.derive_status == "failed"
+        ][:10],
+        "stale_count": len(stale),
+        "unread": sum(unread(progress) for progress, _ in rows),
+        "stale": stale[:10],
+        "held": [
+            describe(progress, job)
+            for progress, job in rows
+            if progress.derive_status == "paused" and age(progress) > DERIVE_ALERT_AGE
+        ][:10],
+        "authentication": [
+            describe(progress, job)
+            for progress, job in rows
+            if progress.derive_status == "failed"
+            and job is not None
+            and job.error_kind == "authentication"
+        ][:10],
+    }
+
+
+def _derive_alerts(summary: dict[str, Any], max_lag: float) -> list[dict[str, Any]]:
+    """Alert on derives that need attention or fall behind, without failing health."""
+    alerts: list[dict[str, Any]] = []
+    if summary["authentication"]:
+        alerts.append(
+            {
+                "key": "derive:authentication",
+                "severity": "error",
+                "message": "Archive rejected a derive request; check account "
+                "credentials",
+                "details": {"derives": summary["authentication"]},
+            }
+        )
+    if summary["stale"]:
+        alerts.append(
+            {
+                "key": "derive:failed",
+                "severity": "warning",
+                "message": "derives failed or unconfirmed for more than 24 hours",
+                "details": {
+                    "count": summary["stale_count"],
+                    "derives": summary["stale"],
+                },
+            }
+        )
+    if summary["held"]:
+        alerts.append(
+            {
+                "key": "derive:paused",
+                "severity": "warning",
+                "message": "Archive has held derives for more than 24 hours",
+                "details": {"derives": summary["held"]},
+            }
+        )
+    if summary["lag_seconds"] is not None and summary["lag_seconds"] > max_lag:
+        alerts.append(
+            {
+                "key": "derive:lag",
+                "severity": "warning",
+                "message": "oldest pending derive exceeds the derive lag limit; "
+                "the derive backlog target may be too low",
+                "details": {
+                    "lag_seconds": summary["lag_seconds"],
+                    "max_lag_seconds": max_lag,
+                    "pending": summary["pending"],
+                },
+            }
+        )
+    return alerts
 
 
 def retry_delay(base: float, attempts: int) -> float:

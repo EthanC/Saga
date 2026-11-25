@@ -160,6 +160,16 @@ class SagaService:
                         workers.create_task(
                             self._partial_maintenance_loop(), name="partial-maintenance"
                         )
+                        if self.archival.derives is not None:
+                            logger.info(
+                                "Archive derive option: {} (backlog target {}{})",
+                                self.settings.archive_derive,
+                                self.settings.archive_derive_backlog_target,
+                                "; requests paused"
+                                if self.settings.archive_derive_paused
+                                else "",
+                            )
+                            workers.create_task(self._derive_loop(), name="derive")
                     await self.stop.wait()
                 finally:
                     self.request_stop()
@@ -646,6 +656,23 @@ class SagaService:
             executor, self.archival.process, work
         )
 
+    async def _derive_loop(self) -> None:
+        """Request derives while the backlog has room and confirm requested ones."""
+        assert self.archival is not None and self.archival.derives is not None
+        derives = self.archival.derives
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="saga-derive"
+        ) as executor:
+            while not self.stop.is_set():
+                try:
+                    await self._run_blocking(executor, derives.submit_round)
+                    await self._run_blocking(executor, derives.check_round)
+                except CooperativeStop:
+                    return
+                except Exception:
+                    logger.exception("Derive worker failed; continuing")
+                await self._wait(self.settings.archive_task_summary_ttl)
+
     async def _health_loop(self) -> None:
         """Publish a bounded startup or pipeline verdict independently of scans."""
         with ThreadPoolExecutor(
@@ -696,7 +723,14 @@ class SagaService:
             channel_intervals=self._channel_intervals,
             include_archive=self.archival is not None,
             youtube_cookie_generation=self._cookie_generation(),
+            derive_max_lag=self.settings.archive_derive_max_lag,
         )
+        if "derives" in health:
+            health["derives"]["policy"] = self.settings.archive_derive
+            health["derives"]["backlog_target"] = (
+                self.settings.archive_derive_backlog_target
+            )
+            health["derives"]["requests_paused"] = self.settings.archive_derive_paused
         publication_started = self._publication_started
         if publication_started is not None and (
             time.monotonic() - publication_started
@@ -856,7 +890,12 @@ class SagaService:
                     )
                     if window is not None:
                         report = self.state.create_report_snapshot(
-                            window.start, window.end, now
+                            window.start,
+                            window.end,
+                            now,
+                            derive_policy=self.settings.archive_derive
+                            if self.settings.media_archival_enabled
+                            else None,
                         )
                         logger.info(
                             "Generated archival report for {} to {}",

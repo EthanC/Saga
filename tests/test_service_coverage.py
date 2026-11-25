@@ -82,7 +82,7 @@ def test_run_starts_named_channel_workers(
         (),
         store,
         YouTubeClient(),
-        archival=cast(Any, SimpleNamespace(process=lambda _: None)),
+        archival=cast(Any, SimpleNamespace(process=lambda _: None, derives=object())),
     )
     monitored = MonitoredChannel(CHANNEL, 1, frozenset({"video"}))
     names: list[str | None] = []
@@ -104,12 +104,14 @@ def test_run_starts_named_channel_workers(
     monkeypatch.setattr(service, "_health_loop", worker)
     monkeypatch.setattr(service, "_publication_loop", worker)
     monkeypatch.setattr(service, "_partial_maintenance_loop", worker)
+    monkeypatch.setattr(service, "_derive_loop", worker)
     monkeypatch.setattr(service_module, "run_backup_scheduler", worker)
     service.stop.set()
 
     asyncio.run(service.run())
 
     assert set(names) == {
+        "derive",
         f"poll:{CHANNEL.id}",
         f"history:{CHANNEL.id}",
         "discord",
@@ -206,7 +208,7 @@ def test_report_loop_generates_and_suppresses_empty_report(
         def initialize_report_checkpoint(self, end: datetime, schedule: str) -> Any:
             return SimpleNamespace(last_window_end=end), False
 
-        def create_report_snapshot(self, *args: Any) -> Report:
+        def create_report_snapshot(self, *args: Any, **kwargs: Any) -> Report:
             return item
 
         def claim_report(self, now: datetime) -> Report:

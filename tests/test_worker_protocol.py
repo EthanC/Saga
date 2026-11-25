@@ -349,7 +349,7 @@ def test_managed_multipart_keeps_resume_callbacks_in_the_parent(
     assert (method, args[1], kwargs) == (
         "upload_multipart",
         tmp_path,
-        {"create": False, "state": "saved"},
+        {"create": False, "state": "saved", "derive": "deferred"},
     )
     assert {"progress", "heartbeat", "on_state"} <= set(callbacks)
     callbacks["on_state"]("next")

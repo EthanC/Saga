@@ -2,6 +2,7 @@
 
 import asyncio
 import signal
+import sys
 from pathlib import Path
 
 from filelock import FileLock, Timeout
@@ -10,6 +11,7 @@ from loguru import logger
 from core.bandwidth import ByteLimiter
 from core.config import load_logging_settings, load_settings, load_youtube_configs
 from core.logging import bind_stop_controller, configure_logging
+from core.maintenance import run_command
 from core.service import SagaService
 from core.shutdown import CooperativeStop, StopController
 from core.state import StateStore
@@ -94,6 +96,8 @@ async def start() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(run_command(PROJECT_ROOT, sys.argv[1:]))
     try:
         asyncio.run(start())
     except KeyboardInterrupt:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -66,6 +67,8 @@ def report_has_activity(report: Report) -> bool:
             report.validation_failed,
             report.webpage_pending,
             report.webpage_failed,
+            report.derives_pending,
+            report.derives_failed,
         )
     )
 
@@ -159,6 +162,7 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
                 if report.ia_tasks_outstanding is not None
                 else []
             ),
+            *_derive_lines(report),
         ]
     )
     footer = Markdown.subtext(
@@ -195,6 +199,37 @@ async def send_report(report: Report, webhook_url: str, timeout: float) -> str:
     if not isinstance(message_id, str) or not message_id:
         raise RuntimeError("Discord report delivery returned no message ID")
     return message_id
+
+
+def _derive_lines(report: Report) -> list[str]:
+    """Describe derive progress and each failed derive needing follow-up."""
+    if report.derive_policy is None:
+        return []
+    lag = (
+        f" | oldest pending {format_age(report.derive_lag_seconds)}"
+        if report.derive_lag_seconds is not None
+        else ""
+    )
+    failures = json.loads(report.derive_failures) if report.derive_failures else []
+    return [
+        f"Derives ({report.derive_policy}): {report.derives_pending:,} pending, "
+        f"{report.derives_requested:,} requested, {report.derives_running:,} running, "
+        f"{report.derives_paused:,} paused, {report.derives_done:,} done, "
+        f"{report.derives_failed:,} failed{lag}",
+        *(
+            f"Failed derive: {Markdown.inline_code(item['identifier'])}"
+            + (f" (task {item['task_id']})" if item["task_id"] else "")
+            for item in failures
+        ),
+    ]
+
+
+def format_age(seconds: float) -> str:
+    """Format a duration as whole days, hours, or minutes."""
+    for unit, size in (("d", 86_400), ("h", 3_600)):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return f"{int(seconds // 60)}m"
 
 
 def format_bytes(value: int) -> str:

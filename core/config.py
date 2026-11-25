@@ -27,6 +27,9 @@ DISCORD_WEBHOOK_HOSTS = frozenset(
     {"discord.com", "www.discord.com", "canary.discord.com", "ptb.discord.com"}
 )
 ContentType = Literal["video", "short", "livestream"]
+DerivePolicy = Literal["deferred", "immediate", "never"]
+DERIVE_POLICIES: tuple[DerivePolicy, ...] = ("deferred", "immediate", "never")
+DURATION_UNITS = {"s": 1, "m": 60, "h": 3_600, "d": 86_400}
 ALL_CONTENT_TYPES: tuple[ContentType, ...] = ("video", "short", "livestream")
 LOG_LEVELS = frozenset(
     {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
@@ -124,7 +127,13 @@ class Settings:
     archive_request_timeout: float = 60.0
     archive_poll_timeout: float = 900.0
     archive_poll_interval: float = 5.0
-    archive_queue_derive: bool = True
+    archive_derive: DerivePolicy = "deferred"
+    archive_derive_backlog_target: int = 20
+    archive_derive_submit_interval: float = 5.0
+    archive_derive_poll_interval: float = 900.0
+    archive_derive_max_lag: float = 14 * 86_400.0
+    archive_derive_stale_days: float = 7.0
+    archive_derive_paused: bool = False
     archive_interactive_priority: bool = True
     archive_task_queue_limit: int = 0
     archive_task_summary_ttl: float = 60.0
@@ -376,7 +385,21 @@ def load_settings(project_root: Path) -> Settings:
         archive_request_timeout=archive_request_timeout,
         archive_poll_timeout=archive_poll_timeout,
         archive_poll_interval=archive_poll_interval,
-        archive_queue_derive=env.bool("SAGA_ARCHIVE_QUEUE_DERIVE", True),
+        archive_derive=_derive_policy(env),
+        archive_derive_backlog_target=_nonnegative_env_int(
+            env, "SAGA_ARCHIVE_DERIVE_BACKLOG_TARGET", 20
+        ),
+        archive_derive_submit_interval=_nonnegative_env_float(
+            env, "SAGA_ARCHIVE_DERIVE_SUBMIT_INTERVAL", 5.0
+        ),
+        archive_derive_poll_interval=_positive_env_float(
+            env, "SAGA_ARCHIVE_DERIVE_POLL_INTERVAL", 900.0
+        ),
+        archive_derive_max_lag=_duration(env, "SAGA_ARCHIVE_DERIVE_MAX_LAG", "14d"),
+        archive_derive_stale_days=_positive_env_float(
+            env, "SAGA_ARCHIVE_DERIVE_STALE_DAYS", 7.0
+        ),
+        archive_derive_paused=env.bool("SAGA_ARCHIVE_DERIVE_PAUSED", False),
         archive_interactive_priority=env.bool(
             "SAGA_ARCHIVE_INTERACTIVE_PRIORITY", True
         ),
@@ -588,6 +611,33 @@ def _positive_env_float(env: Env, name: str, default: float) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive finite number")
     return value
+
+
+def _nonnegative_env_float(env: Env, name: str, default: float) -> float:
+    value = env.float(name, default)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a non-negative finite number")
+    return value
+
+
+def _derive_policy(env: Env) -> DerivePolicy:
+    value = env.str("SAGA_ARCHIVE_DERIVE", "deferred").strip().lower()
+    for policy in DERIVE_POLICIES:
+        if value == policy:
+            return policy
+    raise ValueError(
+        "SAGA_ARCHIVE_DERIVE must be one of: " + ", ".join(DERIVE_POLICIES)
+    )
+
+
+def _duration(env: Env, name: str, default: str) -> float:
+    """Read seconds, or a number with an s, m, h, or d suffix."""
+    value = env.str(name, default).strip().lower()
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([smhd]?)", value)
+    seconds = float(match[1]) * DURATION_UNITS[match[2] or "s"] if match else 0.0
+    if seconds <= 0:
+        raise ValueError(f"{name} must be a positive duration such as 3600, 12h or 14d")
+    return seconds
 
 
 def _validate_cron_schedule(

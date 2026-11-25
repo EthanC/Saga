@@ -329,7 +329,9 @@ def test_large_original_uploads_in_parts_and_reports_progress(
     ]
     assert sent[0] == 0 and sent[1:] == sorted(sent[1:]) and 0 < max(sent) <= len(MEDIA)
     assert archive.headers["complete"]["x-archive-interactive-priority"] == "1"
-    assert "x-archive-queue-derive" not in archive.headers["complete"]
+    # The default defers the derive, so the completing write opts out.
+    assert archive.headers["complete"]["x-archive-queue-derive"] == "0"
+    assert row.derive_policy == "deferred" and row.derive_status == "pending"
     store.close()
 
 
@@ -345,19 +347,21 @@ def test_originals_below_the_threshold_keep_the_single_transfer(
     store.close()
 
 
+@pytest.mark.parametrize("derive", ["deferred", "immediate", "never"])
 def test_settings_reach_every_multipart_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, derive: str
 ) -> None:
     store, _, _, archive = seed(tmp_path, monkeypatch)
-    attempt(
-        store, tmp_path, archive_queue_derive=False, archive_interactive_priority=False
-    )
+    attempt(store, tmp_path, archive_derive=derive, archive_interactive_priority=False)
     writes = ["item-create", "initiate", "part:1", "part:2", "part:3", "complete"]
     assert all(
         "x-archive-interactive-priority" not in archive.headers[label]
         for label in writes
     )
-    assert archive.headers["complete"]["x-archive-queue-derive"] == "0"
+    if derive == "immediate":
+        assert "x-archive-queue-derive" not in archive.headers["complete"]
+    else:
+        assert archive.headers["complete"]["x-archive-queue-derive"] == "0"
     store.close()
 
 

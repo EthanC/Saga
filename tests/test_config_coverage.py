@@ -43,7 +43,13 @@ SETTING_NAMES = (
     "SAGA_ARCHIVE_REQUEST_TIMEOUT",
     "SAGA_ARCHIVE_POLL_TIMEOUT",
     "SAGA_ARCHIVE_POLL_INTERVAL",
-    "SAGA_ARCHIVE_QUEUE_DERIVE",
+    "SAGA_ARCHIVE_DERIVE",
+    "SAGA_ARCHIVE_DERIVE_BACKLOG_TARGET",
+    "SAGA_ARCHIVE_DERIVE_SUBMIT_INTERVAL",
+    "SAGA_ARCHIVE_DERIVE_POLL_INTERVAL",
+    "SAGA_ARCHIVE_DERIVE_MAX_LAG",
+    "SAGA_ARCHIVE_DERIVE_STALE_DAYS",
+    "SAGA_ARCHIVE_DERIVE_PAUSED",
     "SAGA_ARCHIVE_INTERACTIVE_PRIORITY",
     "SAGA_ARCHIVE_TASK_QUEUE_LIMIT",
     "SAGA_ARCHIVE_TASK_SUMMARY_TTL",
@@ -202,7 +208,13 @@ def test_load_settings_accepts_all_optional_values(
         "SAGA_ARCHIVE_REQUEST_TIMEOUT": "2",
         "SAGA_ARCHIVE_POLL_TIMEOUT": "3",
         "SAGA_ARCHIVE_POLL_INTERVAL": "4",
-        "SAGA_ARCHIVE_QUEUE_DERIVE": "false",
+        "SAGA_ARCHIVE_DERIVE": "Never",
+        "SAGA_ARCHIVE_DERIVE_BACKLOG_TARGET": "0",
+        "SAGA_ARCHIVE_DERIVE_SUBMIT_INTERVAL": "0",
+        "SAGA_ARCHIVE_DERIVE_POLL_INTERVAL": "60",
+        "SAGA_ARCHIVE_DERIVE_MAX_LAG": "12h",
+        "SAGA_ARCHIVE_DERIVE_STALE_DAYS": "2.5",
+        "SAGA_ARCHIVE_DERIVE_PAUSED": "true",
         "SAGA_ARCHIVE_INTERACTIVE_PRIORITY": "false",
         "SAGA_ARCHIVE_TASK_QUEUE_LIMIT": "400",
         "SAGA_ARCHIVE_TASK_SUMMARY_TTL": "30",
@@ -237,7 +249,13 @@ def test_load_settings_accepts_all_optional_values(
     assert result.log_discord_level == "ERROR"
     assert result.notification_timeout == 2.5
     assert result.archive_workers == 4
-    assert result.archive_queue_derive is False
+    assert result.archive_derive == "never"
+    assert result.archive_derive_backlog_target == 0
+    assert result.archive_derive_submit_interval == 0
+    assert result.archive_derive_poll_interval == 60
+    assert result.archive_derive_max_lag == 12 * 3600
+    assert result.archive_derive_stale_days == 2.5
+    assert result.archive_derive_paused is True
     assert result.archive_interactive_priority is False
     assert result.archive_task_queue_limit == 400
     assert result.archive_task_summary_ttl == 30
@@ -266,7 +284,9 @@ def test_load_settings_discovers_default_cookies(
 
     assert result.config_path == config_directory / "config.toml"
     assert result.youtube_cookies_path == cookies
-    assert result.archive_queue_derive is True
+    assert result.archive_derive == "deferred"
+    assert result.archive_derive_stale_days == 7
+    assert result.archive_derive_paused is False
     assert result.archive_interactive_priority is True
     assert result.archive_multipart_threshold == 0
     assert result.archive_multipart_part_size == 512 * 1024**2
@@ -293,7 +313,9 @@ def test_example_environment_preserves_container_paths(
     assert result.data_path == Path(paths["SAGA_DATA_PATH"])
     assert result.healthcheck_file == Path(paths["SAGA_HEALTHCHECK_FILE"])
     assert result.max_data_bytes == 0
-    assert result.archive_queue_derive is True
+    assert result.archive_derive == "deferred"
+    assert result.archive_derive_stale_days == 7
+    assert result.archive_derive_paused is False
     assert result.archive_interactive_priority is True
     assert result.archive_multipart_threshold == 0
     assert result.archive_multipart_part_size == 512 * 1024**2
@@ -341,7 +363,17 @@ def test_backup_schedule_requires_a_future_occurrence(
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": ""}, "SAGA_UPLOAD_BYTES_PER_SECOND"),
         ({"SAGA_UPLOAD_BYTES_PER_SECOND": "fast"}, "SAGA_UPLOAD_BYTES_PER_SECOND"),
         ({"SAGA_ARCHIVE_RETRY_DELAY": "0"}, "positive finite number"),
-        ({"SAGA_ARCHIVE_QUEUE_DERIVE": "maybe"}, "SAGA_ARCHIVE_QUEUE_DERIVE"),
+        ({"SAGA_ARCHIVE_DERIVE": "later"}, "one of: deferred, immediate, never"),
+        ({"SAGA_ARCHIVE_DERIVE": ""}, "one of: deferred, immediate, never"),
+        ({"SAGA_ARCHIVE_DERIVE_BACKLOG_TARGET": "-1"}, "DERIVE_BACKLOG_TARGET"),
+        ({"SAGA_ARCHIVE_DERIVE_SUBMIT_INTERVAL": "-1"}, "non-negative finite"),
+        ({"SAGA_ARCHIVE_DERIVE_SUBMIT_INTERVAL": "nan"}, "invalid"),
+        ({"SAGA_ARCHIVE_DERIVE_POLL_INTERVAL": "0"}, "positive finite number"),
+        ({"SAGA_ARCHIVE_DERIVE_MAX_LAG": "0"}, "positive duration"),
+        ({"SAGA_ARCHIVE_DERIVE_STALE_DAYS": "0"}, "positive finite number"),
+        ({"SAGA_ARCHIVE_DERIVE_PAUSED": "maybe"}, "SAGA_ARCHIVE_DERIVE_PAUSED"),
+        ({"SAGA_ARCHIVE_DERIVE_MAX_LAG": "2w"}, "positive duration"),
+        ({"SAGA_ARCHIVE_DERIVE_MAX_LAG": "-1d"}, "positive duration"),
         ({"SAGA_ARCHIVE_MULTIPART_THRESHOLD": "-1"}, "MULTIPART_THRESHOLD"),
         ({"SAGA_ARCHIVE_TASK_QUEUE_LIMIT": "-1"}, "SAGA_ARCHIVE_TASK_QUEUE_LIMIT"),
         ({"SAGA_ARCHIVE_TASK_SUMMARY_TTL": "0"}, "positive finite number"),
@@ -426,3 +458,60 @@ def test_bandwidth_defaults_and_process_environment_precedence(
     result = config.load_settings(tmp_path)
     assert result.download_bytes_per_second == 30
     assert result.upload_bytes_per_second == 0
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, "deferred"),
+        ("deferred", "deferred"),
+        ("IMMEDIATE", "immediate"),
+        (" Never ", "never"),
+    ],
+)
+def test_derive_option_is_case_insensitive_and_defaults_to_deferred(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_settings: None,
+    value: str | None,
+    expected: str,
+) -> None:
+    if value is not None:
+        monkeypatch.setenv("SAGA_ARCHIVE_DERIVE", value)
+    assert config.load_settings(tmp_path).archive_derive == expected
+
+
+@pytest.mark.parametrize("value", ["false", "true", "maybe"])
+def test_removed_derive_setting_has_no_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean_settings: None, value: str
+) -> None:
+    # The variable SAGA_ARCHIVE_DERIVE replaced is ignored without a warning.
+    monkeypatch.setenv("SAGA_ARCHIVE_QUEUE" + "_DERIVE", value)
+    result = config.load_settings(tmp_path)
+    assert result.archive_derive == "deferred"
+    assert result.archive_derive_stale_days == 7
+    assert result.archive_derive_paused is False
+    monkeypatch.setenv("SAGA_ARCHIVE_DERIVE", "immediate")
+    assert config.load_settings(tmp_path).archive_derive == "immediate"
+
+
+@pytest.mark.parametrize(
+    "value,seconds",
+    [
+        ("90", 90),
+        ("1.5", 1.5),
+        ("30s", 30),
+        ("5m", 300),
+        ("2h", 7200),
+        ("14D", 1209600),
+    ],
+)
+def test_derive_max_lag_accepts_seconds_or_a_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_settings: None,
+    value: str,
+    seconds: float,
+) -> None:
+    monkeypatch.setenv("SAGA_ARCHIVE_DERIVE_MAX_LAG", value)
+    assert config.load_settings(tmp_path).archive_derive_max_lag == seconds

@@ -31,6 +31,8 @@ from archivist import (
     InternetArchiveRecoveryConflictError,
     InternetArchiveRecoveryDeferredError,
     InternetArchiveSuccessStatus,
+    InternetArchiveTaskStatus,
+    InternetArchiveTaskSubmission,
     InternetArchiveTaskSummary,
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
@@ -45,11 +47,17 @@ from archivist import (
 from loguru import logger
 from niquests import Session
 
+from core.archive_derives import DeriveDispatcher
 from core.archive_errors import RecoveryConflictError, failure_cause, failure_facts
 from core.archive_retry import retry_hint, retryable_error
 from core.archive_tasks import TaskBacklog, TaskSource, TaskSummaryCache
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
-from core.config import MULTIPART_MAX_PART_SIZE, MULTIPART_MAX_PARTS, Settings
+from core.config import (
+    MULTIPART_MAX_PART_SIZE,
+    MULTIPART_MAX_PARTS,
+    DerivePolicy,
+    Settings,
+)
 from core.logging import redact_diagnostics
 from core.progress import DownloadCheckpoint
 from core.shutdown import CooperativeStop, StopController
@@ -245,20 +253,25 @@ class ArchiveGateway:
         media_path: Path,
         *,
         progress: Callable[[int], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult:
+        derive = derive or self.settings.archive_derive
         if self.managed:
             return self._observed(
                 "item-create",
                 lambda: self._managed(
                     "upload",
                     (metadata, media_path),
-                    {},
+                    {"derive": derive},
                     progress,
                     backlog=self._backlog("item-create"),
                 ),
+                derive,
             )
         return self._observed(
-            "item-create", lambda: self._upload(metadata, media_path, progress)
+            "item-create",
+            lambda: self._upload(metadata, media_path, progress, derive),
+            derive,
         )
 
     def _upload(
@@ -266,8 +279,9 @@ class ArchiveGateway:
         metadata: FrozenArchiveMetadata,
         media_path: Path,
         progress: Callable[[int], None],
+        derive: DerivePolicy,
     ) -> InternetArchiveUploadResult:
-        options = self._options(metadata)
+        options = self._options(metadata, derive)
         with (
             media_path.open("rb") as stream,
             self._session() as session,
@@ -284,7 +298,9 @@ class ArchiveGateway:
                 lambda: client.upload([file], options, wait=False), queue
             )
 
-    def _options(self, metadata: FrozenArchiveMetadata) -> InternetArchiveUploadOptions:
+    def _options(
+        self, metadata: FrozenArchiveMetadata, derive: DerivePolicy
+    ) -> InternetArchiveUploadOptions:
         return InternetArchiveUploadOptions(
             identifier=metadata.identifier,
             title=_upload_text(metadata.title) or metadata.identifier,
@@ -306,7 +322,7 @@ class ArchiveGateway:
                 "source": metadata.source_url,
                 "saga_operation_id": metadata.operation_id,
             },
-            queue_derive=self.settings.archive_queue_derive,
+            queue_derive=derive == "immediate",
             interactive_priority=self.settings.archive_interactive_priority,
         )
 
@@ -320,21 +336,24 @@ class ArchiveGateway:
         progress: Callable[[int], None],
         heartbeat: Callable[[], None],
         on_state: Callable[[str], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult:
         """Send one original in resumable parts, saving each state before going on."""
         phase = "item-create" if create and state is None else "file-upload"
+        derive = derive or self.settings.archive_derive
         if self.managed:
             return self._observed(
                 phase,
                 lambda: self._managed(
                     "upload_multipart",
                     (metadata, media_path),
-                    {"create": create, "state": state},
+                    {"create": create, "state": state, "derive": derive},
                     progress,
                     backlog=self._backlog(phase),
                     heartbeat=heartbeat,
                     on_state=on_state,
                 ),
+                derive,
             )
         return self._observed(
             phase,
@@ -346,7 +365,9 @@ class ArchiveGateway:
                 progress=progress,
                 heartbeat=heartbeat,
                 on_state=on_state,
+                derive=derive,
             ),
+            derive,
         )
 
     def _upload_multipart(  # noqa: PLR0913 - Resume state and its callbacks.
@@ -359,6 +380,7 @@ class ArchiveGateway:
         progress: Callable[[int], None],
         heartbeat: Callable[[], None],
         on_state: Callable[[str], None],
+        derive: DerivePolicy,
     ) -> InternetArchiveUploadResult:
         resume = (
             InternetArchiveMultipartState.from_dict(json.loads(state))
@@ -402,7 +424,7 @@ class ArchiveGateway:
                 if create:
                     return client.upload_multipart(
                         file,
-                        self._options(metadata),
+                        self._options(metadata, derive),
                         part_size=part_size,
                         state=resume,
                         on_state=save,
@@ -415,7 +437,7 @@ class ArchiveGateway:
                         "saga_operation_id": metadata.operation_id,
                     },
                     part_size=part_size,
-                    queue_derive=self.settings.archive_queue_derive,
+                    queue_derive=derive == "immediate",
                     interactive_priority=self.settings.archive_interactive_priority,
                     state=resume,
                     on_state=save,
@@ -479,7 +501,9 @@ class ArchiveGateway:
             self.task_summary, limit=limit, base_delay=self.settings.archive_retry_delay
         )
 
-    def _observed[T](self, phase: str, operation: Callable[[], T]) -> T:
+    def _observed[T](
+        self, phase: str, operation: Callable[[], T], derive: DerivePolicy
+    ) -> T:
         """Count queued tasks and log the backlog seen with each IA verdict."""
         try:
             result = operation()
@@ -502,7 +526,7 @@ class ArchiveGateway:
                         latest.outstanding,
                     )
             raise
-        self.tasks.note_write(2 if self.settings.archive_queue_derive else 1)
+        self.tasks.note_write(2 if derive == "immediate" else 1)
         if phase == "item-create" and (latest := self.tasks.latest()) is not None:
             logger.info(
                 "Archive created an item with {} outstanding account tasks",
@@ -516,6 +540,31 @@ class ArchiveGateway:
             return self._managed("task_summary", (), {})
         with self._session() as session, self._client(session) as client:
             return client.task_summary()
+
+    def queue_derive(self, identifier: str) -> InternetArchiveTaskSubmission:
+        """Queue one derive unless the item already has one pending."""
+        if self.managed:
+            submission = self._managed("queue_derive", (identifier,), {})
+        else:
+            with self._session() as session, self._client(session) as client:
+                submission = client.queue_derive(identifier)
+        if not submission.already_pending:
+            self.tasks.note_write(1)
+        return submission
+
+    def task_status(self, task_id: int) -> InternetArchiveTaskStatus:
+        """Read one catalog task's live or finished state."""
+        if self.managed:
+            return self._managed("task_status", (task_id,), {})
+        with self._session() as session, self._client(session) as client:
+            return client.task_status(task_id)
+
+    def get_item(self, identifier: str) -> InternetArchiveItem:
+        """Read one item's files and outstanding catalog tasks."""
+        if self.managed:
+            return self._managed("get_item", (identifier,), {})
+        with self._session() as session, self._client(session) as client:
+            return client.get_item(identifier)
 
     @staticmethod
     def _check_limit(
@@ -593,20 +642,25 @@ class ArchiveGateway:
         media_path: Path,
         *,
         progress: Callable[[int], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult:
+        derive = derive or self.settings.archive_derive
         if self.managed:
             return self._observed(
                 "file-upload",
                 lambda: self._managed(
                     "recover",
                     (metadata, media_path),
-                    {},
+                    {"derive": derive},
                     progress,
                     backlog=self._backlog("file-upload"),
                 ),
+                derive,
             )
         return self._observed(
-            "file-upload", lambda: self._recover(metadata, media_path, progress)
+            "file-upload",
+            lambda: self._recover(metadata, media_path, progress, derive),
+            derive,
         )
 
     def _recover(
@@ -614,6 +668,7 @@ class ArchiveGateway:
         metadata: FrozenArchiveMetadata,
         media_path: Path,
         progress: Callable[[int], None],
+        derive: DerivePolicy,
     ) -> InternetArchiveUploadResult:
         with (
             media_path.open("rb") as stream,
@@ -637,7 +692,7 @@ class ArchiveGateway:
                         "saga_operation_id": metadata.operation_id,
                     },
                     expected_size=media_path.stat().st_size,
-                    queue_derive=self.settings.archive_queue_derive,
+                    queue_derive=derive == "immediate",
                     interactive_priority=self.settings.archive_interactive_priority,
                 ),
                 queue,
@@ -693,6 +748,7 @@ class ArchiveBackend(Protocol):
         media_path: Path,
         *,
         progress: Callable[[int], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult: ...
     def inspect(
         self,
@@ -709,6 +765,7 @@ class ArchiveBackend(Protocol):
         media_path: Path,
         *,
         progress: Callable[[int], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult: ...
     def upload_multipart(  # noqa: PLR0913
         self,
@@ -720,6 +777,7 @@ class ArchiveBackend(Protocol):
         progress: Callable[[int], None],
         heartbeat: Callable[[], None],
         on_state: Callable[[str], None],
+        derive: DerivePolicy | None = None,
     ) -> InternetArchiveUploadResult: ...
     def submit_page(self, url: str) -> str: ...
     def page_status(self, job_id: str) -> InternetArchiveCaptureStatus: ...
@@ -754,6 +812,11 @@ class ArchiveProcessor:
                     listener=state.record_archive_tasks,
                 ),
             )
+        self.derives = (
+            DeriveDispatcher(settings, state, self.gateway, self.stop_controller)
+            if isinstance(self.gateway, ArchiveGateway)
+            else None
+        )
         self.download_root = ensure_download_root(settings.download_root)
 
     def process(self, work: ArchiveWork) -> None:
@@ -1035,9 +1098,13 @@ class ArchiveProcessor:
             raise RecoveryConflictError(
                 "upload media is outside its owned staging operation"
             )
+        # Every write to one item must agree on derive, so the first write's
+        # option is stored and reused by resumes and recovery transfers.
+        derive = work.progress.derive_policy or self.settings.archive_derive
         self.state.update_archive(
             work.video.id,
             status="uploading",
+            derive_policy=derive,
             upload_started_at=utcnow(),
             transfer_bytes=0,
             transfer_progress_at=utcnow(),
@@ -1086,6 +1153,7 @@ class ArchiveProcessor:
                     progress=progress,
                     heartbeat=heartbeat,
                     on_state=save_state,
+                    derive=cast(DerivePolicy, derive),
                 )
             else:
                 operation = (
@@ -1093,7 +1161,9 @@ class ArchiveProcessor:
                     if work.progress.upload_mode == "recover"
                     else self._gateway().upload
                 )
-                result = operation(frozen, path, progress=progress)
+                result = operation(
+                    frozen, path, progress=progress, derive=cast(DerivePolicy, derive)
+                )
         except InternetArchiveUploadError as error:
             if self._acknowledged(work, error.result):
                 self._acknowledge(work, error.result)
