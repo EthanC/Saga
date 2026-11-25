@@ -250,7 +250,9 @@ class DeriveDispatcher:
             seconds=self.settings.archive_derive_poll_interval
         )
         try:
-            if progress.derive_task_id is None or progress.derive_status == "unknown":
+            # Saga's own task decides the outcome; the item's task list keeps
+            # older failed derives that say nothing about this one.
+            if progress.derive_task_id is None:
                 outcome = self._from_item(work)
             else:
                 try:
@@ -407,7 +409,10 @@ class DeriveDispatcher:
                 "derive_raw_state": task.raw_state,
             }
         failed = [task for task in item.error_tasks if task.command == DERIVE_COMMAND]
-        if failed:
+        # Item tasks carry no task ID or submit time. With a task ID of its own,
+        # Saga learns of a failure only from the task API, so a derive that
+        # failed before a retry cannot fail the retried one.
+        if failed and work.progress.derive_task_id is None:
             return {
                 "derive_status": "failed",
                 "derive_raw_state": failed[0].raw_state or failed[0].error,

@@ -674,7 +674,10 @@ def test_finished_derive_is_done_only_with_derivative_files(
     video_id = requested(store, tmp_path)
     identifier = saved(store, video_id).ia_identifier
     archive = Archive()
-    archive.statuses = [status(InternetArchiveTaskState.FINISHED, marker=1_700_000_000)]
+    archive.statuses = [
+        status(InternetArchiveTaskState.FINISHED, marker=1_700_000_000),
+        status(InternetArchiveTaskState.FINISHED, marker=1_700_000_000),
+    ]
     archive.items = [item(), item(derived=True)]
     derives = dispatcher(store, tmp_path, archive)
     derives.check_round()
@@ -691,6 +694,7 @@ def test_finished_derive_is_done_only_with_derivative_files(
     assert archive.calls == [
         ("status", 101),
         ("item", identifier),
+        ("status", 101),
         ("item", identifier),
     ]
 
@@ -735,9 +739,10 @@ def test_finished_derive_with_derivatives_completes_at_observation(
             "waiting",
         ),
         (
+            # With a task ID, only the task API reports this derive failed.
             item(tasks=(task(InternetArchiveItemTaskState.ERROR, 2, error="boom"),)),
-            "failed",
-            "failed",
+            "unknown",
+            "waiting",
         ),
         (
             item(tasks=(task(InternetArchiveItemTaskState.PENDING, 0, "other.php"),)),
@@ -807,6 +812,7 @@ def test_unresolved_item_reads_change_nothing(
 ) -> None:
     video_id = requested(store, tmp_path, derive_status="unknown")
     archive = Archive()
+    archive.statuses = [status(InternetArchiveTaskState.UNKNOWN)]
     archive.items = [unresolved]
     dispatcher(store, tmp_path, archive).check_round()
     claim = job(store, video_id)
@@ -972,19 +978,18 @@ def test_reconciliation_reads_each_older_item_once_and_resumes(tmp_path: Path) -
 def test_known_failed_derive_reaches_the_first_report(tmp_path: Path) -> None:
     store = legacy_store(tmp_path)
     archive = Archive()
-    archive.items = [
-        item(KNOWN, tasks=(task(InternetArchiveItemTaskState.ERROR, 2, raw="2"),))
-    ]
     with Session(store.engine) as session:
         for row in session.exec(select(ArchiveJob)).all():
             if row.kind == "derive" and row.video_id != "1jd2l2k6ZQY":
                 row.status = "passed"
                 session.add(row)
         session.commit()
+    archive.statuses = [status(InternetArchiveTaskState.ERROR, 5765169292, raw="2")]
     dispatcher(store, tmp_path, archive).check_round()
-    assert archive.calls == [("item", KNOWN)]
+    assert archive.calls == [("status", 5765169292)]
     row = saved(store, "1jd2l2k6ZQY")
     assert (row.derive_status, row.derive_task_id) == ("failed", 5765169292)
+    assert row.derive_raw_state == "2"
     now = datetime.now(UTC)
     store.initialize_report_checkpoint(now - timedelta(days=1), "0 0 * * *")
     report = store.create_report_snapshot(
@@ -1359,6 +1364,7 @@ def test_stalled_timeout_skips_task_ids_and_unread_items(
         derive_status_at=utcnow() - timedelta(days=30),
     )
     archive = Archive(outstanding=0)
+    archive.statuses = [status(InternetArchiveTaskState.UNKNOWN)]
     archive.items = [
         item(),
         item(tasks=(task(InternetArchiveItemTaskState.PENDING, 0),)),
@@ -1496,3 +1502,59 @@ def test_after_a_restart_the_stale_clock_starts_at_the_first_reading(
     due(store, video_id)
     derives.check_round()
     assert saved(store, video_id).derive_status == "failed"
+
+
+def test_a_retried_derive_ignores_the_failed_task_still_on_the_item(
+    store: StateStore, tmp_path: Path
+) -> None:
+    video_id = uploaded(store, tmp_path, "retried0000", "immediate")
+    set_progress(store, video_id, derive_status="unknown")
+    with Session(store.engine) as session:
+        session.add(ArchiveJob(video_id=video_id, kind="derive"))
+        session.commit()
+    identifier = saved(store, video_id).ia_identifier
+    assert identifier is not None
+    old_error = task(InternetArchiveItemTaskState.ERROR, 2, raw="2", error="old")
+    archive = Archive()
+    derives = dispatcher(store, tmp_path, archive)
+
+    # The first read finds only the failed derive, so the row fails.
+    archive.items = [item(identifier, tasks=(old_error,))]
+    derives.check_round()
+    assert saved(store, video_id).derive_status == "failed"
+
+    # The operator retry submits one new derive beside the failed task.
+    assert store.reset_failed_derives([identifier]) == [identifier]
+    assert derives.submit_round() == 1
+    row = saved(store, video_id)
+    assert (row.derive_status, row.derive_task_id) == ("requested", 101)
+
+    # The new derive is queued while the old error is still listed.
+    archive.statuses = [status(InternetArchiveTaskState.QUEUED)]
+    due(store, video_id)
+    derives.check_round()
+    assert saved(store, video_id).derive_status == "requested"
+
+    # The task API loses track of it, and the item shows only the old error.
+    archive.statuses = [InternetArchiveTaskNotFoundError(101)]
+    archive.items = [item(identifier, tasks=(old_error,))]
+    due(store, video_id)
+    derives.check_round()
+    assert saved(store, video_id).derive_status == "unknown"
+
+    # It finished before its files were listed, with the old error still there.
+    archive.statuses = [status(InternetArchiveTaskState.FINISHED)]
+    archive.items = [item(identifier, tasks=(old_error,))]
+    due(store, video_id)
+    derives.check_round()
+    assert saved(store, video_id).derive_status == "unknown"
+
+    # Derivative files appear, and the derive is done.
+    archive.statuses = [status(InternetArchiveTaskState.FINISHED)]
+    archive.items = [item(identifier, derived=True, tasks=(old_error,))]
+    due(store, video_id)
+    derives.check_round()
+    row, claim = saved(store, video_id), job(store, video_id)
+    assert (row.derive_status, row.derive_task_id) == ("done", 101)
+    assert claim is not None and claim.status == "passed"
+    assert [name for name, _ in archive.calls].count("queue") == 1
