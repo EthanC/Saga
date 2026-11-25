@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 from archivist import (
+    InternetArchiveClient,
     InternetArchiveUploadFileResult,
     InternetArchiveUploadLimit,
     InternetArchiveUploadResult,
@@ -12,7 +13,6 @@ from archivist import (
 
 from core.archival import ArchiveGateway, ArchiveProcessor
 from core.state import StateStore
-from core.transport import TransportArchiveClient
 from core.youtube import YouTubeClient
 from tests.test_archival import FakeGateway, saved, seed_upload, settings
 
@@ -50,9 +50,9 @@ def test_upload_cleans_invalid_display_text_without_changing_provenance(
             (InternetArchiveUploadFileResult(frozen.media_name, 4, transferred=True),),
         )
 
-    monkeypatch.setattr(TransportArchiveClient, "upload", upload)
+    monkeypatch.setattr(InternetArchiveClient, "upload", upload)
     monkeypatch.setattr(
-        TransportArchiveClient,
+        InternetArchiveClient,
         "upload_limit",
         lambda *args: InternetArchiveUploadLimit(over_limit=False),
     )

@@ -3017,6 +3017,7 @@ class StateStore:
         with self._write_lock, Session(self.engine) as session:
             if session.get(SchemaMigration, 2) is not None:
                 self._recover_unsubmitted_ziggy(session)
+                self._recheck_throttled_item_creation(session)
                 if session.get(SchemaMigration, 3) is None:
                     session.add(SchemaMigration(version=3))
                     session.commit()
@@ -3086,6 +3087,7 @@ class StateStore:
             session.add(SchemaMigration(version=3))
             session.commit()
             self._recover_unsubmitted_ziggy(session)
+            self._recheck_throttled_item_creation(session)
 
     @staticmethod
     def _recover_unsubmitted_ziggy(session: Session) -> None:
@@ -3120,6 +3122,28 @@ class StateStore:
             progress.webpage_status = "pending"
             session.add_all((job, progress))
         session.add(SchemaMigration(version=4))
+        session.commit()
+
+    @classmethod
+    def _recheck_throttled_item_creation(cls, session: Session) -> None:
+        """Recheck transfers held for reconciliation by a throttled item creation.
+
+        Older releases did not treat IA-S3 ``SlowDown`` at item creation as a
+        known failure. The recovery check reads the item and returns only an
+        absent item to ``upload``; any remote evidence keeps reconciliation.
+        """
+        if session.get(SchemaMigration, 5) is not None:
+            return
+        for progress in session.exec(
+            select(ArchiveProgress).where(
+                ArchiveProgress.status == "reconcile_upload",
+                ArchiveProgress.error_code == "SlowDown",
+                ArchiveProgress.error_phase == "item-create",
+                col(ArchiveProgress.media_uploaded_at).is_(None),
+            )
+        ).all():
+            cls._restart_recovery_job(session, progress.video_id, delay=0)
+        session.add(SchemaMigration(version=5))
         session.commit()
 
 

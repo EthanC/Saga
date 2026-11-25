@@ -11,18 +11,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from archivist import (
-    InternetArchiveApiKey,
-    InternetArchiveUploadError,
-    InternetArchiveUploadFile,
-)
 from niquests import Response
 from sqlmodel import Session
 
 from core import archival, healthcheck, migration, service, youtube
 from core.archival import ArchiveProcessor, inspect_item
 from core.state import ArchiveJob, StateStore, utcnow
-from core.transport import RecoveryConflictError, TransportArchiveClient
 from tests.test_archival import (
     FakeGateway,
     route_sends,
@@ -327,62 +321,6 @@ def test_ambiguous_duplicate_originals_cannot_establish_completion(
         inspect_item(replace(item, files=item.files * 2), frozen, 4).state == "conflict"
     )
     state.close()
-
-
-@pytest.mark.parametrize(
-    "failure",
-    ["bad_provenance", "changed_size", "http_error", "bad_status", "bad_body"],
-)
-def test_transport_errors_preserve_uncertainty_and_staging(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    path = tmp_path / "media.mkv"
-    path.write_bytes(b"test")
-    expected = {"source": "https://example.com", "saga_operation_id": "operation"}
-
-    def request(
-        self: Any, method: str, url: str, *args: Any, **kwargs: Any
-    ) -> Response:
-        response = Response()
-        response.status_code = 200
-        if url.endswith("services/user.php"):
-            response._content = b'{"success":true,"value":{"email":"owner"}}'
-        elif method == "GET":
-            response._content = json.dumps(
-                {
-                    "metadata": {"identifier": "item", "uploader": "owner", **expected},
-                    "files": [],
-                }
-            ).encode()
-        else:
-            response.status_code = (
-                403
-                if failure == "http_error"
-                else 202
-                if failure == "bad_status"
-                else 200
-            )
-            response._content = b"unexpected" if failure == "bad_body" else b""
-        return response
-
-    monkeypatch.setattr(TransportArchiveClient, "_recovery_request", request)
-    with (
-        TransportArchiveClient(
-            api_key=InternetArchiveApiKey("key", "secret")
-        ) as client,
-        pytest.raises(
-            RecoveryConflictError
-            if failure in {"bad_provenance", "changed_size"}
-            else InternetArchiveUploadError
-        ),
-    ):
-        client.add_file_transport(
-            "item",
-            InternetArchiveUploadFile(path),
-            expected_metadata={} if failure == "bad_provenance" else expected,
-            expected_size=5 if failure == "changed_size" else 4,
-        )
-    assert path.read_bytes() == b"test"
 
 
 def test_independent_claims_reject_stale_operations_and_late_failure_writes(

@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl
 import pytest
 from archivist import (
     AuthenticationError,
-    InternetArchiveApiKey,
+    InternetArchiveClient,
     InternetArchiveFailedStatus,
     InternetArchiveItem,
     InternetArchiveItemAvailability,
@@ -23,14 +23,19 @@ from archivist import (
     InternetArchiveItemTask,
     InternetArchiveItemTaskState,
     InternetArchivePendingStatus,
+    InternetArchiveRecoveryConflictError,
+    InternetArchiveRecoveryDeferredError,
+    InternetArchiveRecoveryPhase,
+    InternetArchiveRecoveryReason,
+    InternetArchiveRecoveryResult,
     InternetArchiveSuccessStatus,
     InternetArchiveUploadError,
-    InternetArchiveUploadFile,
     InternetArchiveUploadFileResult,
     InternetArchiveUploadLimit,
     InternetArchiveUploadResult,
     InvalidServiceResponseError,
     NetworkError,
+    ServiceError,
 )
 from niquests import Response
 from sqlmodel import Session
@@ -50,12 +55,30 @@ from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter
 from core.config import Settings
 from core.service import SagaService
 from core.state import ArchiveJob, ArchiveProgress, Channel, StateStore, Video, utcnow
-from core.transport import (
-    RecoveryConflictError,
-    RecoveryDeferredError,
-    TransportArchiveClient,
-)
 from core.youtube import VideoMetadata, YouTubeClient
+
+
+def refusal(
+    reason: str, identifier: str = "item"
+) -> InternetArchiveRecoveryDeferredError | InternetArchiveRecoveryConflictError:
+    """Build the refusal Archivist raises for one guarded-transfer reason."""
+    value = InternetArchiveRecoveryReason(reason)
+    deferred = value in {
+        InternetArchiveRecoveryReason.METADATA_UNRESOLVED,
+        InternetArchiveRecoveryReason.SLOT_OCCUPIED,
+        InternetArchiveRecoveryReason.LISTING_NOT_AUTHORITATIVE,
+    }
+    error_type = (
+        InternetArchiveRecoveryDeferredError
+        if deferred
+        else InternetArchiveRecoveryConflictError
+    )
+    return error_type(
+        InternetArchiveRecoveryResult(identifier, ()),
+        ServiceError(f"refused: {reason}", service="Internet Archive"),
+        phase=InternetArchiveRecoveryPhase.RECONCILIATION,
+        reason=value,
+    )
 
 
 @pytest.mark.parametrize(
@@ -143,7 +166,7 @@ def test_transfer_receipts_and_rejections_are_classified(
             if outcome == "missing_ack":
                 return result
             if outcome == "recovery_deferred":
-                raise RecoveryDeferredError("listing delayed")
+                raise refusal("listing_not_authoritative", frozen.identifier)
             raise InternetArchiveUploadError(
                 result,
                 InvalidServiceResponseError("status", status_code=400),
@@ -317,23 +340,23 @@ def test_gateway_status_and_transport_recovery_delegation(
     state = StateStore(tmp_path / "saga.sqlite")
     _, path, frozen = seed_upload(state, tmp_path)
     monkeypatch.setattr(
-        TransportArchiveClient, "get_item", lambda *args: valid_item(frozen)
+        InternetArchiveClient, "get_item", lambda *args: valid_item(frozen)
     )
     monkeypatch.setattr(
-        TransportArchiveClient,
+        InternetArchiveClient,
         "upload_limit",
         lambda *args: InternetArchiveUploadLimit(over_limit=False),
     )
     monkeypatch.setattr(
-        TransportArchiveClient,
-        "add_file_transport",
+        InternetArchiveClient,
+        "transfer_missing_file",
         lambda *args, **kwargs: InternetArchiveUploadResult(frozen.identifier, ()),
     )
     monkeypatch.setattr(
-        TransportArchiveClient, "submit", lambda *args: SimpleNamespace(job_id="job")
+        InternetArchiveClient, "submit", lambda *args: SimpleNamespace(job_id="job")
     )
     monkeypatch.setattr(
-        TransportArchiveClient,
+        InternetArchiveClient,
         "status",
         lambda *args: InternetArchivePendingStatus("job"),
     )
@@ -1044,94 +1067,6 @@ def test_gateway_sessions_disable_retries(tmp_path: Path, limiting: bool) -> Non
                     isinstance(adapter, BandwidthHTTPAdapter)
                     and adapter.limiter is limiter
                 )
-
-
-@pytest.mark.parametrize(
-    "remote",
-    [
-        "missing",
-        "pending_task",
-        "occupied",
-        "wrong_owner",
-        "wrong_operation",
-        "unresolved",
-        "blocked",
-        "incomplete",
-    ],
-)
-def test_transport_recovery_is_scoped_and_never_hashes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, remote: str
-) -> None:
-    path = tmp_path / "media.mkv"
-    path.write_bytes(b"test")
-    calls: list[str] = []
-    expected = {
-        "source": "https://youtu.be/AbCdEfGhI12",
-        "saga_operation_id": "operation",
-    }
-    metadata = {"identifier": "item", "uploader": "owner@example.com", **expected}
-    document: dict[str, Any] = {"metadata": metadata, "files": []}
-    if remote == "pending_task":
-        document["tasks"] = [{"cmd": "derive.php", "state": "pending"}]
-    elif remote == "occupied":
-        document["files"] = [{"name": "media.mkv", "source": "original", "size": "4"}]
-    elif remote == "wrong_owner":
-        metadata["uploader"] = "someone@example.com"
-    elif remote == "wrong_operation":
-        metadata["saga_operation_id"] = "other"
-    elif remote == "unresolved":
-        document = {}
-    elif remote == "blocked":
-        document["is_dark"] = True
-    elif remote == "incomplete":
-        document["files_count"] = 3
-
-    def request(
-        self: Any, method: str, url: str, *args: Any, **kwargs: Any
-    ) -> Response:
-        calls.append(method)
-        response = Response()
-        response.status_code = 200
-        if url.endswith("services/user.php"):
-            response._content = (
-                b'{"success":true,"value":{"email":"owner@example.com"}}'
-            )
-        elif method == "GET":
-            response._content = json.dumps(document).encode()
-        else:
-            assert b"".join(kwargs["data"]) == b"test"
-            assert kwargs["headers"]["If-None-Match"] == "*"
-            assert kwargs["headers"]["x-archive-interactive-priority"] == "1"
-            response._content = b""
-            response.headers["ETag"] = "etag"
-        return response
-
-    monkeypatch.setattr(TransportArchiveClient, "_recovery_request", request)
-    monkeypatch.setattr(
-        "archivist.services.internet_archive._recovery.hash_prepared_files",
-        lambda *args: pytest.fail("whole-file checksum read"),
-    )
-    with TransportArchiveClient(
-        api_key=InternetArchiveApiKey("key", "secret")
-    ) as client:
-        if remote in {"missing", "pending_task"}:
-            result = client.add_file_transport(
-                "item",
-                InternetArchiveUploadFile(path),
-                expected_metadata=expected,
-                expected_size=4,
-            )
-            assert result.files[0].transferred and result.files[0].etag == "etag"
-            assert calls == ["GET", "GET", "PUT"]
-        else:
-            with pytest.raises((RecoveryConflictError, RecoveryDeferredError)):
-                client.add_file_transport(
-                    "item",
-                    InternetArchiveUploadFile(path),
-                    expected_metadata=expected,
-                    expected_size=4,
-                )
-            assert "PUT" not in calls
 
 
 @pytest.mark.parametrize(

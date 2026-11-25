@@ -33,14 +33,12 @@ from core.archive_errors import (
 from core.archive_retry import ArchiveServiceState, retry_hint, retryable_error
 from core.shutdown import StopController
 from core.state import ArchiveJob, ArchiveProgress, StateStore, _as_utc, utcnow
-from core.transport import TransportArchiveClient
 from tests.test_archival import FakeGateway, saved, seed_upload, settings
 from tests.test_archive_classification import wire
 from tests.test_archive_retry import gate, processor, upload
 from tests.test_worker_protocol import Connection
 
 
-@pytest.mark.parametrize("client_type", [InternetArchiveClient, TransportArchiveClient])
 @pytest.mark.parametrize(
     "endpoint,status,payload,kind",
     [
@@ -66,16 +64,11 @@ from tests.test_worker_protocol import Connection
     ],
 )
 def test_released_client_contract_replaces_saga_annotations(
-    monkeypatch: pytest.MonkeyPatch,
-    client_type: Any,
-    endpoint: str,
-    status: int,
-    payload: Any,
-    kind: str,
+    monkeypatch: pytest.MonkeyPatch, endpoint: str, status: int, payload: Any, kind: str
 ) -> None:
     wire(monkeypatch, endpoint, status, payload, retry_after="3600")
     with archival.Session(retries=0) as session:
-        client = client_type(
+        client = InternetArchiveClient(
             session=session, account=InternetArchiveAccount("user", "password")
         )
         with pytest.raises(ServiceError) as raised:

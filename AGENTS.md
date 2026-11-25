@@ -30,7 +30,7 @@ uv run pytest --cov=core --cov-branch --cov-report=term-missing --cov-fail-under
 - `core/` — all application code. Each module opens with a one-line docstring stating its responsibility; read it before editing.
   - `service.py` — coordinates discovery, notification, and worker scheduling.
   - `state.py` — SQLModel tables, schema upgrades, and short transactional workflow operations. Largest module; most durable behavior lives here.
-  - `archival.py`, `transport.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.6.0`; `transport.py` extends that exact version.
+  - `archival.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.6.0`.
   - `youtube.py`, `youtube_errors.py` — yt-dlp channel resolution, enumeration, and downloads.
   - `workers.py` — child-process boundaries for network libraries; the parent owns bandwidth budgets via RPC.
   - `pipeline_health.py`, `healthcheck.py` — health snapshot and the container probe.
@@ -40,6 +40,7 @@ uv run pytest --cov=core --cov-branch --cov-report=term-missing --cov-fail-under
 
 ## Conventions and invariants
 
+- **Internet Archive access goes through Archivist only.** Saga must never communicate with the Internet Archive directly. All IA and archive.org interaction (S3, metadata, Tasks API, Wayback/SPN, and so on) goes through Archivist's **public** API. Don't import Archivist private modules (`archivist.*._*`), call underscore-prefixed methods, subclass Archivist clients to add requests, or send HTTP requests to archive.org hosts from Saga. If Saga needs IA functionality Archivist doesn't provide, stop and request an Archivist update that describes the needed API; don't work around the gap in Saga. `tests/test_archivist_adoption.py::test_saga_reaches_the_archive_only_through_public_archivist` enforces this.
 - **Durability first.** Work state lives in SQLite and must survive restarts. Never delete local originals before the Archive upload acknowledgement is saved. Uncertain outcomes (lost receipts, ambiguous transfers) go to guarded reconciliation or operator review, never blind resubmission.
 - **Schema changes are additive and automatic.** Add columns through the existing upgrade path in `state.py` (`ALTER TABLE ... ADD COLUMN` with defaults/nullable). Older rows must remain readable; users should never need a manual database edit. Migrations of legacy records run once at startup.
 - **Health semantics.** The probe fails only on worker liveness problems (stale polling, stalled transfers, undispatched due work). External outages, backoff, credential rejection, and storage limits are *degraded* states that alert but must not trigger restarts.

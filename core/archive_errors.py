@@ -16,6 +16,11 @@ from archivist import (
 
 from core.logging import redact_diagnostics
 
+
+class RecoveryConflictError(RuntimeError):
+    """A persisted Saga operation contradicts its local staging or stage."""
+
+
 DIAGNOSTIC_FIELDS = (
     "error_code",
     "error_message",
@@ -148,7 +153,24 @@ def failure_cause(error: Exception) -> Exception:
     return error
 
 
+def refusal_reason(error: Exception) -> str | None:
+    """Return the stable reason Archivist gave for refusing a guarded transfer."""
+    if isinstance(error, InternetArchiveRecoveryError) and error.reason is not None:
+        return error.reason.value
+    return None
+
+
 def failure_facts(error: Exception) -> dict[str, Any]:
+    if (reason := refusal_reason(error)) is not None:
+        # A refusal is decided from fresh item evidence before any write, so it
+        # is not a service failure; its reason enum is the stable error code.
+        assert isinstance(error, InternetArchiveRecoveryError)
+        return {
+            "error_kind": None,
+            "error_status": None,
+            "error_phase": None,
+            **diagnostic_fields(reason, str(error.cause) or None),
+        }
     cause = failure_cause(error)
     phase = getattr(cause, "request_phase", None)
     status = cause.status_code if isinstance(cause, ServiceError) else None

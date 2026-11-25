@@ -3,12 +3,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from archivist import (
+    InternetArchiveClient,
+    InternetArchiveUploadFileResult,
+    InternetArchiveUploadResult,
+)
 from niquests import Response
 
 from core import archival
 from core.archival import ArchiveGateway, FrozenArchiveMetadata
 from core.state import StateStore
-from core.transport import TransportArchiveClient
 from tests.test_archival import seed_upload, settings
 
 S3 = "https://s3.us.archive.org"
@@ -63,11 +67,31 @@ def wire(
     def request(self: Any, method: str, url: str, **kwargs: Any) -> Response:
         return respond(method, url, kwargs.get("headers") or {})
 
-    def isolated(self: Any, method: str, url: str, key: Any, **kwargs: Any) -> Response:
-        return respond(method, url, kwargs.get("headers") or {})
+    def recover(
+        self: Any, identifier: str, file: Any, **kwargs: Any
+    ) -> InternetArchiveUploadResult:
+        # Archivist owns the guarded PUT; record the headers Saga asks it for.
+        headers = {"If-None-Match": "*"}
+        if kwargs["interactive_priority"]:
+            headers["x-archive-interactive-priority"] = "1"
+        if not kwargs["queue_derive"]:
+            headers["x-archive-queue-derive"] = "0"
+        assert kwargs["expected_metadata"] == {
+            "source": frozen.source_url,
+            "saga_operation_id": frozen.operation_id,
+        }
+        writes.append((f"{S3}/{identifier}/{file.name}", headers))
+        return InternetArchiveUploadResult(
+            identifier,
+            (
+                InternetArchiveUploadFileResult(
+                    file.name, kwargs["expected_size"], transferred=True
+                ),
+            ),
+        )
 
     monkeypatch.setattr(archival.Session, "request", request)
-    monkeypatch.setattr(TransportArchiveClient, "_recovery_request", isolated)
+    monkeypatch.setattr(InternetArchiveClient, "transfer_missing_file", recover)
     return writes
 
 

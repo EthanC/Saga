@@ -10,6 +10,7 @@ from archivist import (
     AuthenticationError,
     InternetArchiveAccount,
     InternetArchiveApiKey,
+    InternetArchiveClient,
     InternetArchiveUploadFile,
     InvalidServiceResponseError,
     NetworkError,
@@ -22,7 +23,6 @@ from core import archival
 from core.archival import ArchiveProcessor
 from core.archive_errors import failure_facts
 from core.state import ArchiveJob, StateStore, utcnow
-from core.transport import TransportArchiveClient
 from core.youtube import YouTubeClient
 from tests.test_archival import FakeGateway, route_sends, saved, seed_upload, settings
 
@@ -145,7 +145,7 @@ def test_generic_login_failure_keeps_phase_when_used_without_context_manager(
 ) -> None:
     wire(monkeypatch, "login", 400, "Bad Request")
     with archival.Session(retries=0) as session:
-        client = TransportArchiveClient(
+        client = InternetArchiveClient(
             session=session,
             account=InternetArchiveAccount("fixture@example.com", "fixture-password"),
         )
@@ -171,7 +171,7 @@ def test_request_network_failures_keep_the_failed_phase(
     monkeypatch.setattr(archival.Session, "request", failed)
     with (
         archival.Session(retries=0) as session,
-        TransportArchiveClient(
+        InternetArchiveClient(
             session=session,
             account=InternetArchiveAccount("fixture@example.com", "password"),
         ) as client,
@@ -327,11 +327,9 @@ def test_recovery_preflight_failures_preserve_phase_and_do_not_send_media(
     monkeypatch.setattr(archival.Session, "send", request)
     with (
         pytest.raises(ServiceError) as result,
-        TransportArchiveClient(
-            api_key=InternetArchiveApiKey("key", "secret")
-        ) as client,
+        InternetArchiveClient(api_key=InternetArchiveApiKey("key", "secret")) as client,
     ):
-        client.add_file_transport(
+        client.transfer_missing_file(
             "item",
             InternetArchiveUploadFile(media),
             expected_metadata={

@@ -4,7 +4,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from archivist.core._http import parse_retry_after
+from archivist import parse_retry_after
 from sqlmodel import Field, SQLModel
 
 from core.archive_errors import failure_cause, failure_facts

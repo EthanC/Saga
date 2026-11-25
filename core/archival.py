@@ -20,6 +20,7 @@ from archivist import (
     AuthenticationError,
     InternetArchiveAccount,
     InternetArchiveCaptureStatus,
+    InternetArchiveClient,
     InternetArchiveFailedStatus,
     InternetArchiveItem,
     InternetArchiveItemAvailability,
@@ -27,6 +28,8 @@ from archivist import (
     InternetArchiveMultipartResult,
     InternetArchiveMultipartState,
     InternetArchivePendingStatus,
+    InternetArchiveRecoveryConflictError,
+    InternetArchiveRecoveryDeferredError,
     InternetArchiveSuccessStatus,
     InternetArchiveUploadError,
     InternetArchiveUploadFile,
@@ -41,7 +44,7 @@ from archivist import (
 from loguru import logger
 from niquests import Session
 
-from core.archive_errors import failure_cause, failure_facts
+from core.archive_errors import RecoveryConflictError, failure_cause, failure_facts
 from core.archive_retry import retry_hint, retryable_error
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import MULTIPART_MAX_PART_SIZE, MULTIPART_MAX_PARTS, Settings
@@ -50,7 +53,6 @@ from core.progress import DownloadCheckpoint
 from core.shutdown import CooperativeStop, StopController
 from core.staging import ensure_download_root
 from core.state import ArchiveWork, StateStore, retry_delay, utcnow
-from core.transport import RecoveryConflictError, TransportArchiveClient
 from core.webpage_errors import SubmissionNotSentError, known_connect_failure
 from core.workers import run_managed
 from core.youtube import (
@@ -226,8 +228,8 @@ class ArchiveGateway:
                 previous.close()
         return session
 
-    def _client(self, session: Session) -> TransportArchiveClient:
-        return TransportArchiveClient(
+    def _client(self, session: Session) -> InternetArchiveClient:
+        return InternetArchiveClient(
             session=session, account=self.account, timeout=self.request_timeout
         )
 
@@ -379,7 +381,7 @@ class ArchiveGateway:
 
     @staticmethod
     def _respect_upload_limit(
-        client: TransportArchiveClient, identifier: str, phase: str
+        client: InternetArchiveClient, identifier: str, phase: str
     ) -> dict[str, Any] | None:
         """Defer a write while IA-S3 reports the account's task queue as full."""
         try:
@@ -466,7 +468,7 @@ class ArchiveGateway:
                 client, metadata.identifier, "file-upload"
             )
             return self._with_queue(
-                lambda: client.add_file_transport(
+                lambda: client.transfer_missing_file(
                     metadata.identifier,
                     InternetArchiveUploadFile(
                         cast(
@@ -695,6 +697,7 @@ class ArchiveProcessor:
         except (
             LocalMediaChangedError,
             RecoveryConflictError,
+            InternetArchiveRecoveryConflictError,
             InvalidOptionError,
         ) as error:
             if work.job:
@@ -984,6 +987,20 @@ class ArchiveProcessor:
                 deadline=self.settings.background_deadline,
             )
             return
+        except InternetArchiveRecoveryDeferredError as error:
+            # Nothing was written; reconciliation reads the item again later.
+            self.state.defer_transfer(
+                work,
+                status="reconcile_upload",
+                error=_error_text(error),
+                delay=self._failure_delay(work, error),
+                deadline=self.settings.background_deadline,
+                **failure_facts(error),
+            )
+            return
+        except InternetArchiveRecoveryConflictError:
+            # Recovery errors are service errors; keep them out of retry handling.
+            raise
         except ServiceError as error:
             self.stop_controller.check()
             # Both upload APIs wrap service failures once a mutation starts.
@@ -1437,6 +1454,11 @@ def _known_failure(error: ServiceError) -> bool:
     """Return whether a rejection proves the request changed nothing remotely."""
     code = error.status_code
     return (
+        # IA-S3 throttles item creation before it creates the item.
+        isinstance(error, RateLimitError)
+        and error.service_code == "SlowDown"
+        and error.request_phase == "item-create"
+    ) or (
         not isinstance(error, NetworkError)
         and code is not None
         and 400 <= code < 500
