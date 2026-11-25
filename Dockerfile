@@ -1,6 +1,6 @@
 FROM denoland/deno:alpine-2.9.8 AS deno
 
-FROM ghcr.io/astral-sh/uv:0.13.7 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.10 AS uv
 
 FROM alpine:3.24 AS python
 

@@ -154,7 +154,7 @@ class _ProgressStream:
 class _MultipartProgressStream(_ProgressStream):
     """Report hashing reads as liveness and only part reads as transfer progress.
 
-    Archivist 1.5.2 hashes the whole source with sequential reads before it
+    Archivist 1.6.0 hashes the whole source with sequential reads before it
     sends any request, so the first ``size`` bytes read are never transferred.
     """
 

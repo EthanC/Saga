@@ -30,7 +30,7 @@ uv run pytest --cov=core --cov-branch --cov-report=term-missing --cov-fail-under
 - `core/` — all application code. Each module opens with a one-line docstring stating its responsibility; read it before editing.
   - `service.py` — coordinates discovery, notification, and worker scheduling.
   - `state.py` — SQLModel tables, schema upgrades, and short transactional workflow operations. Largest module; most durable behavior lives here.
-  - `archival.py`, `transport.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.5.2`; `transport.py` extends that exact version.
+  - `archival.py`, `transport.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.6.0`; `transport.py` extends that exact version.
   - `youtube.py`, `youtube_errors.py` — yt-dlp channel resolution, enumeration, and downloads.
   - `workers.py` — child-process boundaries for network libraries; the parent owns bandwidth budgets via RPC.
   - `pipeline_health.py`, `healthcheck.py` — health snapshot and the container probe.
