@@ -19,7 +19,7 @@ def test_storage_pause_alerts_without_restarting_progressing_workers(
     health = store.transfer_health(stall_timeout=30, now=later)
     assert health["healthy"] and health["lanes"]["download"]["status"] == "degraded"
     assert any(
-        a["key"] == "download:storage" and a["severity"] == "error"
+        a["key"] == "download:storage" and a["severity"] == "warning"
         for a in health["alerts"]
     )
     upload, _, _ = seed_upload(store, tmp_path, "UploadVid12")

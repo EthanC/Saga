@@ -187,7 +187,7 @@ def build_pipeline_health(
             alerts.append(
                 {
                     "key": "download:storage",
-                    "severity": "error",
+                    "severity": "warning",
                     "message": "download storage remains blocked",
                     "details": {"due_queue_count": len(due), "waiting_reason": reason},
                 }
