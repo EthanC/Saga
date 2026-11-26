@@ -30,7 +30,7 @@ uv run pytest --cov=core --cov-branch --cov-report=term-missing --cov-fail-under
 - `core/` — all application code. Each module opens with a one-line docstring stating its responsibility; read it before editing.
   - `service.py` — coordinates discovery, notification, and worker scheduling.
   - `state.py` — SQLModel tables, schema upgrades, and short transactional workflow operations. Largest module; most durable behavior lives here.
-  - `archival.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.6.0`.
+  - `archival.py`, `archive_*.py` — Internet Archive uploads, recovery, shared cooldown/circuit, diagnostics, and incidents. `archivist-py` is pinned to `1.6.1`.
   - `youtube.py`, `youtube_errors.py` — yt-dlp channel resolution, enumeration, and downloads.
   - `workers.py` — child-process boundaries for network libraries; the parent owns bandwidth budgets via RPC.
   - `pipeline_health.py`, `healthcheck.py` — health snapshot and the container probe.
@@ -78,7 +78,7 @@ YouTube, Archive, and webpage requests run in reusable child processes so yt-dlp
 
 ### Archive diagnostics
 
-- Saga uses Archivist 1.6.0 response diagnostics: Archive/S3 error code, message, request ID, HTTP status, and request phase. `SlowDown` is throttling; explicit credential-rejection evidence produces authentication guidance; item access denials produce item-permission guidance. A generic HTTP 503 does not imply a quota or password problem. Generic HTML HTTP 400 login errors and malformed CSRF/login replies are service failures, not password rejections.
+- Saga uses Archivist 1.6.1 response diagnostics: Archive/S3 error code, message, request ID, HTTP status, and request phase. `SlowDown` is throttling; explicit credential-rejection evidence produces authentication guidance; item access denials produce item-permission guidance. A generic HTTP 503 does not imply a quota or password problem. Generic HTML HTTP 400 login errors and malformed CSRF/login replies are service failures, not password rejections.
 - Diagnostics are redacted and bounded: codes and request IDs to 256 characters, messages to 1,024, each header to 256. Only `content-type`, `retry-after`, and `x-amz-request-id` headers are kept. The same representation is used in SQLite, snapshots, logs, and Discord.
 - `data/transfers.json` exposes the shared circuit (`archive_service`), `archive_diagnostics` (`error_kind` is Saga's classification; `error_code`, `error_message`, `error_request_id`, `error_headers`, and `error_queue` come from the Archive), incident progress fields, `retry_delay_source` (server `Retry-After` vs. local pacing), `storage`, `derives`, and `youtube_access`.
 

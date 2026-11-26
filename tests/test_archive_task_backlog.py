@@ -41,6 +41,7 @@ from tests.test_archive_retry import clock as clock
 from tests.test_archive_retry import gate, processor, upload
 from tests.test_archive_upload_limit import wire
 from tests.test_reporting import WEBHOOK, report
+from tests.test_worker_protocol import pickled
 
 
 def summary(
@@ -531,7 +532,7 @@ def test_managed_writes_read_the_shared_summary_in_the_managing_process(
         calls.append((method, options.get("task_backlog")))
         return summary(10) if method == "task_summary" else result
 
-    monkeypatch.setattr(archival, "run_managed", run)
+    monkeypatch.setattr(archival, "run_managed", pickled(run))
     gateway = ArchiveGateway(
         settings(tmp_path, archive_task_queue_limit=400), managed=True
     )

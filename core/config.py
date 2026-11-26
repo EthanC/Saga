@@ -35,7 +35,7 @@ LOG_LEVELS = frozenset(
     {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}
 )
 _CRON_FIELD_COUNT = 5
-# Multipart limits enforced by the pinned Archivist 1.6.0 client.
+# Multipart limits enforced by the pinned Archivist 1.6.1 client.
 MULTIPART_MAX_PART_SIZE = 5 * 1024**3
 MULTIPART_MAX_PARTS = 1000
 

@@ -1,4 +1,8 @@
+import pickle
+import threading
 from collections import deque
+from collections.abc import Callable
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -15,6 +19,20 @@ from core import archival, workers, youtube
 from core import logging as logging_module
 from core.shutdown import CooperativeStop, StopController
 from tests.test_archival import settings
+
+
+def round_trip[T](value: T) -> T:
+    """Send a value through the pickler a managed worker's pipe uses."""
+    return pickle.loads(ForkingPickler.dumps(value))
+
+
+def pickled(fake: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a run_managed fake so its results cross a worker pipe as pickles."""
+
+    def run(*args: Any, **kwargs: Any) -> Any:
+        return round_trip(fake(*args, **kwargs))
+
+    return run
 
 
 class Connection:
@@ -293,7 +311,7 @@ def test_managed_youtube_dispatch_and_merge_probe(
             callbacks["phase_hook"]("merged", 5)
         return "result"
 
-    monkeypatch.setattr(youtube, "run_managed", run)
+    monkeypatch.setattr(youtube, "run_managed", pickled(run))
     client.resolve_channel("@handle")
     client.recent_videos(cast(Any, "channel"))
     client.scan_history(cast(Any, "channel"), lambda batch: None)
@@ -315,10 +333,24 @@ def test_managed_youtube_dispatch_and_merge_probe(
     }
 
 
+def test_managed_fakes_return_what_a_worker_pipe_would(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unpicklable(*args: Any) -> Any:
+        return threading.Lock()
+
+    monkeypatch.setattr(archival, "run_managed", pickled(unpicklable))
+    gateway = archival.ArchiveGateway(settings(tmp_path), managed=True)
+    with pytest.raises(TypeError, match="pickle"):
+        gateway.get_item("item")
+
+
 def test_managed_gateway_dispatch_preserves_upload_callbacks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(archival, "run_managed", lambda *args, **kwargs: "result")
+    monkeypatch.setattr(
+        archival, "run_managed", pickled(lambda *args, **kwargs: "result")
+    )
     gateway = archival.ArchiveGateway(settings(tmp_path), managed=True)
     gateway.upload(cast(Any, "metadata"), tmp_path, progress=lambda _: None)
     gateway.recover(cast(Any, "metadata"), tmp_path, progress=lambda _: None)
@@ -332,7 +364,7 @@ def test_managed_multipart_keeps_resume_callbacks_in_the_parent(
 ) -> None:
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(
-        archival, "run_managed", lambda *args, **kwargs: calls.append(args)
+        archival, "run_managed", pickled(lambda *args, **kwargs: calls.append(args))
     )
     saved: list[str] = []
     gateway = archival.ArchiveGateway(settings(tmp_path), managed=True)

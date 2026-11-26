@@ -1,19 +1,26 @@
 import asyncio
 import json
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from multiprocessing import Pipe
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from archivist import (
     AuthenticationError,
+    InternetArchiveCaptureJob,
+    InternetArchiveClient,
     InternetArchiveItem,
     InternetArchiveItemAvailability,
     InternetArchiveItemFile,
     InternetArchiveItemFileSource,
     InternetArchiveItemTask,
     InternetArchiveItemTaskState,
+    InternetArchiveSuccessStatus,
     InternetArchiveTaskNotFoundError,
     InternetArchiveTaskState,
     InternetArchiveTaskStatus,
@@ -26,7 +33,7 @@ from archivist import (
 )
 from sqlmodel import Session, select
 
-from core import archival, maintenance, reporting
+from core import archival, archive_derives, maintenance, reporting, workers
 from core.archival import ArchiveGateway, ArchiveProcessor
 from core.archive_derives import DeriveDispatcher, _error_text
 from core.archive_tasks import TaskBacklog, TaskSource, TaskSummaryCache
@@ -43,11 +50,14 @@ from core.state import (
 )
 from core.youtube import YouTubeClient
 from tests.test_archival import FakeGateway, saved, seed_upload, settings
+from tests.test_worker_protocol import pickled
 
 KNOWN = (
     "riyadhfalcons-vs-royalravens-major-i-tournament-elimination-round-1-1jd2l2k6ZQY"
 )
 SUBMITTED = datetime(2026, 11, 20, 12, tzinfo=UTC)
+# Archivist 1.6.0 item reads failed this way in the managing process.
+UNPICKLABLE = TypeError("cannot pickle 'mappingproxy' object")
 
 
 class Backlog(TaskSource):
@@ -359,7 +369,7 @@ def test_managed_gateway_sends_derive_reads_to_a_worker(
         calls.append((method, args))
         return results[method]
 
-    monkeypatch.setattr(archival, "run_managed", run)
+    monkeypatch.setattr(archival, "run_managed", pickled(run))
     gateway = ArchiveGateway(settings(tmp_path), managed=True)
     assert gateway.queue_derive("item").task_id == 9
     assert gateway.task_status(9).state is InternetArchiveTaskState.RUNNING
@@ -370,6 +380,86 @@ def test_managed_gateway_sends_derive_reads_to_a_worker(
         ("get_item", ("item",)),
     ]
     assert cast(TaskSummaryCache, gateway.tasks)._added == 1
+
+
+def run_through_pipe(
+    category: str,
+    method: str,
+    options: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    controller: StopController,
+    callbacks: dict[str, Callable[..., Any]] | None = None,
+) -> Any:
+    """Serve one managed request over a real pipe, as a worker process would."""
+    parent, child = Pipe()
+
+    def serve() -> None:
+        workers._execute(cast(Any, child), Event(), *child.recv())
+
+    server = threading.Thread(target=serve)
+    server.start()
+    try:
+        parent.send((category, method, options, args, kwargs))
+        kind, values = parent.recv()
+    finally:
+        server.join()
+        parent.close()
+        child.close()
+    if kind == "failure":
+        raise values
+    assert kind == "result"
+    return values
+
+
+def test_managed_gateway_results_survive_the_worker_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found = item(
+        derived=True,
+        tasks=(
+            task(InternetArchiveItemTaskState.PENDING, 0),
+            task(InternetArchiveItemTaskState.ERROR, raw="2", error="failed"),
+        ),
+    )
+    summary = InternetArchiveTaskSummary(3, 1, 2, 0)
+    live = status(InternetArchiveTaskState.RUNNING, 9, "1")
+    submission = InternetArchiveTaskSubmission(9, "item", None, already_pending=False)
+    capture = InternetArchiveSuccessStatus(
+        "job",
+        "https://example.com/",
+        datetime(2026, 11, 20, tzinfo=UTC),
+        resources=("https://example.com/",),
+        outlinks={"https://example.com/a": "job-a"},
+    )
+    answers: dict[str, Any] = {
+        "get_item": found,
+        "task_summary": summary,
+        "task_status": live,
+        "queue_derive": submission,
+        "submit": InternetArchiveCaptureJob("job", "https://example.com/"),
+        "status": capture,
+    }
+    for name, value in answers.items():
+        monkeypatch.setattr(
+            InternetArchiveClient, name, lambda self, *args, value=value: value
+        )
+    monkeypatch.setattr(archival, "run_managed", run_through_pipe)
+    gateway = archival.ArchiveGateway(settings(tmp_path), managed=True)
+    read = gateway.get_item("item")
+    assert read == found and read is not found
+    assert read.metadata["identifier"] == "item"
+    assert archive_derives._resolved(read) and archive_derives._derived(read)
+    assert [file.source for file in read.files] == [
+        InternetArchiveItemFileSource.ORIGINAL,
+        InternetArchiveItemFileSource.DERIVATIVE,
+    ]
+    assert read.tasks == found.tasks
+    assert gateway.task_summary() == summary
+    assert gateway.task_status(9) == live
+    assert gateway.queue_derive("item") == submission
+    assert gateway.submit_page("https://example.com/") == "job"
+    assert gateway.page_status("job") == capture
 
 
 # Submission
@@ -972,6 +1062,55 @@ def test_reconciliation_reads_each_older_item_once_and_resumes(tmp_path: Path) -
     pending = job(store, videos[5])
     assert pending is not None and pending.status == "pending"
     assert store.claim_derive("submit") is not None
+    store.close()
+
+
+def test_failed_item_reads_leave_derives_unread_and_their_clocks_unstarted(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    older = uploaded(store, tmp_path, "legacy00000", "immediate")
+    set_progress(store, older, derive_policy="immediate", derive_status="unknown")
+    uploaded_at = saved(store, older).media_uploaded_at
+    set_progress(store, older, derive_status_at=uploaded_at)
+    stale = item_tracked(store, tmp_path, "stale000000", 30)
+    stale_since = saved(store, stale).derive_status_at
+    with Session(store.engine) as session:
+        session.add(ArchiveJob(video_id=older, kind="derive"))
+        session.commit()
+    archive = Archive()
+    derives = dispatcher(store, tmp_path, archive, archive_derive_backlog_target=20)
+    derives._settled_since = datetime.now(UTC) - timedelta(days=30)
+    for video_id in (stale, older):
+        archive.items = [UNPICKLABLE]
+        due(store, video_id)
+        derives.check_round()
+    row = saved(store, older)
+    assert (row.derive_status, row.derive_task_id, row.derive_requested_at) == (
+        "unknown",
+        None,
+        None,
+    )
+    assert row.derive_status_at == uploaded_at
+    row = saved(store, stale)
+    assert row.derive_status == "requested"
+    assert row.derive_status_at == stale_since
+    for video_id in (older, stale):
+        claim = job(store, video_id)
+        assert claim is not None and claim.status == "waiting"
+        assert claim.attempts == 0
+        assert claim.last_error == f"TypeError: {UNPICKLABLE}"
+    # The first successful read is the first one the derive pass counts.
+    archive.items = [item(tasks=(task(InternetArchiveItemTaskState.PENDING, 0),))]
+    due(store, older)
+    work = store.claim_derive("reconcile")
+    assert work is not None and work.video.id == older
+    store.finish_derive(work, job_status="waiting", retry_at=None)
+    derives.check_round()
+    row = saved(store, older)
+    assert row.derive_status == "requested"
+    assert near(row.derive_status_at, datetime.now(UTC))
+    assert near(row.derive_requested_at, datetime.now(UTC))
     store.close()
 
 
@@ -1739,6 +1878,7 @@ def test_a_backlog_above_the_target_never_fails_a_stuck_task(
         RateLimitError("slow", retry_after=5),
         NetworkError("reset"),
         InvalidServiceResponseError("bad"),
+        UNPICKLABLE,
     ],
 )
 @pytest.mark.parametrize("on_item", [False, True])
@@ -1746,7 +1886,7 @@ def test_a_failed_or_incomplete_last_check_never_times_out(
     store: StateStore,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failure: ServiceError,
+    failure: Exception,
     on_item: bool,
 ) -> None:
     clock = Clock(monkeypatch)

@@ -20,6 +20,7 @@ from core.state import StateStore, utcnow
 from tests.test_archival import FakeGateway, saved, seed_upload, settings
 from tests.test_partials import FORMATS, partial
 from tests.test_service_coverage import CHANNEL, VIDEO
+from tests.test_worker_protocol import pickled
 from tests.test_youtube_coverage import DownloadingYoutubeDL, fake_downloader
 
 
@@ -172,7 +173,7 @@ def test_partial_identity_lookup_uses_selected_inputs_without_downloading(
     else:
         selected, expected = client.selected_formats("video")
         assert expected == (6 if outcome == "formats" else 4) and selected
-    monkeypatch.setattr(youtube, "run_managed", lambda *args: (FORMATS, 7))
+    monkeypatch.setattr(youtube, "run_managed", pickled(lambda *args: (FORMATS, 7)))
     assert youtube.YouTubeClient(managed=True).selected_formats("video") == (FORMATS, 7)
 
 
