@@ -42,6 +42,8 @@ QUEUE_COUNTERS = (
 )
 # Account catalog task counts that Saga reads before a write, with its limit.
 TASK_COUNTERS = ("task_queued", "task_running", "task_error", "task_limit")
+# Saga's own pre-write deferrals carry this prefix; the Archive saw no request.
+DEFERRED_PREFIX = "Upload deferred before sending: "
 THROTTLING_CODES = {"SlowDown", "Throttling", "ThrottlingException", "TooManyRequests"}
 AUTHENTICATION_CODES = {
     "InvalidAccessKeyId",

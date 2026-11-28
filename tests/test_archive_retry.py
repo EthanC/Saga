@@ -95,7 +95,7 @@ def test_production_backlog_prefetches_and_uses_one_probe_before_releasing_retri
         download_completed_at=clock[0],
         ready_at=clock[0],
     )
-    assert store.claim_background("recovery", archive_retry_base=300) is None
+    assert store.claim_background("recovery") is None
     with ThreadPoolExecutor(max_workers=4) as workers:
         claims = list(workers.map(lambda _: upload(store, clock[0]), range(4)))
     probes = [claim for claim in claims if claim is not None]
@@ -155,54 +155,17 @@ def test_production_backlog_prefetches_and_uses_one_probe_before_releasing_retri
     store.close()
 
 
-def test_metadata_probe_hands_off_one_original_without_reopening_write_traffic(
-    tmp_path: Path, clock: list[datetime]
-) -> None:
-    store = StateStore(tmp_path / "saga.sqlite")
-    video_id = failed_upload(store, tmp_path, "Recovery123", clock[0])
-    store.update_archive(video_id, status="reconcile_upload")
+def paced(store: StateStore, now: datetime, **values: Any) -> None:
     with Session(store.engine) as session:
         session.add(
-            ArchiveJob(
-                video_id=video_id,
-                kind="recovery",
-                retry_at=clock[0] + timedelta(hours=6),
+            ArchiveServiceState(
+                failures=1, retry_at=now, first_failure_at=now, **values
             )
         )
         session.commit()
-    gateway = FakeGateway()
-    gateway.inspection = Inspection("missing")
-    operation = processor(store, tmp_path, gateway)
-    probe = store.claim_background("recovery", now=clock[0], archive_retry_base=300)
-    assert probe is not None and probe.archive_probe_token
-    operation.process(probe)
-    handoff = gate(store)
-    assert (
-        handoff.failures == 1
-        and handoff.probe_kind == "upload"
-        and handoff.probe_video_id == video_id
-    )
-    assert handoff.probe_token is None
-    seed_upload(store, tmp_path, "ACompetitor")
-    assert (
-        store.claim_background("recovery", now=clock[0], archive_retry_base=300) is None
-    )
-    transfer = upload(store, clock[0])
-    assert (
-        transfer is not None
-        and transfer.video.id == video_id
-        and transfer.archive_probe_token
-    )
-    assert upload(store, clock[0]) is None
-    store.finish_archive_request(probe, base_delay=300)
-    assert gate(store).probe_token == transfer.archive_probe_token
-    operation.process(transfer)
-    assert saved(store, video_id).media_uploaded_at and gate(store).failures == 0
-    assert gateway.recovery_calls == 1
-    store.close()
 
 
-def test_pending_metadata_releases_probe_with_bounded_pacing(
+def test_recovery_read_ignores_the_write_gate_and_its_transfer_takes_a_probe(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
@@ -211,14 +174,55 @@ def test_pending_metadata_releases_probe_with_bounded_pacing(
     with Session(store.engine) as session:
         session.add(ArchiveJob(video_id=video_id, kind="recovery"))
         session.commit()
+    # A due upload used to hold every recovery read behind the paced gate.
+    seed_upload(store, tmp_path, "ACompetitor")
+    paced(store, clock[0])
+    gateway = FakeGateway()
+    gateway.inspection = Inspection("missing")
+    operation = processor(store, tmp_path, gateway)
+    read = store.claim_background("recovery", now=clock[0])
+    assert read is not None and read.archive_probe_token is None
+    assert read.archive_generation is None
+    operation.process(read)
+    held = gate(store)
+    assert held.failures == 1 and held.probe_token is None
+    assert held.retry_at and _as_utc(held.retry_at) == clock[0]
+    assert saved(store, video_id).status == "upload"
+    transfer = upload(store, clock[0])
+    assert (
+        transfer is not None
+        and transfer.video.id == video_id
+        and transfer.archive_probe_token
+    )
+    assert upload(store, clock[0]) is None
+    operation.process(transfer)
+    assert saved(store, video_id).media_uploaded_at and gate(store).failures == 0
+    assert gateway.recovery_calls == 1
+    store.close()
+
+
+def test_pending_recovery_read_backs_off_on_its_own_schedule(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    video_id = failed_upload(store, tmp_path, "Recovery123", clock[0])
+    store.update_archive(video_id, status="reconcile_upload")
+    with Session(store.engine) as session:
+        session.add(ArchiveJob(video_id=video_id, kind="recovery"))
+        session.commit()
+    paced(store, clock[0])
     operation = processor(store, tmp_path, FakeGateway())
-    work = store.claim_background("recovery", now=clock[0], archive_retry_base=300)
+    work = store.claim_background("recovery", now=clock[0])
     assert work is not None
     operation.process(work)
     state = gate(store)
-    assert state.failures == 1 and state.probe_token is None and state.retry_at
-    assert 0 < (_as_utc(state.retry_at) - clock[0]).total_seconds() <= MAX_PROBE_DELAY
-    assert store.claim_background("recovery", archive_retry_base=300) is None
+    assert state.failures == 1 and state.retry_at
+    assert _as_utc(state.retry_at) == clock[0]
+    with Session(store.engine) as session:
+        job = session.get(ArchiveJob, (video_id, "recovery"))
+        assert job is not None and job.status == "waiting" and job.retry_at
+        assert (_as_utc(job.retry_at) - clock[0]).total_seconds() == 300
+    assert store.claim_background("recovery", now=clock[0]) is None
     store.close()
 
 
@@ -409,34 +413,21 @@ def test_success_releases_service_jobs_but_preserves_item_local_backoff(
     store.close()
 
 
-def test_recovery_probe_skips_local_future_errors_and_handles_a_removed_handoff(
+def test_recovery_reads_wait_for_their_own_retry_time_even_while_paced(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
-    local, _, _ = seed_upload(store, tmp_path, "LocalVideo1")
-    remote = failed_upload(store, tmp_path, "RemoteVid12", clock[0])
-    for name, kind in ((local, "permission"), (remote, None)):
+    later, _, _ = seed_upload(store, tmp_path, "LaterVideo1")
+    due = failed_upload(store, tmp_path, "DueVideo123", clock[0])
+    for name, retry_at in ((later, clock[0] + timedelta(hours=6)), (due, None)):
         store.update_archive(name, status="reconcile_upload")
         with Session(store.engine) as session:
-            session.add(
-                ArchiveJob(
-                    video_id=name,
-                    kind="recovery",
-                    retry_at=clock[0] + timedelta(hours=6),
-                    error_kind=kind,
-                    last_error="denied" if kind else None,
-                )
-            )
+            session.add(ArchiveJob(video_id=name, kind="recovery", retry_at=retry_at))
             session.commit()
-    work = store.claim_background("recovery", archive_retry_base=300)
-    assert work is not None and work.video.id == remote
-    gateway = FakeGateway()
-    gateway.inspection = Inspection("missing")
-    operation = processor(store, tmp_path, gateway)
-    operation.process(work)
-    store.update_archive(remote, status="operator_action")
-    assert store.claim_background("recovery", archive_retry_base=300) is None
-    assert gate(store).probe_video_id is None
+    paced(store, clock[0] + timedelta(hours=1))
+    work = store.claim_background("recovery", now=clock[0])
+    assert work is not None and work.video.id == due
+    assert store.claim_background("recovery", now=clock[0]) is None
     store.close()
 
 
@@ -463,16 +454,16 @@ def test_stale_operations_cannot_change_service_state_and_acknowledgement_wins(
     store.reset_interrupted_claims()
     fresh = upload(store, clock[0])
     assert fresh is not None
-    assert store.record_archive_failure(work, **facts) == 0
+    assert store.record_archive_failure(work, **facts).delay == 0
     assert gate(store).probe_token == fresh.archive_probe_token
     store.acknowledge_upload(fresh, receipt="ack", etag=None)
-    assert store.record_archive_failure(fresh, **facts) == 0
+    assert store.record_archive_failure(fresh, **facts).delay == 0
     store.finish_archive_request(fresh, base_delay=300)
     assert gate(store).failures == 0
     store.close()
 
 
-def test_old_recovery_claim_cannot_record_a_service_failure_after_restart(
+def test_recovery_read_failures_back_off_the_job_without_failing_the_gate(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
@@ -481,32 +472,27 @@ def test_old_recovery_claim_cannot_record_a_service_failure_after_restart(
     with Session(store.engine) as session:
         session.add(ArchiveJob(video_id=video_id, kind="recovery"))
         session.commit()
-    old = store.claim_background("recovery", archive_retry_base=300)
+    paced(store, clock[0])
+    old = store.claim_background("recovery", now=clock[0])
     assert old is not None
     store.reset_interrupted_claims()
-    fresh = store.claim_background("recovery", archive_retry_base=300)
+    fresh = store.claim_background("recovery", now=clock[0])
     assert fresh is not None
-    assert (
-        store.record_archive_failure(
-            old,
-            base_delay=300,
-            hint=0,
-            error="offline",
-            error_kind="network",
-            error_status=None,
-            error_phase="item-metadata",
-        )
-        == 0
-    )
-    assert gate(store).probe_token == fresh.archive_probe_token
+    with pytest.raises(RuntimeError, match="no longer belongs"):
+        store.update_job(old, status="passed")
 
     class FailingGateway(FakeGateway):
         def inspect(self, *args: Any, **kwargs: Any) -> Inspection:
             raise NetworkError("offline")
 
-    gateway = FailingGateway()
-    processor(store, tmp_path, gateway).process(fresh)
-    assert gate(store).probe_token is None and gate(store).retry_at is not None
+    before = gate(store)
+    processor(store, tmp_path, FailingGateway()).process(fresh)
+    after = gate(store)
+    assert after.failures == before.failures and after.retry_at == before.retry_at
+    with Session(store.engine) as session:
+        job = session.get(ArchiveJob, (video_id, "recovery"))
+        assert job is not None and job.status == "waiting"
+        assert job.error_kind == "network" and job.retry_at is not None
     store.close()
 
 
@@ -547,10 +533,7 @@ def test_intentional_cooldown_does_not_turn_prefetched_work_into_a_dispatch_stal
     gateway = FakeGateway()
     gateway.upload_error = RateLimitError("limited", retry_after=3600)
     processor(store, tmp_path, gateway).process(work)
-    ready, _, _ = seed_upload(store, tmp_path, "NextReady12")
-    with Session(store.engine) as session:
-        session.add(ArchiveJob(video_id=ready, kind="recovery", status="pending"))
-        session.commit()
+    seed_upload(store, tmp_path, "NextReady12")
     store.health_started_at = clock[0] - timedelta(hours=1)
     store.transfer_health(stall_timeout=30, now=clock[0])
     health = store.transfer_health(
@@ -558,7 +541,28 @@ def test_intentional_cooldown_does_not_turn_prefetched_work_into_a_dispatch_stal
     )
     assert health["healthy"]
     assert health["lanes"]["upload"]["waiting_reason"] == "Archive service cooldown"
-    assert health["lanes"]["recovery"]["waiting_reason"] == "Archive service cooldown"
+    store.close()
+
+
+def test_cooldown_does_not_pause_due_recovery_reads(
+    tmp_path: Path, clock: list[datetime]
+) -> None:
+    store = StateStore(tmp_path / "saga.sqlite")
+    video_id = failed_upload(store, tmp_path, "Recovery123", clock[0])
+    store.update_archive(video_id, status="reconcile_upload")
+    with Session(store.engine) as session:
+        session.add(ArchiveJob(video_id=video_id, kind="recovery"))
+        session.commit()
+    paced(store, clock[0] + timedelta(hours=1))
+    store.health_started_at = clock[0] - timedelta(hours=1)
+    health = store.transfer_health(stall_timeout=30, now=clock[0])
+    assert health["lanes"]["recovery"]["waiting_reason"] == "awaiting worker dispatch"
+    later = store.transfer_health(
+        stall_timeout=30, now=clock[0] + timedelta(seconds=31)
+    )
+    # An undispatched read is now a worker problem, not an expected cooldown.
+    assert not later["healthy"]
+    assert not any(alert["key"] == "archive:probe-stall" for alert in later["alerts"])
     store.close()
 
 

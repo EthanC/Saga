@@ -36,6 +36,8 @@ from core.youtube import YouTubeClient
 from core.youtube_errors import cookie_fingerprint, is_permanent_video_error
 
 STARTUP_STALL_TIMEOUT = 300
+# Recovery checks read items outside the write gate, so they pace themselves.
+RECOVERY_READ_INTERVAL = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +88,7 @@ class SagaService:
         self._partial_health: dict[str, Any] = {}
         self.started_at = utcnow()
         self._channel_intervals: dict[str, float] = {}
-        self._health_alerts: dict[str, tuple[str, str, float]] = {}
+        self._health_alerts: dict[str, tuple[str, str, float, tuple[str, ...]]] = {}
         self._initializing = False
         self._startup_progress = time.monotonic()
         self._publication_started: float | None = None
@@ -94,6 +96,7 @@ class SagaService:
         self._history_slots = asyncio.Semaphore(1)
         self._staging_bytes: int | None = None
         self._youtube_cookie_generation: str | None = None
+        self.recovery_read_interval = RECOVERY_READ_INTERVAL
 
     async def run(self) -> None:
         """Initialize durable state, run workers, and stop them cooperatively."""
@@ -619,9 +622,7 @@ class SagaService:
                 )
             else:
                 work = self.state.claim_background(
-                    lane,
-                    max_attempts=self.settings.background_max_attempts,
-                    archive_retry_base=self.settings.archive_retry_delay,
+                    lane, max_attempts=self.settings.background_max_attempts
                 )
             if work is None:
                 async with self._work_changed:
@@ -630,7 +631,10 @@ class SagaService:
                 continue
             claim_count += 1
             logger.debug(
-                "Archive worker {} claimed video {}", worker_index, work.video.id
+                "Archive {} worker {} claimed video {}",
+                lane,
+                worker_index,
+                work.video.id,
             )
             operation = asyncio.create_task(
                 self._archive_operation(executor, work),
@@ -649,6 +653,8 @@ class SagaService:
                 self.state.record_worker_time(lane, time.monotonic() - started)
                 async with self._work_changed:
                     self._work_changed.notify_all()
+            if lane == "recovery":
+                await self._wait(self.recovery_read_interval)
 
     async def _archive_operation(self, executor: ThreadPoolExecutor, work: Any) -> None:
         assert self.archival is not None
@@ -800,19 +806,22 @@ class SagaService:
                 continue
             message = alert["message"]
             severity = alert["severity"]
+            # Standing warnings name their items; they repeat when those change.
+            affected = tuple(alert.get("affected", ()))
             previous = self._health_alerts.get(key)
             if (
                 previous is None
                 or previous[0] != message
                 or previous[1] != severity
-                or now - previous[2] >= 900
+                or previous[3] != affected
+                or now - previous[2] >= alert.get("reminder_seconds", 900)
             ):
                 log = logger.error if severity == "error" else logger.warning
                 log("{}: {}", message, alert["details"])
-                self._health_alerts[key] = (message, severity, now)
+                self._health_alerts[key] = (message, severity, now, affected)
         for key in tuple(self._health_alerts):
             if key not in active:
-                message, _, _ = self._health_alerts.pop(key)
+                message, *_ = self._health_alerts.pop(key)
                 logger.info("Pipeline condition recovered: {}", message)
 
     def _cookie_generation(self) -> str:

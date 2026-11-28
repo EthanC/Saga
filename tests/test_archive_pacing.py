@@ -132,7 +132,7 @@ def test_recurrent_throttling_increases_pacing_until_stable_recovery(
     store.close()
 
 
-def test_probation_metadata_handoff_is_fenced_and_does_not_bypass_write_spacing(
+def test_probation_recovery_read_takes_no_probe_and_its_transfer_keeps_spacing(
     tmp_path: Path, clock: list[datetime]
 ) -> None:
     store = StateStore(tmp_path / "saga.sqlite")
@@ -151,10 +151,11 @@ def test_probation_metadata_handoff_is_fenced_and_does_not_bypass_write_spacing(
     gateway = FakeGateway()
     gateway.inspection = Inspection("missing")
     operation = processor(store, tmp_path, gateway)
-    work = store.claim_background("recovery", archive_retry_base=300)
-    assert work is not None and work.archive_probe_token
+    work = store.claim_background("recovery")
+    assert work is not None and work.archive_probe_token is None
     operation.process(work)
-    assert store.claim_background("recovery", archive_retry_base=300) is None
+    assert store.claim_background("recovery") is None
+    assert gate(store).probe_token is None
     transfer = upload(store, clock[0])
     assert transfer is not None and transfer.archive_probe_token
     operation.process(transfer)

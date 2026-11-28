@@ -15,6 +15,11 @@ THROTTLE_PROBATION = 1800.0
 MIN_WRITE_INTERVAL = 60.0
 RELEASE_WRITE_INTERVAL = 15.0
 INCIDENT_RECOVERY_DELAY = 1800.0
+# An item whose creation alone is throttled backs off on its own schedule.
+ITEM_THROTTLE_BASE = 3600.0
+ITEM_THROTTLE_CAP = 86_400.0
+ITEM_THROTTLE_PROBES = 3
+ITEM_THROTTLED = "item_throttled"
 
 
 class ArchiveServiceState(SQLModel, table=True):
@@ -54,6 +59,8 @@ class ArchiveServiceState(SQLModel, table=True):
     task_error: int | None = None
     task_paused: int | None = None
     task_sampled_at: datetime | None = None
+    failed_probe_video_id: str | None = None
+    last_probe_class: str | None = None
 
 
 def retryable_fields(

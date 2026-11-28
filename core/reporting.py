@@ -145,6 +145,7 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
             f"Active transfers: {report.active_transfers:,}"
             f" | Failed: {report.failed_transfers:,}"
             f" | Uncertain: {report.uncertain_transfers:,}",
+            *_item_throttle_lines(report),
             f"Validation: {report.validation_pending:,} pending, "
             f"{report.validation_passed:,} passed, "
             f"{report.validation_failed:,} failed, "
@@ -199,6 +200,17 @@ async def send_report(report: Report, webhook_url: str, timeout: float) -> str:
     if not isinstance(message_id, str) or not message_id:
         raise RuntimeError("Discord report delivery returned no message ID")
     return message_id
+
+
+def _item_throttle_lines(report: Report) -> list[str]:
+    """List uploads backing off because the Archive throttles only their item."""
+    if not report.item_throttled:
+        return []
+    items = json.loads(report.item_throttled_items or "[]")
+    return [
+        f"Item-throttled uploads: {report.item_throttled:,}",
+        *(f"Item throttled: {Markdown.inline_code(item)}" for item in items),
+    ]
 
 
 def _derive_lines(report: Report) -> list[str]:

@@ -48,8 +48,13 @@ from loguru import logger
 from niquests import Session
 
 from core.archive_derives import DeriveDispatcher
-from core.archive_errors import RecoveryConflictError, failure_cause, failure_facts
-from core.archive_retry import retry_hint, retryable_error
+from core.archive_errors import (
+    DEFERRED_PREFIX,
+    RecoveryConflictError,
+    failure_cause,
+    failure_facts,
+)
+from core.archive_retry import ITEM_THROTTLED, retry_hint, retryable_error
 from core.archive_tasks import TaskBacklog, TaskSource, TaskSummaryCache
 from core.bandwidth import BandwidthHTTPAdapter, ByteLimiter, Limiter
 from core.config import (
@@ -76,7 +81,6 @@ from core.youtube_errors import VideoAccessError
 MAX_IDENTIFIER_LENGTH = 100
 CREDENTIAL_PHASES = frozenset({"csrf", "login", "upload-key"})
 TASK_PHASES = frozenset({"item-create", "file-upload"})
-DEFERRED_PREFIX = "Upload deferred before sending: "
 
 
 class _NoSubmissionRedirects(HTTPRedirectHandler):
@@ -828,25 +832,36 @@ class ArchiveProcessor:
             )
 
     def _failure_delay(self, work: ArchiveWork, error: Exception) -> float:
+        return self._failure(work, error)["delay"]
+
+    def _failure(self, work: ArchiveWork, error: Exception) -> dict[str, Any]:
+        """Return the retry delay and diagnostics to save for one failed request."""
+        facts = failure_facts(error)
         if work.archive_generation is not None and (
             retryable_error(error)
             or work.archive_probe_token is not None
-            and failure_facts(error)["error_kind"] == "permission"
+            and facts["error_kind"] == "permission"
         ):
-            return self.state.record_archive_failure(
+            verdict = self.state.record_archive_failure(
                 work,
                 base_delay=self.settings.archive_retry_delay,
                 hint=retry_hint(error, utcnow()),
                 error=_error_text(error),
-                **failure_facts(error),
+                **facts,
             )
-        return max(
-            retry_hint(error, utcnow()),
-            retry_delay(
-                self.settings.archive_retry_delay,
-                work.job.attempts if work.job else work.progress.retry_attempts + 1,
+            if verdict.item_throttled:
+                facts["error_kind"] = ITEM_THROTTLED
+            return {"delay": verdict.delay, **facts}
+        return {
+            "delay": max(
+                retry_hint(error, utcnow()),
+                retry_delay(
+                    self.settings.archive_retry_delay,
+                    work.job.attempts if work.job else work.progress.retry_attempts + 1,
+                ),
             ),
-        )
+            **facts,
+        }
 
     def _process(self, work: ArchiveWork) -> None:
         stage = work.job.kind if work.job else work.progress.status
@@ -1176,9 +1191,8 @@ class ArchiveProcessor:
                 work,
                 status="upload" if known_failure else "reconcile_upload",
                 error=_error_text(error),
-                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
-                **failure_facts(error),
+                **self._failure(work, error),
             )
             return
         except InternetArchiveMultipartError as error:
@@ -1202,9 +1216,8 @@ class ArchiveProcessor:
                 work,
                 status="upload" if retry else "reconcile_upload",
                 error=_error_text(error),
-                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
-                **failure_facts(error),
+                **self._failure(work, error),
             )
             return
         except InvalidOptionError as error:
@@ -1249,9 +1262,8 @@ class ArchiveProcessor:
                 work,
                 status="upload",
                 error=_error_text(error),
-                delay=self._failure_delay(work, error),
                 deadline=self.settings.background_deadline,
-                **failure_facts(error),
+                **self._failure(work, error),
             )
             return
         if not self._acknowledged(work, result):
